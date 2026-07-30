@@ -14,6 +14,7 @@
 //! the seed and the run directory, and the address changes.
 
 mod identity;
+mod proto;
 mod transport;
 
 use std::path::PathBuf;
