@@ -1,0 +1,39 @@
+[package]
+name = "murmure"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Arti is pinned with "=" on purpose: 0.x crates, monthly releases, API breaks
+# at every bump. See aidd_docs/INSTALL.md.
+#
+# onion-service-service  -> publish a v3 onion service (implies `keymgr`)
+# onion-service-client   -> dial a .onion address
+# experimental-api       -> TorClient::launch_onion_service_with_hsid (route A)
+arti-client = { version = "=0.44.0", features = [
+    "experimental-api",
+    "onion-service-client",
+    "onion-service-service",
+] }
+
+# Named directly so murmure can build the onion-service config, the nickname,
+# and its own HsIdKeypair instead of letting arti generate one.
+tor-hsservice = "=0.44.0"
+tor-hscrypto = "=0.44.0"
+tor-llcrypto = "=0.44.0"
+tor-keymgr = "=0.44.0"
+# CONNECTED / END relay messages, needed to answer a StreamRequest.
+tor-cell = "=0.44.0"
+# PreferredRuntime, to name the concrete TorClient type. arti-client does not
+# re-export it.
+tor-rtcompat = { version = "=0.44.0", features = ["tokio", "native-tls"] }
+# HsId is inherently sensitive: printing it unredacted goes through
+# safelog::DisplayRedacted.
+safelog = "0.9"
+
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+rand = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
