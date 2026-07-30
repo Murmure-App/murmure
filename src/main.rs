@@ -1,18 +1,18 @@
-//! murmure — keystore milestone.
+//! murmure — peer-to-peer terminal messaging over Tor onion services.
 //!
-//! One executable proof, and nothing else:
+//! ```text
+//! murmure                      publish our address and wait for a friend
+//! murmure <address>.onion      call a friend
+//! ```
 //!
-//! 1. murmure generates and owns a 32-byte ed25519 seed;
-//! 2. it hands the derived keypair to arti as the onion service identity;
-//! 3. it publishes the service and prints the resulting `.onion` address,
-//!    after checking byte-for-byte that the address arti published is the one
-//!    derived from *our* seed;
-//! 4. a second, independent `TorClient` on the same machine dials that address
-//!    through Tor and gets its probe echoed back.
+//! Both sides need to be online at the same time. It is a phone call, not a
+//! text message.
 //!
-//! Run it twice: the address is the same, because murmure owns the seed. Delete
-//! the seed and the run directory, and the address changes.
+//! The identity is a 32-byte seed murmure owns; the `.onion` address is derived
+//! from it, so the address survives restarts and is unforgeable without the
+//! seed. Delete the seed and you are someone else.
 
+mod chat;
 mod identity;
 mod proto;
 mod transport;
@@ -31,26 +31,23 @@ use crate::transport::tor::{self, KeyHandover};
 /// would look like a brand new service to the keystore.
 const NICKNAME: &str = "murmure";
 
-/// How long to wait for the service to *confirm* it is reachable before dialling
-/// anyway. Short on purpose, and overlapped with the client bootstrap: the
-/// confirmation is advisory (see `transport::tor::wait_until_reachable`) and
-/// often never arrives even on a service that answers. The dial is the real
-/// test.
+/// How long to wait for the service to *confirm* it is reachable before
+/// announcing it as ready. Advisory only — see `tor::wait_until_reachable`,
+/// which under-reports on a service that already answers.
 const REACHABLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Total budget for reaching our own service. A rendezvous is 7-50 s per
-/// PETS 2025 and the first dial can land before the descriptor has propagated,
-/// so this covers several attempts. Generous on purpose: a tight timeout would
-/// fail the milestone for the wrong reason.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(240);
 
-/// What the client sends and expects back verbatim.
-const PROBE: &[u8] = b"murmure milestone probe";
+/// Total budget for reaching a friend's service. A rendezvous is 7-50 s per
+/// PETS 2025, and a first dial can land before the descriptor has propagated,
+/// so this covers several attempts.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(240);
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                // Arti is chatty at info. Quiet by default so the conversation
+                // is readable; `RUST_LOG=info` brings the detail back.
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
 
@@ -63,10 +60,7 @@ fn main() -> ExitCode {
     };
 
     match runtime.block_on(run()) {
-        Ok(()) => {
-            println!("[ok] milestone crossed");
-            ExitCode::SUCCESS
-        }
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("murmure: {e:#}");
             ExitCode::FAILURE
@@ -77,10 +71,38 @@ fn main() -> ExitCode {
 async fn run() -> Result<()> {
     let started = Instant::now();
     let run_dir = run_dir();
-    std::fs::create_dir_all(&run_dir)
-        .with_context(|| format!("creating {}", run_dir.display()))?;
+    std::fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
 
-    // ---- phase 2: our own identity -------------------------------------
+    match parse_args()? {
+        Mode::Listen => listen(started, &run_dir).await,
+        Mode::Call { address } => call(started, &run_dir, &address).await,
+    }
+}
+
+/// What the operator asked for.
+enum Mode {
+    /// Publish our own service and wait.
+    Listen,
+    /// Dial someone else's.
+    Call { address: String },
+}
+
+fn parse_args() -> Result<Mode> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [] => Ok(Mode::Listen),
+        [one] if !one.starts_with('-') => Ok(Mode::Call {
+            address: one.clone(),
+        }),
+        _ => bail!(
+            "usage:\n  murmure                    publish and wait\n  \
+             murmure <address>.onion    call a friend"
+        ),
+    }
+}
+
+/// Publish our onion service and hold a conversation with whoever connects.
+async fn listen(started: Instant, run_dir: &std::path::Path) -> Result<()> {
     let seed_path = run_dir.join("identity.seed");
     let existed = seed_path.exists();
     let identity = Identity::load_or_create(&seed_path)?;
@@ -95,37 +117,28 @@ async fn run() -> Result<()> {
             identity.path().display()
         ),
     );
-    println!("expected address (derived locally from our seed):");
-    println!("  {}", expected.display_unredacted());
 
-    // ---- phase 3: publish under that identity --------------------------
     let nickname = NICKNAME
         .to_owned()
         .try_into()
         .map_err(|e| anyhow::anyhow!("invalid onion service nickname {NICKNAME:?}: {e}"))?;
 
-    stage(started, "bootstrapping the service-side Tor client");
-    let service_client = tor::bootstrap_client(
+    stage(started, "bootstrapping Tor");
+    let client = tor::bootstrap_client(
         &run_dir.join("service/state"),
         &run_dir.join("service/cache"),
     )
     .await?;
 
-    stage(started, "launching the onion service under our key");
+    stage(started, "publishing the service");
     let (handover, service, requests) =
-        tor::launch_with_identity(&service_client, &nickname, identity.hs_id_keypair())?;
-    match handover {
-        KeyHandover::Inserted => stage(started, "arti accepted our keypair into an empty keystore"),
-        KeyHandover::Reused => stage(
-            started,
-            "the keystore already held an identity for this nickname; \
-             arti refused to overwrite it (this is the wanted behaviour)",
-        ),
+        tor::launch_with_identity(&client, &nickname, identity.hs_id_keypair())?;
+    if handover == KeyHandover::Reused {
+        tracing::debug!("the keystore already held this identity; arti did not overwrite it");
     }
 
-    // The whole point of the milestone: the published address must be the one
-    // we derived locally, not one arti generated. A byte comparison, not a log
-    // check.
+    // The address we publish must be the one our seed derives, never one arti
+    // generated. A byte comparison, not a log check.
     let published = service
         .onion_address()
         .context("arti published the service but reported no onion address")?;
@@ -133,9 +146,8 @@ async fn run() -> Result<()> {
         bail!(
             "IDENTITY MISMATCH — arti published {published} but our seed derives {expected}.\n\
              The keystore at {}/service/state/keystore holds a different key than the seed at {}.\n\
-             arti was not allowed to overwrite it, so nothing was lost: either delete that \
-             keystore directory to republish under our seed, or delete the seed to adopt the \
-             stored identity.",
+             Nothing was overwritten: delete that keystore directory to republish under our \
+             seed, or delete the seed to adopt the stored identity.",
             run_dir.display(),
             seed_path.display(),
             published = published.display_unredacted(),
@@ -143,74 +155,91 @@ async fn run() -> Result<()> {
         );
     }
 
-    let address_text = published.display_unredacted().to_string();
-    assert_well_formed(&address_text)?;
-    println!("published address (reported by arti):");
-    println!("  {address_text}");
-    println!("  -> matches the address derived from our seed");
+    let address = published.display_unredacted().to_string();
+    assert_well_formed(&address)?;
 
-    stage(
-        started,
-        "serving; publishing the descriptor and bootstrapping the client in parallel",
-    );
-    tokio::spawn(tor::serve_echo(requests));
+    println!();
+    println!("your address — give it to your friend, and compare it out loud:");
+    println!("  {address}");
+    println!("  fingerprint: {}", fingerprint(&address));
+    println!();
 
-    // ---- phase 4: reach it from a second client ------------------------
-    //
-    // The two are independent, so they run concurrently: the second client owns
-    // its own state and cache directories and shares nothing with the service.
-    let client_state = run_dir.join("client/state");
-    let client_cache = run_dir.join("client/cache");
-    let (reachable, dial_client) = tokio::join!(
-        tor::wait_until_reachable(&service, REACHABLE_TIMEOUT),
-        tor::bootstrap_client(&client_state, &client_cache),
-    );
-    let dial_client = dial_client?;
-    match reachable {
-        Ok(()) => stage(started, "onion service reports itself reachable"),
-        // Advisory only — see `wait_until_reachable`. The dial below decides.
-        Err(e) => stage(
+    match tor::wait_until_reachable(&service, REACHABLE_TIMEOUT).await {
+        Ok(()) => stage(started, "reachable; waiting for a connection"),
+        // Under-reports; the incoming connection is the real test.
+        Err(_) => stage(
             started,
-            &format!("reachability not confirmed ({e:#}); dialling anyway"),
+            "reachability not confirmed (arti under-reports); waiting anyway",
         ),
     }
 
-    stage(
-        started,
-        &format!("dialling {address_text}:{}", tor::SERVICE_PORT),
-    );
-    let echoed = tor::dial_and_echo_retrying(
-        &dial_client,
-        published,
-        PROBE,
-        DIAL_TIMEOUT,
-        |attempt, err| stage(started, &format!("dial attempt {attempt} failed: {err}")),
-    )
-    .await?;
-
-    if echoed != PROBE {
-        bail!(
-            "echo mismatch: sent {:?}, received {:?}",
-            String::from_utf8_lossy(PROBE),
-            String::from_utf8_lossy(&echoed)
-        );
-    }
-    stage(started, "echo received and identical");
-
+    let stream = tor::accept_one(requests).await?;
+    stage(started, "connected");
+    println!("(type to send, Ctrl-D to hang up)");
     println!();
-    println!("murmure reached its own onion service through Tor, under a key it generated itself.");
-    println!("run it again: the address will be identical, because the seed is ours.");
-    Ok(())
+
+    let (reader, writer) = stream.split();
+    chat::run(reader, writer, "them").await
 }
 
-/// Where this run keeps its seed and its two client directory pairs.
+/// Dial a friend's address and hold a conversation.
+async fn call(started: Instant, run_dir: &std::path::Path, address: &str) -> Result<()> {
+    let address = address.trim().trim_end_matches('/');
+    assert_well_formed(address)?;
+    let hs_id: tor_hscrypto::pk::HsId = address
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{address} is not a valid onion address: {e}"))?;
+
+    println!();
+    println!("calling:");
+    println!("  {address}");
+    println!("  fingerprint: {}", fingerprint(address));
+    println!("  -> compare that fingerprint out loud before you say anything private.");
+    println!();
+
+    stage(started, "bootstrapping Tor");
+    let client =
+        tor::bootstrap_client(&run_dir.join("client/state"), &run_dir.join("client/cache")).await?;
+
+    stage(started, "dialling (7-50 s is normal)");
+    let stream = tor::dial_retrying(&client, hs_id, DIAL_TIMEOUT, |attempt, err| {
+        stage(started, &format!("attempt {attempt} failed: {err}"))
+    })
+    .await?;
+
+    stage(started, "connected");
+    println!("(type to send, Ctrl-D to hang up)");
+    println!();
+
+    let (reader, writer) = stream.split();
+    chat::run(reader, writer, "them").await
+}
+
+/// Where this run keeps its seed and its Tor directories.
 ///
-/// Overridable with `MURMURE_DIR` so a test can point at a scratch directory.
+/// Overridable with `MURMURE_DIR`, which is also how two instances share one
+/// machine without colliding.
 fn run_dir() -> PathBuf {
     match std::env::var_os("MURMURE_DIR") {
         Some(dir) => PathBuf::from(dir),
         None => PathBuf::from(".murmure"),
     }
+}
+
+/// A short, speakable digest of an address, for comparing out loud.
+///
+/// The address itself is 56 characters — nobody reads that over the phone
+/// correctly. These are the first and last four, which is what the human check
+/// in `aidd_docs/brainstorm` actually needs: an attacker who substituted the
+/// address has to match both ends.
+fn fingerprint(address: &str) -> String {
+    let base32 = address.strip_suffix(".onion").unwrap_or(address);
+    let head: String = base32.chars().take(4).collect();
+    let tail: String = base32
+        .chars()
+        .skip(base32.chars().count().saturating_sub(4))
+        .collect();
+    format!("{head} … {tail}")
 }
 
 /// A v3 onion address is 56 base32 characters plus `.onion`.
@@ -233,7 +262,30 @@ fn assert_well_formed(address: &str) -> Result<()> {
     Ok(())
 }
 
-/// Print a timestamped stage marker, so a 90-second run never looks frozen.
+/// Print a timestamped stage marker, so a 90-second wait never looks frozen.
 fn stage(started: Instant, what: &str) {
     println!("[{:>5.1}s] {what}", started.elapsed().as_secs_f32());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_takes_both_ends() {
+        let addr = "haticvmas7sfodcos2yhp7sf43cxifwl5aafgeathnyad4culhdj7ryd.onion";
+        assert_eq!(fingerprint(addr), "hati … 7ryd");
+    }
+
+    #[test]
+    fn well_formed_rejects_the_wrong_shapes() {
+        let ok = "haticvmas7sfodcos2yhp7sf43cxifwl5aafgeathnyad4culhdj7ryd.onion";
+        assert!(assert_well_formed(ok).is_ok());
+        // v2 length
+        assert!(assert_well_formed("abcdefghij234567.onion").is_err());
+        // no suffix
+        assert!(assert_well_formed("haticvmas7sfodcos2yhp7sf43cxifwl5aafgeathnyad4culhdj7ryd").is_err());
+        // '1' and '8' are not in base32
+        assert!(assert_well_formed("1aticvmas7sfodcos2yhp7sf43cxifwl5aafgeathnyad4culhdj7ry8.onion").is_err());
+    }
 }

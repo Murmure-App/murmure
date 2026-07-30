@@ -1,9 +1,9 @@
 //! The Tor control plane: publish murmure's onion service, and dial another one.
 //!
-//! Everything here is scoped to the keystore milestone. There is no `Transport`
-//! trait yet (see `transport/mod.rs`), no reconnection policy, and no framing —
-//! only the two halves the milestone has to prove: *we publish under our own
-//! key*, and *we can reach that address through Tor*.
+//! This module opens streams and hands them over; what travels on them is
+//! `proto`'s business and the loop above them is `chat`'s. There is no
+//! `Transport` trait yet (see `transport/mod.rs`) and no reconnection policy:
+//! a dropped conversation ends the program, and the operator dials again.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -201,80 +201,32 @@ pub async fn wait_until_reachable(svc: &Arc<RunningOnionService>, timeout: Durat
         .map_err(|_| anyhow!("the onion service was still not reachable after {timeout:?}"))?
 }
 
-/// Answer every incoming stream by echoing back whatever bytes arrive.
+/// Wait for the first incoming stream and accept it.
 ///
-/// Runs until the request stream ends, i.e. until the service is dropped.
-pub async fn serve_echo(requests: impl Stream<Item = RendRequest>) {
+/// Returns the accepted stream. Later streams are left unanswered: v1 holds one
+/// conversation at a time, and the contacts book is what makes several make
+/// sense.
+pub async fn accept_one(requests: impl Stream<Item = RendRequest>) -> Result<arti_client::DataStream> {
     let streams = handle_rend_requests(requests);
     futures::pin_mut!(streams);
-    while let Some(request) = streams.next().await {
-        tokio::spawn(async move {
-            if let Err(e) = echo_once(request).await {
-                tracing::warn!("echo failed: {e:#}");
-            }
-        });
-    }
-}
-
-/// Accept one stream, read one chunk, write it straight back.
-///
-/// Neither side waits for end-of-stream; see [`dial_and_echo`] for why.
-async fn echo_once(request: tor_hsservice::StreamRequest) -> Result<()> {
-    use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
+    let request = streams
+        .next()
+        .await
+        .ok_or_else(|| anyhow!("the incoming-stream channel closed before anyone connected"))?;
     tracing::info!("incoming stream: {:?}", request.request());
-    let mut stream = request
+    request
         .accept(Connected::new_empty())
         .await
-        .context("accepting the incoming stream")?;
-
-    let mut buf = [0u8; 1024];
-    let n = stream.read(&mut buf).await.context("reading the probe")?;
-    stream
-        .write_all(&buf[..n])
-        .await
-        .context("writing the echo")?;
-    stream.flush().await.context("flushing the echo")?;
-    stream.close().await.context("closing the echo stream")?;
-    Ok(())
+        .context("accepting the incoming stream")
 }
 
-/// Dial a `.onion` on [`SERVICE_PORT`], send `payload`, and read back exactly as
-/// many bytes.
-///
-/// # Why not `read_to_end`
-///
-/// Closing a Tor stream is not a clean EOF. `DataWriter::poll_close` hands the
-/// reactor a `CloseStreamBehavior::SendEnd(End::new_misc())`
-/// (`tor-proto-0.44.0/src/stream.rs:82`), i.e. an END cell with reason `MISC`.
-/// The reading side turns `EndReceived(DONE)` into EOF but every other reason
-/// into an error (`tor-proto-0.44.0/src/client/stream/data.rs:503`), so
-/// `read_to_end` against a peer that closed its stream fails with
-/// "Received an END cell with reason MISC" *after* having received all the
-/// data. Reading a known length sidesteps the question entirely, which is all
-/// this echo protocol needs.
-pub async fn dial_and_echo(client: &Client, address: HsId, payload: &[u8]) -> Result<Vec<u8>> {
-    use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
+/// Dial a `.onion` on [`SERVICE_PORT`] and hand back the open stream.
+pub async fn dial(client: &Client, address: HsId) -> Result<arti_client::DataStream> {
     let host = address.display_unredacted().to_string();
-    let mut stream = client
+    client
         .connect((host.as_str(), SERVICE_PORT))
         .await
-        .map_err(|e| describe(e, &format!("dialling {host}:{SERVICE_PORT}")))?;
-
-    stream
-        .write_all(payload)
-        .await
-        .context("writing the probe")?;
-    // Arti buffers: without an explicit flush the probe never leaves.
-    stream.flush().await.context("flushing the probe")?;
-
-    let mut reply = vec![0u8; payload.len()];
-    stream
-        .read_exact(&mut reply)
-        .await
-        .context("reading the echo")?;
-    Ok(reply)
+        .map_err(|e| describe(e, &format!("dialling {host}:{SERVICE_PORT}")))
 }
 
 /// Dial until it works or `deadline` runs out.
@@ -283,13 +235,12 @@ pub async fn dial_and_echo(client: &Client, address: HsId, payload: &[u8]) -> Re
 /// fails with `OnionServiceNotFound` / `OnionServiceDescriptorValidationFailed`
 /// — a timing artefact, not a verdict. Retrying is the only honest way to tell
 /// "not published yet" from "not reachable".
-pub async fn dial_and_echo_retrying(
+pub async fn dial_retrying(
     client: &Client,
     address: HsId,
-    payload: &[u8],
     deadline: Duration,
     mut on_attempt: impl FnMut(u32, &str),
-) -> Result<Vec<u8>> {
+) -> Result<arti_client::DataStream> {
     /// Gap between two dials. A rendezvous is 7-50 s, so retrying faster than
     /// this just piles up circuits.
     const BACKOFF: Duration = Duration::from_secs(10);
@@ -301,8 +252,8 @@ pub async fn dial_and_echo_retrying(
     while start.elapsed() < deadline {
         attempt += 1;
         let remaining = deadline.saturating_sub(start.elapsed());
-        match tokio::time::timeout(remaining, dial_and_echo(client, address, payload)).await {
-            Ok(Ok(reply)) => return Ok(reply),
+        match tokio::time::timeout(remaining, dial(client, address)).await {
+            Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => {
                 on_attempt(attempt, &format!("{e:#}"));
                 last = Some(e);
@@ -317,3 +268,4 @@ pub async fn dial_and_echo_retrying(
         None => anyhow!("no dial attempt completed within {deadline:?}"),
     })
 }
+
