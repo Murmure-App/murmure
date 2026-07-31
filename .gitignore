@@ -1,4 +1,7 @@
 /target
+# Un bundle contient tout l'historique. Le commiter dans le dépôt qu'il
+# contient est une boucle, et le suivant embarquerait le précédent.
+*.bundle
 # Run directories: identity seed, sealed book, Tor state and cache.
 # The glob matters — `.murmure-b` is a second local instance, and its seed is a
 # private key just like the first one's.
