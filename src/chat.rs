@@ -64,6 +64,8 @@ pub enum Ended {
     PeerHungUp,
     /// We did, with `/bye`.
     WeHungUp,
+    /// We did, with `/quit`: hang up *and* leave the program.
+    Quit,
     /// stdin reached EOF: Ctrl-D, or a piped script running out.
     InputClosed,
 }
@@ -73,9 +75,14 @@ impl Ended {
     pub fn describe(self, peer: &str) -> String {
         match self {
             Ended::PeerHungUp => format!("{peer} hung up"),
-            Ended::WeHungUp => "you hung up".to_owned(),
+            Ended::WeHungUp | Ended::Quit => "you hung up".to_owned(),
             Ended::InputClosed => "input closed".to_owned(),
         }
+    }
+
+    /// Should the program stop, rather than go back to listening?
+    pub fn leaves(self) -> bool {
+        matches!(self, Ended::Quit | Ended::InputClosed)
     }
 }
 
@@ -184,14 +191,17 @@ where
                 };
                 match classify(&line) {
                     Typed::Nothing => continue,
-                    Typed::HangUp => {
+                    // `/bye` goes back to listening, `/quit` leaves the program.
+                    // Both wait for a file rather than truncating it, and both
+                    // give up waiting if asked twice.
+                    Typed::HangUp(how) => {
                         if !busy(&sending, &receiving) || leaving.is_some() {
-                            break Ended::WeHungUp;
+                            break how;
                         }
                         screen.system(
-                            "-- hanging up when the file is done; /bye again to leave now --",
+                            "-- hanging up when the file is done; type it again to leave now --",
                         );
-                        leaving = Some(Ended::WeHungUp);
+                        leaving = Some(how);
                     }
                     // Anything else starting with '/' stays here. Letting it
                     // through would send `/add alice <address>` — a contact's
@@ -568,8 +578,8 @@ fn pump(sending: &mut Option<Sending>, screen: &Screen) -> Result<Option<Message
 enum Typed {
     /// Blank; ignore it.
     Nothing,
-    /// `/bye`.
-    HangUp,
+    /// `/bye` or `/quit`, carrying which one it was.
+    HangUp(Ended),
     /// `/send <path>`.
     Send(PathBuf),
     /// `/accept`.
@@ -605,7 +615,10 @@ fn classify(line: &str) -> Typed {
         None => (trimmed, ""),
     };
     match verb {
-        "/bye" => Typed::HangUp,
+        "/bye" => Typed::HangUp(Ended::WeHungUp),
+        // Typing `/quit` mid-call used to be refused, which meant `/bye` then
+        // `/quit`: two commands for one intention nobody splits in their head.
+        "/quit" => Typed::HangUp(Ended::Quit),
         "/accept" => Typed::Accept,
         "/refuse" => Typed::Refuse,
         // The whole remainder, not the first word: paths have spaces in them,
@@ -644,13 +657,14 @@ mod tests {
     /// The one that matters: a command typed during a call must never travel.
     #[test]
     fn commands_typed_during_a_call_are_never_sent() {
-        assert_eq!(classify("/bye"), Typed::HangUp);
+        assert_eq!(classify("/bye"), Typed::HangUp(Ended::WeHungUp));
+        // `/quit` hangs up *and* leaves, rather than being refused.
+        assert_eq!(classify("/quit"), Typed::HangUp(Ended::Quit));
         assert_eq!(
             classify("/add alice haticv.onion"),
             Typed::UnknownCommand("/add".into())
         );
         assert_eq!(classify("/call bob"), Typed::UnknownCommand("/call".into()));
-        assert_eq!(classify("/quit"), Typed::UnknownCommand("/quit".into()));
         assert_eq!(classify("  "), Typed::Nothing);
         // `/send` with nothing after it is a mistake, not a message.
         assert_eq!(classify("/send"), Typed::UnknownCommand("/send".into()));

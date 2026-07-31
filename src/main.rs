@@ -295,7 +295,11 @@ async fn serve(
                 screen.system("-- incoming call --");
                 screen.status("in a call");
                 let (reader, writer) = stream.split();
-                converse(reader, writer, "they", &incoming_dir, lines, screen).await;
+                if let Flow::Quit =
+                    converse(reader, writer, "they", &incoming_dir, lines, screen).await
+                {
+                    break;
+                }
                 screen.status("listening");
             }
             Event::Called(None) => bail!("the incoming-stream channel closed"),
@@ -386,8 +390,11 @@ enum Flow {
     Quit,
 }
 
-/// Hold one conversation and report how it ended. Never propagates: a dropped
-/// call must not end the program.
+/// Hold one conversation and say whether the operator wants out of the program
+/// as well as out of the call.
+///
+/// Never propagates an error: a dropped call must not end the program, so a
+/// failure is shown and treated as an ordinary hang-up.
 async fn converse<R, W>(
     reader: R,
     writer: W,
@@ -395,14 +402,21 @@ async fn converse<R, W>(
     incoming_dir: &Path,
     lines: &mut mpsc::Receiver<String>,
     screen: &Screen,
-) where
+) -> Flow
+where
     R: futures::io::AsyncRead + Unpin + Send + 'static,
     W: futures::io::AsyncWrite + Unpin + Send + 'static,
 {
     match chat::run(reader, writer, peer, incoming_dir, lines, screen).await {
-        Ok(ended) => screen.system(format!("-- {} --", ended.describe(peer))),
+        Ok(ended) => {
+            screen.system(format!("-- {} --", ended.describe(peer)));
+            if ended.leaves() {
+                return Flow::Quit;
+            }
+        }
         Err(e) => screen.error(format!("-- call dropped: {e:#} --")),
     }
+    Flow::Continue
 }
 
 /// Run one typed command.
@@ -474,10 +488,27 @@ async fn command(
                 .address_of(name)
                 .ok_or_else(|| anyhow::anyhow!("no contact called {name} — /add them first"))?
                 .to_owned();
-            call(started, live, name, &address, lines, screen).await?;
+            return call(started, live, name, &address, lines, screen).await;
+        }
+        "/copy" => {
+            // Exactly what the other person has to type after `/add <name>`, in
+            // that order, so they paste once and are done.
+            let both = format!(
+                "{} {}",
+                live.identity.onion_address().display_unredacted(),
+                live.identity.discovery_key()
+            );
+            screen.copy(both);
+            screen.system("your address and key are on the clipboard — send them both.");
+            screen.system("(if nothing was copied, your terminal refuses OSC 52; select and copy)");
         }
         "/help" => help(screen),
         "/quit" => return Ok(Flow::Quit),
+        // Reachable by dragging a file onto the window outside a call, which is
+        // the obvious thing to try first.
+        "/send" | "/accept" | "/refuse" => {
+            bail!("{verb} only works during a call — /call someone first")
+        }
         _ => bail!("unknown command {verb} — /help"),
     }
     Ok(Flow::Continue)
@@ -491,7 +522,7 @@ async fn call(
     address: &str,
     lines: &mut mpsc::Receiver<String>,
     screen: &Screen,
-) -> Result<()> {
+) -> Result<Flow> {
     let hs_id: tor_hscrypto::pk::HsId = address
         .parse()
         .map_err(|e| anyhow::anyhow!("{address} is not a valid onion address: {e}"))?;
@@ -517,11 +548,17 @@ async fn call(
             outcome = &mut dialling => break outcome.inspect_err(|_| screen.status("listening"))?,
             line = lines.recv() => match line.as_deref().map(str::trim) {
                 // The interface is gone.
-                None => return Ok(()),
+                None => return Ok(Flow::Quit),
                 Some("/cancel") => {
                     screen.system(format!("gave up calling {name}"));
                     screen.status("listening");
-                    return Ok(());
+                    return Ok(Flow::Continue);
+                }
+                // Giving up on a call that has not connected is the one place
+                // where `/quit` needs no hang-up: there is nothing to hang up.
+                Some("/quit") => {
+                    screen.system(format!("gave up calling {name}"));
+                    return Ok(Flow::Quit);
                 }
                 Some("") => {}
                 Some(_) => screen.system(format!("still calling {name} — /cancel to give up")),
@@ -532,9 +569,11 @@ async fn call(
     screen.system(format!("-- connected to {name} --"));
     screen.status(format!("in a call with {name}"));
     let (reader, writer) = stream.split();
-    converse(reader, writer, name, live.incoming_dir, lines, screen).await;
-    screen.status("listening");
-    Ok(())
+    let flow = converse(reader, writer, name, live.incoming_dir, lines, screen).await;
+    if let Flow::Continue = flow {
+        screen.status("listening");
+    }
+    Ok(flow)
 }
 
 fn help(screen: &Screen) {
@@ -544,9 +583,10 @@ fn help(screen: &Screen) {
         "  /call <name>                  call them",
         "  /contacts                     list the book",
         "  /forget <name>                drop a contact",
+        "  /copy                         your address and key, to the clipboard",
         "  /quit                         leave",
         "during a call:",
-        "  /send <path>                  offer them a file",
+        "  /send <path>                  offer them a file (or drop one on the window)",
         "  /accept  /refuse              answer an offer of theirs",
         "  /bye                          hang up",
         "keys:",

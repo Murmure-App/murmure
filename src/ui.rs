@@ -14,9 +14,13 @@
 //! `.murmure/murmure.log` instead of on screen.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers,
+};
 use futures::StreamExt as _;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -85,6 +89,8 @@ pub enum Update {
     Status(String),
     /// Start or stop accepting typed lines.
     Accepting(bool),
+    /// Put this on the system clipboard.
+    Clipboard(String),
 }
 
 /// A handle for putting lines on screen from anywhere in the program.
@@ -129,6 +135,15 @@ impl Screen {
     pub fn accepting(&self, yes: bool) {
         let _ = self.0.send(Update::Accepting(yes));
     }
+
+    /// Put text on the system clipboard.
+    ///
+    /// Best effort: it goes through the terminal (see [`copy_to_clipboard`]),
+    /// and a terminal that does not support it drops it silently. There is no
+    /// reply to wait for, so nothing here can tell whether it worked.
+    pub fn copy(&self, text: impl Into<String>) {
+        let _ = self.0.send(Update::Clipboard(text.into()));
+    }
 }
 
 /// Build a screen handle and the receiver [`run`] consumes.
@@ -148,6 +163,12 @@ struct App {
     history: VecDeque<Entry>,
     /// What is being typed.
     input: String,
+    /// Files dropped on the window, waiting to be sent.
+    ///
+    /// A terminal turns a drag-and-drop into a paste of the file's path, which
+    /// is 60-odd characters of noise in a one-line input box. The path is kept
+    /// here and shown as `[name]`, so what is on screen is what was dropped.
+    attached: Vec<PathBuf>,
     /// Screen rows scrolled up from the bottom. Zero means following the tail.
     ///
     /// Rows, not entries. Counting entries is the obvious thing and it is
@@ -173,6 +194,7 @@ impl App {
             title,
             history: VecDeque::new(),
             input: String::new(),
+            attached: Vec::new(),
             scroll_back: 0,
             viewport: (80, PAGE),
             accepting: false,
@@ -204,6 +226,61 @@ impl App {
         self.scroll_back = moved.clamp(0, limit as isize) as usize;
     }
 
+    /// Take a paste: an existing file becomes an attachment, anything else is
+    /// text.
+    ///
+    /// A drag-and-drop and a paste are the same event to a terminal, so they are
+    /// told apart by what the text turns out to be. That is not a heuristic
+    /// about how it looks — the path is resolved, and only a file that is
+    /// actually there is treated as one.
+    fn paste(&mut self, text: &str) {
+        if let Some(path) = as_dropped_file(text) {
+            self.attached.push(path);
+            return;
+        }
+        // Newlines would submit several lines at once from a source that is not
+        // the keyboard; a pasted paragraph becomes one line instead.
+        for c in text.chars() {
+            match c {
+                '\n' | '\r' => self.input.push(' '),
+                c if c.is_control() => {}
+                c => self.input.push(c),
+            }
+        }
+    }
+
+    /// What the input box shows: the attachments, then what is being typed.
+    fn input_display(&self) -> String {
+        let mut shown = String::new();
+        for path in &self.attached {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            shown.push_str(&format!("[{name}] "));
+        }
+        shown.push_str(&self.input);
+        shown
+    }
+
+    /// The lines Enter should send: one `/send` per attachment, then the text.
+    ///
+    /// Emitting commands rather than a new event type keeps the interface's only
+    /// output a line of text, exactly as if it had been typed — so the idle loop
+    /// and the conversation need to know nothing about drag-and-drop.
+    fn submit(&mut self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .attached
+            .drain(..)
+            .map(|p| format!("/send {}", p.display()))
+            .collect();
+        let text = std::mem::take(&mut self.input);
+        if !text.trim().is_empty() {
+            lines.push(text);
+        }
+        lines
+    }
+
     fn push(&mut self, entry: Entry) {
         self.history.push_back(entry);
         while self.history.len() > SCROLLBACK {
@@ -233,7 +310,19 @@ pub async fn run(
     // installs a panic hook that restores the terminal. Without that hook a
     // panic leaves the operator with an unusable shell.
     let mut terminal = ratatui::init();
+    // Bracketed paste makes the terminal deliver a paste — and a drag-and-drop,
+    // which every terminal implements as a paste of the file's path — as one
+    // event instead of a burst of keystrokes. Without it a dropped path arrives
+    // character by character and there is nothing to recognise it by.
+    let bracketed = crossterm::execute!(std::io::stdout(), EnableBracketedPaste).is_ok();
+
     let result = event_loop(&mut terminal, &mut updates, typed, title).await;
+
+    if bracketed {
+        // Leaving it on would make the shell after us receive pastes wrapped in
+        // escape sequences it does not expect.
+        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+    }
     ratatui::restore();
     result
 }
@@ -256,6 +345,7 @@ async fn event_loop(
                     Some(Update::Line(entry)) => app.push(entry),
                     Some(Update::Status(status)) => app.status = status,
                     Some(Update::Accepting(yes)) => app.accepting = yes,
+                    Some(Update::Clipboard(text)) => copy_to_clipboard(&text),
                     // The program is shutting down.
                     None => return Ok(()),
                 }
@@ -266,6 +356,7 @@ async fn event_loop(
                         Update::Line(entry) => app.push(entry),
                         Update::Status(status) => app.status = status,
                         Update::Accepting(yes) => app.accepting = yes,
+                        Update::Clipboard(text) => copy_to_clipboard(&text),
                     }
                 }
             }
@@ -277,6 +368,7 @@ async fn event_loop(
                             return Ok(());
                         }
                     }
+                    Some(Ok(Event::Paste(text))) => app.paste(&text),
                     // Resize and mouse events just need a redraw.
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e).context("reading a terminal event"),
@@ -310,7 +402,10 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<String>) 
     }
 
     match key.code {
-        KeyCode::Char('u') if ctrl => app.input.clear(),
+        KeyCode::Char('u') if ctrl => {
+            app.input.clear();
+            app.attached.clear();
+        }
         // Scrolling, bound to keys every keyboard has. A MacBook has no
         // PageUp/PageDown/End except through Fn, so the arrows and the
         // less(1) conventions carry the feature; the named keys stay as
@@ -321,15 +416,21 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<String>) 
         KeyCode::Up => app.scroll(1),
         KeyCode::Down => app.scroll(-1),
         KeyCode::Char(c) => app.input.push(c),
+        // Once the text is gone, Backspace takes attachments off the end, so a
+        // file dropped by mistake is removed the way anything else is.
         KeyCode::Backspace => {
-            app.input.pop();
+            if app.input.pop().is_none() {
+                app.attached.pop();
+            }
         }
         KeyCode::Enter => {
-            let line = std::mem::take(&mut app.input);
-            if !line.trim().is_empty() {
+            let lines = app.submit();
+            if !lines.is_empty() {
                 // Back to following the tail: you sent something, you want to
                 // see the answer.
                 app.scroll_back = 0;
+            }
+            for line in lines {
                 if typed.send(line).await.is_err() {
                     return Ok(true);
                 }
@@ -421,8 +522,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         )
     };
 
+    let shown = app.input_display();
     frame.render_widget(
-        Paragraph::new(app.input.as_str()).style(body_style).block(
+        Paragraph::new(shown.as_str()).style(body_style).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
@@ -434,9 +536,83 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     // Put the real cursor where the text is, so the terminal's own blink is the
     // cursor and there is nothing to draw. No cursor while input is refused.
     if app.accepting {
-        let cursor_x = input.x + 1 + app.input.chars().count() as u16;
+        let cursor_x = input.x + 1 + shown.chars().count() as u16;
         frame.set_cursor_position((cursor_x.min(input.right().saturating_sub(2)), input.y + 1));
     }
+}
+
+/// Put text on the system clipboard, by asking the terminal to do it.
+///
+/// # Why an escape sequence and not a clipboard library
+///
+/// OSC 52 is a request the terminal answers on our behalf, so it needs no X11,
+/// no Wayland and no pasteboard API — which means no platform-specific build
+/// dependency, and it keeps working over SSH, where a clipboard library would be
+/// writing to the clipboard of the wrong machine.
+///
+/// It is best effort. A terminal that does not implement it, or that has it
+/// switched off for security — some do, because a program that can write your
+/// clipboard can also overwrite what you were about to paste — ignores the
+/// sequence. There is no reply, so there is nothing to check.
+///
+/// ponytail: no chunking. The sequence goes through the terminal's input buffer
+/// and long payloads get truncated somewhere around 100 kB; an address and a key
+/// are 120 bytes.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write as _;
+
+    let encoded = data_encoding::BASE64.encode(text.as_bytes());
+    let mut out = std::io::stdout();
+    // `c` is the selection: the clipboard proper, not the X11 primary selection.
+    let _ = write!(out, "\x1b]52;c;{encoded}\x07");
+    let _ = out.flush();
+}
+
+/// Is this paste a file dropped on the window? If so, where it lives.
+///
+/// Terminals hand a dropped file over as its path, escaped for a shell that is
+/// not there: GNOME Terminal and Konsole quote it, iTerm2 and Terminal.app
+/// backslash-escape the spaces, some prepend `file://`. Undo all of that, then
+/// let the filesystem decide — a path that resolves to a real file was a drop,
+/// anything else was a paste of text that happened to look like one.
+fn as_dropped_file(text: &str) -> Option<PathBuf> {
+    let raw = text.trim();
+    if raw.is_empty() || raw.contains('\n') {
+        return None;
+    }
+
+    // Quoted whole, which is what a path with spaces usually arrives as.
+    let unquoted = match (raw.chars().next(), raw.chars().last()) {
+        (Some('\''), Some('\'')) | (Some('"'), Some('"')) if raw.chars().count() > 1 => {
+            &raw[1..raw.len() - 1]
+        }
+        _ => raw,
+    };
+
+    // A `file://` URL, which is what a Wayland drop can produce. Only the
+    // localhost form: anything else is not a local path.
+    let stripped = unquoted
+        .strip_prefix("file://localhost")
+        .or_else(|| unquoted.strip_prefix("file://"))
+        .unwrap_or(unquoted);
+
+    // Backslash escapes. Dropping the backslash is right for `\ ` and `\'`, and
+    // for a literal backslash in a name it is the escaped form that arrived.
+    let mut path = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => path.push(chars.next().unwrap_or('\\')),
+            c => path.push(c),
+        }
+    }
+
+    let expanded = match path.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        None => PathBuf::from(&path),
+    };
+    // The filesystem is the judge, not the shape of the string.
+    expanded.is_file().then_some(expanded)
 }
 
 /// How many rows one entry occupies once wrapped to `width`.
@@ -542,6 +718,77 @@ mod tests {
             .map(|e| rows_for(&e.text, width))
             .sum();
         assert_eq!(drawn - hidden as usize, height);
+    }
+
+    /// A dropped file is recognised however the terminal escaped it, and a
+    /// paste that merely looks like a path is not.
+    #[test]
+    fn a_dropped_file_is_told_apart_from_pasted_text() {
+        let dir = std::env::temp_dir().join(format!("murmure-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spaced = dir.join("mon rapport.pdf");
+        std::fs::write(&spaced, b"x").unwrap();
+        let plain = dir.join("image.png");
+        std::fs::write(&plain, b"x").unwrap();
+
+        let d = dir.display();
+        for form in [
+            format!("{d}/image.png"),
+            format!("  {d}/image.png  "),
+            format!("'{d}/image.png'"),
+            format!("\"{d}/image.png\""),
+            format!("file://{d}/image.png"),
+        ] {
+            assert_eq!(as_dropped_file(&form), Some(plain.clone()), "{form}");
+        }
+        // Spaces, escaped the two ways terminals escape them.
+        assert_eq!(
+            as_dropped_file(&format!("{d}/mon\\ rapport.pdf")),
+            Some(spaced.clone())
+        );
+        assert_eq!(
+            as_dropped_file(&format!("'{d}/mon rapport.pdf'")),
+            Some(spaced)
+        );
+
+        // Text that is not a file stays text, however path-shaped.
+        assert_eq!(as_dropped_file("/etc/passwd/nope"), None);
+        assert_eq!(as_dropped_file("bonjour tout le monde"), None);
+        assert_eq!(as_dropped_file(""), None);
+        // A directory is not something to send.
+        assert_eq!(as_dropped_file(&d.to_string()), None);
+        // Several lines is a paste, whatever the first one is.
+        assert_eq!(as_dropped_file(&format!("{d}/image.png\nsecond line")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the box shows is the file's name; what Enter sends is its path.
+    #[test]
+    fn an_attachment_shows_as_a_name_and_submits_as_a_command() {
+        let mut app = App::new("t".into());
+        app.attached.push(PathBuf::from("/tmp/mes docs/image.png"));
+        app.input.push_str("tiens");
+
+        assert_eq!(app.input_display(), "[image.png] tiens");
+        assert_eq!(
+            app.submit(),
+            vec!["/send /tmp/mes docs/image.png".to_owned(), "tiens".to_owned()]
+        );
+        // Submitting empties both, so the next line starts clean.
+        assert!(app.attached.is_empty());
+        assert!(app.input.is_empty());
+        assert!(app.submit().is_empty(), "nothing to send is nothing sent");
+    }
+
+    /// A pasted paragraph is one line, not several submissions.
+    #[test]
+    fn a_multi_line_paste_stays_one_line() {
+        let mut app = App::new("t".into());
+        app.paste("deux\nlignes\r\ncollees");
+        assert_eq!(app.input, "deux lignes  collees");
+        assert!(app.attached.is_empty());
     }
 
     #[test]

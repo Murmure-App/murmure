@@ -77,6 +77,13 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # safelog::DisplayRedacted.
 safelog = "0.9"
 
+# Base64 for the OSC 52 clipboard escape. Named rather than hand-rolled, and it
+# costs nothing: arti already compiles it, so this adds no build time and no new
+# code to the tree. The alternative to OSC 52 is a clipboard crate, which on
+# Linux wants X11 or Wayland libraries at build time and would break the one
+# build recipe that works on all three platforms.
+data-encoding = "2"
+
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 rand = "0.8"
