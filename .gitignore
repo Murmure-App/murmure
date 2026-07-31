@@ -6,3 +6,6 @@
 # The glob matters — `.murmure-b` is a second local instance, and its seed is a
 # private key just like the first one's.
 /.murmure*
+# macOS Finder metadata. Not a glob anchored to the root: Finder drops one of
+# these in every directory it has ever displayed.
+.DS_Store
