@@ -1,3 +1,5 @@
 /target
-# Milestone run directory: identity seed and the two Tor client state/cache pairs.
-/.murmure
+# Run directories: identity seed, sealed book, Tor state and cache.
+# The glob matters — `.murmure-b` is a second local instance, and its seed is a
+# private key just like the first one's.
+/.murmure*
