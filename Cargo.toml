@@ -10,10 +10,16 @@ edition = "2024"
 # onion-service-service  -> publish a v3 onion service (implies `keymgr`)
 # onion-service-client   -> dial a .onion address
 # experimental-api       -> TorClient::launch_onion_service_with_hsid (route A)
+# static-sqlite          -> compile SQLite from source instead of linking a
+#   system one. tor-dirmgr caches the Tor consensus in SQLite, and without this
+#   the link step fails on Windows (`LNK1181: cannot open sqlite3.lib`, there is
+#   no system SQLite) and on a fresh Linux without `libsqlite3-dev`. Costs a
+#   minute of C compilation and buys one build recipe on all three platforms.
 arti-client = { version = "=0.44.0", features = [
     "experimental-api",
     "onion-service-client",
     "onion-service-service",
+    "static-sqlite",
 ] }
 
 # Named directly so murmure can build the onion-service config, the nickname,

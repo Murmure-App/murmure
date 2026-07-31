@@ -20,7 +20,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use rand::RngCore as _;
 use tor_hscrypto::pk::{HsId, HsIdKey, HsIdKeypair};
 use tor_llcrypto::pk::ed25519;
@@ -32,7 +32,10 @@ pub const SEED_LEN: usize = 32;
 pub struct Identity {
     /// The secret seed. Never printed, never logged.
     seed: [u8; SEED_LEN],
-    /// Where the seed lives on disk.
+    /// Where the seed lives on disk. Only `check_permissions` reads it, and that
+    /// has nothing to check off Unix — hence the allow rather than a cfg on the
+    /// field, which would make the two constructors platform-specific too.
+    #[cfg_attr(not(unix), allow(dead_code))]
     path: PathBuf,
 }
 
@@ -92,13 +95,14 @@ impl Identity {
         file.sync_all()
             .with_context(|| format!("flushing the identity seed at {}", path.display()))?;
 
-        // On platforms where `mode` is not available, tighten after the fact.
-        #[cfg(not(unix))]
-        {
-            let mut perms = fs::metadata(path)?.permissions();
-            perms.set_readonly(false);
-            fs::set_permissions(path, perms)?;
-        }
+        // Off Unix there is nothing to tighten here. std exposes only the
+        // read-only flag, which is not a permission — setting it would restrict
+        // nobody while looking like it did. On Windows the file inherits the
+        // profile directory's ACL: the owner, SYSTEM and Administrators.
+        //
+        // ponytail: an ACL narrowed to the owner alone needs the win32 API and a
+        // Windows-only dependency. Worth it the day murmure runs on a shared
+        // Windows machine; the profile ACL covers a personal one.
 
         let this = Self {
             seed,
@@ -119,7 +123,8 @@ impl Identity {
                 .mode()
                 & 0o777;
             if mode & 0o077 != 0 {
-                bail!(
+                // Qualified: the import would be unused off Unix.
+                anyhow::bail!(
                     "{} is mode {mode:o}; the identity seed must be 0600. \
                      Run: chmod 600 {}",
                     self.path.display(),
