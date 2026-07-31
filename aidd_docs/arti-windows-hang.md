@@ -17,6 +17,11 @@ own periodic tasks (e.g. `tor_circmgr::hspool`) never fire again.
 Reproduced on **two independent Windows machines on two different networks**.
 The same code bootstraps in **3.3 s** on macOS from a cold cache.
 
+Windows is documented as a supported platform: `crates/arti/README.md` lists a
+Windows configuration path alongside Unix and macOS, and the troubleshooting
+guide names `schannel` as the Windows TLS backend. No caveat marks it as
+best-effort.
+
 ## Versions
 
 - `arti-client` 0.44.0, embedded (not the `arti` CLI)
