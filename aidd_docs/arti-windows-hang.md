@@ -59,6 +59,30 @@ One core saturated plus zero log output suggests a future being polled in a
 tight loop without ever completing, rather than a lock deadlock (CPU would be
 0 %) or a fault in the cell-handling path (which logs).
 
+The stall is per-stream and it repeats. In one run the directory request was
+abandoned after about ten seconds —
+
+```
+13:29:11.633  reactor shutdown  tunnel_id=Tunnel 1 reason=command channel drop
+13:29:12.648  Returning existing tunnel.
+13:29:12.649  sending relay cell ... msg: BeginDir(BeginDir)
+13:29:12.649  sending relay cell ... msg: Data("GET /tor/status-vote/current/consensus-microdesc ...")
+13:29:13.591  handling cell ... cell=Relay(..)
+              *** silence again ***
+```
+
+— retried on a second circuit, streamed cells for another ~0.9 s, and stopped
+the same way. So some of arti's timers do fire; what never finishes is the
+directory fetch itself. The time from `GET` to silence is not constant: 0.2 s
+on the first attempt, 0.9 s on the second.
+
+Issue #2651 (congestion-control event counters not updated when the clock is
+reported as stalled) looked like a fit: Windows has a ~15.6 ms clock
+granularity, and a stream that stops mid-transfer with flow control still
+alive is the shape it would take. It does not hold — rebuilding with
+`flowctl-cc` removed from the `arti-client` feature list produces exactly the
+same freeze at the same point.
+
 ## Environment
 
 - arti 2.5.0 CLI, default features plus `static-sqlite`
@@ -76,6 +100,7 @@ tight loop without ever completing, rather than a lock deadlock (CPU would be
 | Decompression (`zstd`, `xz`) | Identical with `compression` off, i.e. `accept-encoding: deflate, identity`. |
 | Application code | Reproduced by the stock `arti` CLI with no third-party code. |
 | Lock deadlock | CPU is not 0 %: exactly one core is saturated. |
+| Congestion control (#2651) | Identical freeze with `flowctl-cc` disabled. |
 
 ## Second, unrelated finding: `cargo install arti` does not link on Windows
 
