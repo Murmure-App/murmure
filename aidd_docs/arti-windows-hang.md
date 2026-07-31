@@ -1,97 +1,105 @@
-# Bug report — arti 0.44.0 hangs on Windows during consensus download
+# Bug report — arti hangs on Windows while fetching the first consensus
 
 Draft for <https://gitlab.torproject.org/tpo/core/arti/-/issues>.
-Title suggestion: *Client hangs with one core pegged while downloading the
-first consensus (Windows, 0.44.0)*.
+Anonymous filing is possible via <https://anonticket.torproject.org/>.
+
+Title: *arti 2.5.0 hangs during initial consensus download on Windows, one core
+pegged*
 
 ---
 
-## Summary
+## Reproducer
 
-On Windows, `arti-client` 0.44.0 reaches 15 % of bootstrap, builds a one-hop
-directory circuit, sends the consensus request, receives several hundred relay
-cells over roughly 0.8 s — and then stops making progress permanently. One CPU
-core stays at 100 % indefinitely. No further log output at `TRACE`, and arti's
-own periodic tasks (e.g. `tor_circmgr::hspool`) never fire again.
-
-Reproduced on **two independent Windows machines on two different networks**.
-The same code bootstraps in **3.3 s** on macOS from a cold cache.
-
-Windows is documented as a supported platform: `crates/arti/README.md` lists a
-Windows configuration path alongside Unix and macOS, and the troubleshooting
-guide names `schannel` as the Windows TLS backend. No caveat marks it as
-best-effort.
-
-## Versions
-
-- `arti-client` 0.44.0, embedded (not the `arti` CLI)
-- Windows 11, x86_64-pc-windows-msvc
-- Rust stable 1.97
-- Features: `tokio`, `compression`, `flowctl-cc`, `rustls`, `experimental-api`,
-  `onion-service-client`, `onion-service-service`, `static-sqlite`
-
-## What it looks like
+Two commands, on a Windows 11 machine with the MSVC build tools and Rust stable:
 
 ```
-[   0.0s] 0%
-[   0.1s] 8%
-[   0.2s] 15%
-<nothing further; one core at 100 % forever>
+cargo install arti --features static-sqlite
+arti proxy
 ```
 
-Trace excerpt, the last thing that happens:
+```
+2026-07-31T13:12:34Z  INFO arti::subcommands::proxy: Starting Arti 2.5.0 in proxy mode on localhost port 9150 ...
+2026-07-31T13:12:34Z  INFO tor_memquota::mtracker: Memory quota tracking initialised max=8.00 GiB low_water=6.00 GiB
+2026-07-31T13:12:34Z  INFO arti::proxy: Listening on [::1]:9150
+2026-07-31T13:12:34Z  INFO arti::proxy: Listening on 127.0.0.1:9150
+2026-07-31T13:12:34Z  INFO tor_dirmgr: Didn't get usable directory from cache.
+2026-07-31T13:12:34Z  INFO tor_dirmgr::bootstrap: 1: Looking for a consensus. attempt=1
+2026-07-31T13:12:35Z  INFO arti::reload_cfg: Successfully reloaded configuration.
+```
+
+Nothing further is ever printed. `arti.exe` sits at 6.2 % CPU — on a 16-thread
+machine, exactly one core at 100 % — indefinitely. Bootstrap never completes and
+never retries.
+
+## What the client is doing when it stops
+
+Captured from an embedded `arti-client` 0.44.0 with
+`RUST_LOG=tor_proto=trace,tor_circmgr=trace`. The client gets much further than
+the `INFO` log suggests:
 
 ```
 12:52:24.856  Handshake complete; circuit created.        circ_id=Circ 0.0
 12:52:24.856  Circuit creation success hop=0 delay=97.6575ms
 12:52:24.857  sending relay cell ... msg: BeginDir(BeginDir)
 12:52:24.858  sending relay cell ... msg: Data("GET /tor/status-vote/current/consensus-microdesc HTTP/1.0 ...")
-12:52:24.887  handling cell ... cell=Relay(..)     ← hundreds of these
-   ...        (flow control works: Sendme in, Sendme out)
+12:52:24.887  handling cell ... cell=Relay(..)      ← several hundred of these
+   ...        flow control works: Sendme in, Sendme out
 12:52:25.296  handling cell ... cell=Relay(..)
-              *** last log line, 60+ s of silence ***
+              *** last log line; silence from here on ***
 ```
 
-## What we ruled out, with evidence
+So: the directory circuit builds, the request goes out, consensus data streams
+back at full speed for roughly 0.8 s, and then the client stops. arti's own
+periodic tasks stop too — on a multi-threaded runtime,
+`tor_circmgr::hspool: launching 3 NAIVE and 1 GUARDED circuits` keeps firing
+every 30 s for twelve minutes while nothing else progresses; on a
+`current_thread` runtime the whole client wedges.
+
+One core saturated plus zero log output suggests a future being polled in a
+tight loop without ever completing, rather than a lock deadlock (CPU would be
+0 %) or a fault in the cell-handling path (which logs).
+
+## Environment
+
+- arti 2.5.0 CLI, default features plus `static-sqlite`
+- Also reproduced with embedded `arti-client` 0.44.0
+- Windows 11, `x86_64-pc-windows-msvc`, Rust stable 1.97
+- Reproduced on **two independent Windows machines on two different networks**
+
+## Ruled out, with evidence
 
 | Hypothesis | How it was ruled out |
 | --- | --- |
-| Network filtering Tor | A macOS client bootstraps in 3.3 s on the *same* Wi-Fi. On the other machine's network, Tor Browser builds a full circuit and reaches an onion service. |
-| Clock skew | Log timestamps on both Windows machines agree with a reference host to within a minute. |
+| Network filtering Tor | A macOS client bootstraps in 3.3 s from a cold cache on the *same* Wi-Fi as one of the failing machines. On the other machine's network, Tor Browser builds a full three-hop circuit and reaches an onion service. |
+| Clock skew | Log timestamps on both Windows machines agree with a reference host. |
 | TLS backend | Identical behaviour with `native-tls` (schannel) and with `rustls` + `ring`. |
-| Decompression (`zstd` / `xz`) | Identical behaviour with `compression` disabled, i.e. `accept-encoding: deflate, identity`. |
-| Application code | Reproduced by a bare `bootstrap_client` call with no UI and no other tasks. |
-| Deadlock on a lock | CPU is not 0 %: exactly one core is saturated. It is a spin, not a block. |
+| Decompression (`zstd`, `xz`) | Identical with `compression` off, i.e. `accept-encoding: deflate, identity`. |
+| Application code | Reproduced by the stock `arti` CLI with no third-party code. |
+| Lock deadlock | CPU is not 0 %: exactly one core is saturated. |
 
-## Interpretation
+## Second, unrelated finding: `cargo install arti` does not link on Windows
 
-One future appears to be polled in a tight loop without ever completing. The
-CPU figure (6.25 % of a 16-thread machine = exactly one core) and the total
-absence of log output point at a poll loop rather than at the cell-handling
-path, which does log.
-
-On a `current_thread` runtime the whole client wedges, which matches the
-observation above. On a multi-threaded runtime, unrelated periodic tasks keep
-running while bootstrap never finishes — which is what the first machine showed
-at `DEBUG` level: `hspool: launching 3 NAIVE and 1 GUARDED circuits` kept
-appearing every 30 s for twelve minutes while nothing else progressed.
-
-## Secondary, unrelated finding: `cargo install arti` fails to link on Windows
-
-Worth its own issue. On a Windows machine with the MSVC build tools and nothing
-else, the default feature set does not link:
+On a Windows machine with the MSVC build tools and nothing else, the default
+feature set fails at the link step:
 
 ```
 LINK : fatal error LNK1181: cannot open input file 'sqlite3.lib'
 ```
 
-`rusqlite` looks for a system SQLite, and Windows has none. `cargo install arti
---features static-sqlite` works around it. A fresh Windows user following the
-install instructions hits this before anything else, so `static-sqlite` may be
-worth defaulting on `cfg(windows)`.
+`rusqlite` looks for a system SQLite and Windows has none. `--features
+static-sqlite` works around it. Since the README directs users to build from
+source ("We expect to be providing official binaries soon"), this is the first
+wall a Windows newcomer hits. Enabling `static-sqlite` by default on
+`cfg(windows)` would remove it.
 
-## Not yet checked
+## Note on platform support
 
-- Whether the `arti` CLI (`arti proxy`) shows the same hang. That would separate
-  "arti on Windows" from "this feature combination".
+Windows appears to be treated as supported: `crates/arti/README.md` documents a
+Windows configuration path alongside Unix and macOS, and the troubleshooting
+guide names `schannel` as the Windows TLS backend. We could not find a support
+tier or a published CI platform matrix, so if Windows is in fact best-effort,
+saying so in the README would save people time.
+
+## Not yet investigated
+
 - Which thread is spinning. No native debugger was attached.
