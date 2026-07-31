@@ -38,6 +38,17 @@ pub enum Ended {
     InputClosed,
 }
 
+impl Ended {
+    /// What to tell the operator, using the name they know the peer by.
+    pub fn describe(self, peer: &str) -> String {
+        match self {
+            Ended::PeerHungUp => format!("{peer} hung up"),
+            Ended::WeHungUp => "you hung up".to_owned(),
+            Ended::InputClosed => "input closed".to_owned(),
+        }
+    }
+}
+
 /// Run a conversation over an open stream.
 ///
 /// `lines` is borrowed rather than consumed: when the conversation ends, the

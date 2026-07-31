@@ -148,10 +148,13 @@ where
 {
     let mut filled = 0;
     while filled < buf.len() {
-        let n = r
-            .read(&mut buf[filled..])
-            .await
-            .context("reading from the stream")?;
+        let n = match r.read(&mut buf[filled..]).await {
+            Ok(n) => n,
+            // A peer that hung up is not a failure, even though the transport
+            // reports one. See `is_hangup`.
+            Err(e) if is_hangup(&e) => 0,
+            Err(e) => return Err(e).context("reading from the stream"),
+        };
         if n == 0 {
             if filled == 0 {
                 return Ok(ReadEnd::Eof);
@@ -164,6 +167,26 @@ where
         filled += n;
     }
     Ok(ReadEnd::Filled)
+}
+
+/// Is this read error just the other side hanging up?
+///
+/// Closing a Tor stream is not a clean EOF. `DataWriter::poll_close` sends an
+/// END cell with reason `MISC` (`tor-proto-0.44.0/src/stream.rs:82`), and the
+/// reading side turns every reason other than `DONE` into an error
+/// (`tor-proto-0.44.0/src/client/stream/data.rs:503`). So a peer typing `/bye`
+/// arrives here as a failure rather than as end-of-stream.
+///
+/// Matching on the message is unpleasant, and it is what the transport offers:
+/// the error is an `io::Error` whose kind is `Other`, so the kind carries
+/// nothing. The same string-matching approach is already used, for the same
+/// reason, in `transport::tor::is_key_already_exists`.
+///
+/// ponytail: if arti ever exposes a typed end-of-stream reason, replace this
+/// with it — the whole knowledge lives in this one function.
+fn is_hangup(err: &std::io::Error) -> bool {
+    let text = err.to_string();
+    text.contains("END cell") || text.contains("stream closed")
 }
 
 #[cfg(test)]
@@ -236,6 +259,48 @@ mod tests {
             err.to_string().contains("over the"),
             "expected a size-limit error, got: {err}"
         );
+    }
+
+    /// A peer hanging up reaches us as a transport error, and must still read
+    /// as the end of the conversation rather than as a fault.
+    #[test]
+    fn a_tor_hangup_reads_as_end_of_stream() {
+        use std::io::Error;
+
+        struct HangsUp;
+        impl AsyncRead for HangsUp {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(Error::other(
+                    "Received an END cell with reason MISC",
+                )))
+            }
+        }
+
+        let got = futures::executor::block_on(read_frame(&mut HangsUp)).unwrap();
+        assert!(got.is_none(), "a hang-up must be None, not an error");
+    }
+
+    /// A real read failure must still be a failure.
+    #[test]
+    fn a_genuine_read_error_is_not_swallowed() {
+        use std::io::{Error, ErrorKind};
+
+        struct Broken;
+        impl AsyncRead for Broken {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "disk on fire")))
+            }
+        }
+
+        assert!(futures::executor::block_on(read_frame(&mut Broken)).is_err());
     }
 
     /// An over-long body is refused by the sender, not discovered by the peer.

@@ -75,7 +75,15 @@ fn main() -> ExitCode {
         }
     };
 
-    match runtime.block_on(run()) {
+    let outcome = runtime.block_on(run());
+
+    // The stdin reader lives on a blocking thread, parked in a `read` that only
+    // returns on the next keypress. Dropping the runtime waits for blocking
+    // tasks, so `/quit` would hang until the operator typed one more line.
+    // Nothing left to do at this point needs that thread.
+    runtime.shutdown_background();
+
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("murmure: {e:#}");
@@ -184,8 +192,12 @@ async fn run() -> Result<()> {
                 // discovery (see INSTALL.md) will make possible.
                 println!("\n-- incoming call --");
                 let (reader, writer) = stream.split();
-                let ended = chat::run(reader, writer, "them", &mut lines).await?;
-                println!("-- call ended ({ended:?}) --\n");
+                // A dropped call must never end the program: print why and go
+                // back to listening.
+                match chat::run(reader, writer, "them", &mut lines).await {
+                    Ok(ended) => println!("-- {} --\n", ended.describe("they")),
+                    Err(e) => println!("-- call dropped: {e:#} --\n"),
+                }
             }
             Event::Called(None) => bail!("the incoming-stream channel closed"),
             // stdin reached EOF: Ctrl-D, or a piped script running out.
@@ -302,8 +314,11 @@ async fn call(
 
     println!("-- connected to {name} --");
     let (reader, writer) = stream.split();
-    let ended = chat::run(reader, writer, name, lines).await?;
-    println!("-- call ended ({ended:?}) --\n");
+    // Same as an incoming call: a dropped call is reported, not propagated.
+    match chat::run(reader, writer, name, lines).await {
+        Ok(ended) => println!("-- {} --\n", ended.describe(name)),
+        Err(e) => println!("-- call dropped: {e:#} --\n"),
+    }
     Ok(())
 }
 
