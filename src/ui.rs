@@ -164,6 +164,11 @@ struct App {
     history: VecDeque<Entry>,
     /// What is being typed.
     input: String,
+    /// Where the text cursor sits in [`Self::input`], as a byte index on a char
+    /// boundary. Kept as bytes because that is what `String::insert` and
+    /// `String::remove` take; every move goes through a boundary search, so it
+    /// can never land mid-character.
+    cursor: usize,
     /// Files dropped on the window, waiting to be sent.
     ///
     /// A terminal turns a drag-and-drop into a paste of the file's path, which
@@ -195,6 +200,7 @@ impl App {
             title,
             history: VecDeque::new(),
             input: String::new(),
+            cursor: 0,
             attached: Vec::new(),
             scroll_back: 0,
             viewport: (80, PAGE),
@@ -243,24 +249,66 @@ impl App {
         // the keyboard; a pasted paragraph becomes one line instead.
         for c in text.chars() {
             match c {
-                '\n' | '\r' => self.input.push(' '),
+                '\n' | '\r' => self.insert(' '),
                 c if c.is_control() => {}
-                c => self.input.push(c),
+                c => self.insert(c),
             }
         }
     }
 
-    /// What the input box shows: the attachments, then what is being typed.
+    /// Type one character where the cursor is.
+    fn insert(&mut self, c: char) {
+        self.input.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Delete the character before the cursor. `false` when there was none.
+    fn backspace(&mut self) -> bool {
+        let Some(prev) = self.input[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+        else {
+            return false;
+        };
+        self.input.remove(prev);
+        self.cursor = prev;
+        true
+    }
+
+    /// Move the cursor one character left or right, stopping at either end.
+    fn move_cursor(&mut self, right: bool) {
+        self.cursor = if right {
+            self.input[self.cursor..]
+                .char_indices()
+                .nth(1)
+                .map_or(self.input.len(), |(i, _)| self.cursor + i)
+        } else {
+            self.input[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(i, _)| i)
+        };
+    }
+
+    /// What the input box shows: what is being typed, then the attachments.
+    ///
+    /// Attachments come last because they are the most recent thing that
+    /// happened — dropping a file on `/send` used to render `[image.jpg] /send`,
+    /// which reads backwards. Putting them after the text also keeps them clear
+    /// of the cursor, which only ever moves inside the typed part.
     fn input_display(&self) -> String {
-        let mut shown = String::new();
+        let mut shown = self.input.clone();
         for path in &self.attached {
             let name = path
                 .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.to_string_lossy().into_owned());
-            shown.push_str(&format!("[{name}] "));
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy();
+            if !shown.is_empty() && !shown.ends_with(' ') {
+                shown.push(' ');
+            }
+            shown.push_str(&format!("[{name}]"));
         }
-        shown.push_str(&self.input);
         shown
     }
 
@@ -275,8 +323,14 @@ impl App {
             .drain(..)
             .map(|p| format!("/send {}", p.display()))
             .collect();
+
         let text = std::mem::take(&mut self.input);
-        if !text.trim().is_empty() {
+        self.cursor = 0;
+        // Typing `/send` and *then* dropping a file is the obvious way to try
+        // it. The chips already carry the whole command, so the bare verb left
+        // over would only produce "usage: /send <path>" after the file went.
+        let redundant = !lines.is_empty() && text.trim() == "/send";
+        if !text.trim().is_empty() && !redundant {
             lines.push(text);
         }
         lines
@@ -398,13 +452,19 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<String>) 
     }
     // Scrolling is harmless while starting up; typing is not, because nothing
     // is reading it yet.
-    if !app.accepting && !matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::End) {
+    if !app.accepting
+        && !matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+        )
+    {
         return Ok(false);
     }
 
     match key.code {
         KeyCode::Char('u') if ctrl => {
             app.input.clear();
+            app.cursor = 0;
             app.attached.clear();
         }
         // Ctrl-V, because a terminal reserves Ctrl-Shift-V for itself and
@@ -425,12 +485,26 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<String>) 
         KeyCode::Char('e') if ctrl => app.scroll_back = 0,
         KeyCode::Up => app.scroll(1),
         KeyCode::Down => app.scroll(-1),
-        KeyCode::Char(c) => app.input.push(c),
+        KeyCode::Char(c) => app.insert(c),
+        // Editing inside the line, not just at its end. A 62-character address
+        // with one wrong character used to mean clearing the lot and starting
+        // over.
+        KeyCode::Left => app.move_cursor(false),
+        KeyCode::Right => app.move_cursor(true),
+        KeyCode::Home => app.cursor = 0,
+        // End belongs to the input box; Ctrl-E is the one that jumps the history
+        // back to the newest line, and it is the one the help names.
+        KeyCode::End => app.cursor = app.input.len(),
         // Once the text is gone, Backspace takes attachments off the end, so a
         // file dropped by mistake is removed the way anything else is.
         KeyCode::Backspace => {
-            if app.input.pop().is_none() {
+            if !app.backspace() {
                 app.attached.pop();
+            }
+        }
+        KeyCode::Delete => {
+            if app.cursor < app.input.len() {
+                app.input.remove(app.cursor);
             }
         }
         KeyCode::Enter => {
@@ -448,7 +522,6 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<String>) 
         }
         KeyCode::PageUp => app.scroll(app.page() as isize),
         KeyCode::PageDown => app.scroll(-(app.page() as isize)),
-        KeyCode::End => app.scroll_back = 0,
         _ => {}
     }
     Ok(false)
@@ -546,7 +619,10 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     // Put the real cursor where the text is, so the terminal's own blink is the
     // cursor and there is nothing to draw. No cursor while input is refused.
     if app.accepting {
-        let cursor_x = input.x + 1 + shown.chars().count() as u16;
+        // Counted over the typed text only, up to the cursor. The attachment
+        // chips are drawn after it, so they never shift it.
+        let before = app.input[..app.cursor].chars().count() as u16;
+        let cursor_x = input.x + 1 + before;
         frame.set_cursor_position((cursor_x.min(input.right().saturating_sub(2)), input.y + 1));
     }
 }
@@ -825,14 +901,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The cursor moves inside the line, and edits land where it is.
+    #[test]
+    fn the_cursor_moves_and_edits_in_the_middle() {
+        let mut app = App::new("t".into());
+        for c in "bonjur".chars() {
+            app.insert(c);
+        }
+        // Two steps back from the end lands between `j` and `u`.
+        app.move_cursor(false);
+        app.move_cursor(false);
+        app.insert('o');
+        assert_eq!(app.input, "bonjour");
+        assert_eq!(app.cursor, 5, "the cursor follows what was just typed");
+
+        // Backspace takes what is before the cursor, not what is at the end.
+        assert!(app.backspace());
+        assert_eq!(app.input, "bonjur");
+
+        // Neither end runs off.
+        app.cursor = 0;
+        app.move_cursor(false);
+        assert_eq!(app.cursor, 0);
+        assert!(!app.backspace(), "nothing before the start");
+        app.cursor = app.input.len();
+        app.move_cursor(true);
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    /// Multi-byte characters must not be split by a cursor move.
+    #[test]
+    fn the_cursor_steps_over_whole_characters() {
+        let mut app = App::new("t".into());
+        for c in "éàü".chars() {
+            app.insert(c);
+        }
+        assert_eq!(app.cursor, 6, "three two-byte characters");
+        app.move_cursor(false);
+        assert_eq!(app.cursor, 4);
+        app.insert('x');
+        assert_eq!(app.input, "éàxü");
+        assert!(app.backspace());
+        assert_eq!(app.input, "éàü");
+    }
+
     /// What the box shows is the file's name; what Enter sends is its path.
     #[test]
     fn an_attachment_shows_as_a_name_and_submits_as_a_command() {
         let mut app = App::new("t".into());
         app.attached.push(PathBuf::from("/tmp/mes docs/image.png"));
-        app.input.push_str("tiens");
+        for c in "tiens".chars() {
+            app.insert(c);
+        }
 
-        assert_eq!(app.input_display(), "[image.png] tiens");
+        // The chip goes after the text, because dropping it is what just
+        // happened — `[image.png] tiens` read backwards.
+        assert_eq!(app.input_display(), "tiens [image.png]");
         assert_eq!(
             app.submit(),
             vec!["/send /tmp/mes docs/image.png".to_owned(), "tiens".to_owned()]
@@ -841,6 +965,20 @@ mod tests {
         assert!(app.attached.is_empty());
         assert!(app.input.is_empty());
         assert!(app.submit().is_empty(), "nothing to send is nothing sent");
+    }
+
+    /// Typing `/send` and then dropping a file must not leave the bare verb
+    /// behind, which would only produce a usage error after the file went.
+    #[test]
+    fn a_dropped_file_absorbs_a_typed_send() {
+        let mut app = App::new("t".into());
+        for c in "/send".chars() {
+            app.insert(c);
+        }
+        app.attached.push(PathBuf::from("/tmp/image.JPG"));
+
+        assert_eq!(app.input_display(), "/send [image.JPG]");
+        assert_eq!(app.submit(), vec!["/send /tmp/image.JPG".to_owned()]);
     }
 
     /// A pasted paragraph is one line, not several submissions.

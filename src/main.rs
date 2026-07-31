@@ -593,6 +593,7 @@ fn help(screen: &Screen) {
         "  up / down                     scroll one line",
         "  Ctrl-B / Ctrl-F               scroll one page",
         "  Ctrl-E                        jump back to the newest line",
+        "  left / right / Home / End     move inside what you are typing",
         "  Ctrl-V                        paste (no Shift needed)",
         "  Ctrl-U                        clear the input   Ctrl-C  leave",
     ] {
