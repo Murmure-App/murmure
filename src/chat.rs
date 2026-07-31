@@ -20,6 +20,7 @@ use futures::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use crate::proto::{self, MAX_TEXT, Message};
+use crate::ui::{Kind, Screen};
 
 /// How many outbound frames may queue before the sender waits.
 ///
@@ -58,6 +59,7 @@ pub async fn run<R, W>(
     writer: W,
     peer: &str,
     lines: &mut mpsc::Receiver<String>,
+    screen: &Screen,
 ) -> Result<Ended>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -75,11 +77,12 @@ where
 
     let peer_label = peer.to_owned();
     let replies = outbox.clone();
+    let on_screen = screen.clone();
     let mut reader = reader;
     let reading = tokio::spawn(async move {
         while let Some(msg) = proto::read_frame(&mut reader).await? {
             if let Some(line) = render(&msg, &peer_label) {
-                println!("{line}");
+                on_screen.say(Kind::Theirs, line);
             }
             if let Some(reply) = respond(&msg) {
                 // A closed outbox means the writer is gone, i.e. the
@@ -102,15 +105,32 @@ where
             }
             typed = lines.recv() => {
                 let Some(line) = typed else { break Ended::InputClosed };
-                match line.trim() {
-                    "" => continue,
-                    "/bye" => break Ended::WeHungUp,
-                    _ => {}
-                }
+                let line = match classify(&line) {
+                    Typed::Nothing => continue,
+                    Typed::HangUp => break Ended::WeHungUp,
+                    // Anything else starting with '/' stays here. Letting it
+                    // through would send `/add alice <address>` — a contact's
+                    // address — straight to whoever is on the other end.
+                    Typed::UnknownCommand(verb) => {
+                        screen.error(format!(
+                            "{verb} is not available during a call — /bye first. \
+                             (start a line with // to send a literal slash)"
+                        ));
+                        continue;
+                    }
+                    Typed::Message(text) => text,
+                };
                 if line.len() > MAX_TEXT {
-                    eprintln!("(line dropped: {} bytes, limit is {MAX_TEXT})", line.len());
+                    screen.error(format!(
+                        "line dropped: {} bytes, the limit is {MAX_TEXT}",
+                        line.len()
+                    ));
                     continue;
                 }
+                // Echo our own line: without it the conversation is one-sided
+                // on screen, and there is no way to tell a sent message from a
+                // swallowed one.
+                screen.say(Kind::Mine, format!("you> {line}"));
                 if outbox.send(Message::Text(line)).await.is_err() {
                     break Ended::PeerHungUp;
                 }
@@ -134,6 +154,44 @@ where
     Ok(ended)
 }
 
+/// What a line typed during a call turns out to be.
+#[derive(Debug, PartialEq, Eq)]
+enum Typed {
+    /// Blank; ignore it.
+    Nothing,
+    /// `/bye`.
+    HangUp,
+    /// Any other `/word`. Held back rather than sent.
+    UnknownCommand(String),
+    /// Something to say, with any `//` escape already unwrapped.
+    Message(String),
+}
+
+/// Decide what a typed line is.
+///
+/// A leading `/` means "command" during a call, and there are exactly two
+/// outcomes: hang up, or refuse. Nothing beginning with `/` is ever sent by
+/// accident, because the accident sends secrets. `//` at the start escapes it,
+/// for the rare line that genuinely opens with a slash.
+fn classify(line: &str) -> Typed {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Typed::Nothing;
+    }
+    if let Some(rest) = trimmed.strip_prefix("//") {
+        return Typed::Message(format!("/{rest}"));
+    }
+    if trimmed.starts_with('/') {
+        let verb = trimmed.split_whitespace().next().unwrap_or(trimmed);
+        return if verb == "/bye" {
+            Typed::HangUp
+        } else {
+            Typed::UnknownCommand(verb.to_owned())
+        };
+    }
+    Typed::Message(line.to_owned())
+}
+
 /// What a received message puts on screen, if anything.
 fn render(msg: &Message, peer: &str) -> Option<String> {
     match msg {
@@ -155,6 +213,37 @@ fn respond(msg: &Message) -> Option<Message> {
 mod tests {
     use super::*;
     use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+
+    /// The one that matters: a command typed during a call must never travel.
+    #[test]
+    fn commands_typed_during_a_call_are_never_sent() {
+        assert_eq!(classify("/bye"), Typed::HangUp);
+        assert_eq!(
+            classify("/add alice haticv.onion"),
+            Typed::UnknownCommand("/add".into())
+        );
+        assert_eq!(classify("/call bob"), Typed::UnknownCommand("/call".into()));
+        assert_eq!(classify("/quit"), Typed::UnknownCommand("/quit".into()));
+        assert_eq!(classify("  "), Typed::Nothing);
+    }
+
+    #[test]
+    fn a_double_slash_sends_a_literal_slash() {
+        assert_eq!(classify("//bye"), Typed::Message("/bye".into()));
+        assert_eq!(
+            classify("//usr/bin is where it lives"),
+            Typed::Message("/usr/bin is where it lives".into())
+        );
+    }
+
+    #[test]
+    fn ordinary_lines_are_untouched() {
+        assert_eq!(classify("bonjour"), Typed::Message("bonjour".into()));
+        assert_eq!(
+            classify("et voilà 3/4 du chemin"),
+            Typed::Message("et voilà 3/4 du chemin".into())
+        );
+    }
 
     #[test]
     fn ping_is_answered_with_pong_and_nothing_else_is() {
@@ -186,6 +275,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel::<String>(4);
             tx.send("bonjour".to_owned()).await.unwrap();
             tx.send("/bye".to_owned()).await.unwrap();
+            let (screen, _updates) = crate::ui::channel();
 
             let talking = tokio::spawn(async move {
                 run(
@@ -193,6 +283,7 @@ mod tests {
                     alice_w.compat_write(),
                     "them",
                     &mut rx,
+                    &screen,
                 )
                 .await
             });
