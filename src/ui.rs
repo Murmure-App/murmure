@@ -31,7 +31,11 @@ use tokio::sync::mpsc;
 /// anyway.
 const SCROLLBACK: usize = 2_000;
 
-/// How many lines a PageUp/PageDown moves.
+/// Rows a PageUp/PageDown moves when the viewport height is not known yet.
+///
+/// It normally is — [`App::page`] uses the real height minus a row of overlap,
+/// so a page turn keeps one line of context. This is only the value before the
+/// first frame has been drawn.
 const PAGE: usize = 10;
 
 /// What kind of line this is, which decides how it is coloured.
@@ -131,8 +135,20 @@ struct App {
     history: VecDeque<Entry>,
     /// What is being typed.
     input: String,
-    /// Lines scrolled up from the bottom. Zero means following the tail.
+    /// Screen rows scrolled up from the bottom. Zero means following the tail.
+    ///
+    /// Rows, not entries. Counting entries is the obvious thing and it is
+    /// wrong: with wrapping on, one entry is one to three rows — a 56-character
+    /// address is two, a discovery key is two more — so one press of Up moved
+    /// the view by an amount that depended on what happened to be there, and a
+    /// page turn overshot by a whole screen.
     scroll_back: usize,
+    /// The history box, as of the last frame: usable width, then height.
+    ///
+    /// Kept because wrapping is what turns entries into rows, so nothing can be
+    /// clamped or paged without it. Seeded with a plausible terminal so the
+    /// first keypress behaves even if it lands before the first draw.
+    viewport: (usize, usize),
     /// Whether typed lines are accepted at all. False until Tor is up.
     accepting: bool,
 }
@@ -145,23 +161,48 @@ impl App {
             history: VecDeque::new(),
             input: String::new(),
             scroll_back: 0,
+            viewport: (80, PAGE),
             accepting: false,
         }
     }
 
+    /// Every row the history occupies at the current width.
+    fn total_rows(&self) -> usize {
+        self.history
+            .iter()
+            .map(|e| rows_for(&e.text, self.viewport.0))
+            .sum()
+    }
+
+    /// How far a page key moves: a screenful, less one row of overlap so the
+    /// reader keeps a line they have already seen.
+    fn page(&self) -> usize {
+        self.viewport.1.saturating_sub(1).max(1)
+    }
+
     /// Move the view: positive scrolls back into history, negative comes
     /// forward. Clamped at both ends, so holding a key never overshoots.
-    fn scroll(&mut self, lines: isize) {
-        let moved = self.scroll_back as isize + lines;
-        self.scroll_back = moved.clamp(0, self.history.len() as isize) as usize;
+    fn scroll(&mut self, rows: isize) {
+        // Scrolling stops when the oldest row reaches the top of the box, not
+        // when it reaches the bottom — otherwise the view can be dragged into
+        // empty space above the history.
+        let limit = self.total_rows().saturating_sub(self.viewport.1);
+        let moved = self.scroll_back as isize + rows;
+        self.scroll_back = moved.clamp(0, limit as isize) as usize;
     }
 
     fn push(&mut self, entry: Entry) {
         self.history.push_back(entry);
         while self.history.len() > SCROLLBACK {
-            self.history.pop_front();
-            // Keep the view anchored on the same text as lines fall off the top.
-            self.scroll_back = self.scroll_back.saturating_sub(1);
+            let Some(dropped) = self.history.pop_front() else {
+                break;
+            };
+            // Keep the view anchored on the same text as lines fall off the
+            // top: the offset is measured from the bottom, so it has to lose
+            // exactly the rows that left.
+            self.scroll_back = self
+                .scroll_back
+                .saturating_sub(rows_for(&dropped.text, self.viewport.0));
         }
     }
 }
@@ -193,7 +234,7 @@ async fn event_loop(
     let mut app = App::new(title);
     let mut keys = EventStream::new();
 
-    terminal.draw(|frame| draw(frame, &app)).context("drawing")?;
+    terminal.draw(|frame| draw(frame, &mut app)).context("drawing")?;
 
     loop {
         tokio::select! {
@@ -231,7 +272,7 @@ async fn event_loop(
             }
         }
 
-        terminal.draw(|frame| draw(frame, &app)).context("drawing")?;
+        terminal.draw(|frame| draw(frame, &mut app)).context("drawing")?;
     }
 }
 
@@ -261,8 +302,8 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<String>) 
         // PageUp/PageDown/End except through Fn, so the arrows and the
         // less(1) conventions carry the feature; the named keys stay as
         // aliases for keyboards that have them.
-        KeyCode::Char('b') if ctrl => app.scroll(PAGE as isize),
-        KeyCode::Char('f') if ctrl => app.scroll(-(PAGE as isize)),
+        KeyCode::Char('b') if ctrl => app.scroll(app.page() as isize),
+        KeyCode::Char('f') if ctrl => app.scroll(-(app.page() as isize)),
         KeyCode::Char('e') if ctrl => app.scroll_back = 0,
         KeyCode::Up => app.scroll(1),
         KeyCode::Down => app.scroll(-1),
@@ -281,15 +322,15 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<String>) 
                 }
             }
         }
-        KeyCode::PageUp => app.scroll(PAGE as isize),
-        KeyCode::PageDown => app.scroll(-(PAGE as isize)),
+        KeyCode::PageUp => app.scroll(app.page() as isize),
+        KeyCode::PageDown => app.scroll(-(app.page() as isize)),
         KeyCode::End => app.scroll_back = 0,
         _ => {}
     }
     Ok(false)
 }
 
-fn draw(frame: &mut ratatui::Frame, app: &App) {
+fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let [header, body, input] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -325,6 +366,12 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     // and the newest lines are drawn past the edge and never seen.
     let inner_w = body.width.saturating_sub(2).max(1) as usize;
     let inner_h = body.height.saturating_sub(2) as usize;
+    // Remembered for the next keypress: paging and clamping both need to know
+    // how tall a screen is and how wide a row wraps.
+    app.viewport = (inner_w, inner_h);
+    // A terminal that just got narrower turns entries into more rows, which can
+    // leave the offset pointing past the oldest one.
+    app.scroll(0);
     let (start, end, hidden_rows) = window(&app.history, inner_w, inner_h, app.scroll_back);
 
     let lines: Vec<Line> = app
@@ -388,38 +435,51 @@ fn rows_for(text: &str, width: usize) -> usize {
     text.chars().count().div_ceil(width).max(1)
 }
 
-/// Pick the slice of history to draw, anchored on the bottom.
+/// Pick the slice of history to draw, anchored `scroll_back` rows above the
+/// bottom.
 ///
 /// Returns the half-open entry range and how many rows of the *first* entry to
-/// hide, so that the last visible row is the newest line rather than whatever
-/// happened to fit.
+/// hide. `Paragraph` renders top-down from that offset and clips at the bottom
+/// edge, so a partly visible entry works at either end without help.
 fn window(
     history: &VecDeque<Entry>,
     width: usize,
     height: usize,
     scroll_back: usize,
 ) -> (usize, usize, u16) {
-    let end = history.len().saturating_sub(scroll_back);
-    if height == 0 || end == 0 {
-        return (end, end, 0);
+    if height == 0 || history.is_empty() {
+        return (history.len(), history.len(), 0);
     }
 
-    // Walk backwards from the newest visible entry, adding wrapped heights
-    // until the box is full.
-    let mut start = end;
-    let mut rows = 0usize;
-    for entry in history.iter().take(end).rev() {
-        rows += rows_for(&entry.text, width);
-        start -= 1;
-        if rows >= height {
+    // The whole history is one column of rows. Work out which row sits at the
+    // top of the box, then find the entry it falls inside.
+    let total: usize = history.iter().map(|e| rows_for(&e.text, width)).sum();
+    let top = total.saturating_sub(scroll_back + height);
+
+    let mut start = 0usize;
+    let mut above = 0usize;
+    for entry in history.iter() {
+        let rows = rows_for(&entry.text, width);
+        if above + rows > top {
+            break;
+        }
+        above += rows;
+        start += 1;
+    }
+
+    // Take just enough entries to fill the box. Anything past the bottom edge
+    // would be drawn and clipped, which costs work and changes nothing.
+    let mut end = start;
+    let mut drawn = 0usize;
+    for entry in history.iter().skip(start) {
+        drawn += rows_for(&entry.text, width);
+        end += 1;
+        if drawn >= top - above + height {
             break;
         }
     }
 
-    // If the topmost entry only half fits, hide its first rows rather than
-    // pushing the newest line off the bottom.
-    let hidden = u16::try_from(rows.saturating_sub(height)).unwrap_or(u16::MAX);
-    (start, end, hidden)
+    (start, end, u16::try_from(top - above).unwrap_or(u16::MAX))
 }
 
 fn style_for(kind: Kind) -> Style {
@@ -488,8 +548,10 @@ mod tests {
         let mut one = VecDeque::new();
         one.push_back(entry("hello"));
         assert_eq!(window(&one, 20, 0, 0), (1, 1, 0));
-        // Scrolled back further than the history is long.
-        assert_eq!(window(&one, 20, 5, 99), (0, 0, 0));
+        // Scrolled back further than the history is tall. `App::scroll` clamps
+        // so this cannot arrive from the keyboard, but a window that answered
+        // with an empty range would blank the box instead of pinning to the top.
+        assert_eq!(window(&one, 20, 5, 99), (0, 1, 0));
     }
 
     #[test]
@@ -518,18 +580,53 @@ mod tests {
     #[test]
     fn scrolling_never_runs_past_the_history() {
         let mut app = App::new("t".into());
+        app.viewport = (80, 3);
         for i in 0..5 {
             app.push(entry(&i.to_string()));
         }
 
-        app.scroll(PAGE as isize);
-        assert_eq!(app.scroll_back, 5, "cannot scroll past the oldest line");
-        app.scroll(PAGE as isize);
-        assert_eq!(app.scroll_back, 5);
+        // Five rows in a three-row box: two rows of travel, and no more.
+        app.scroll(app.page() as isize);
+        assert_eq!(app.scroll_back, 2, "cannot scroll past the oldest row");
+        app.scroll(app.page() as isize);
+        assert_eq!(app.scroll_back, 2);
 
-        app.scroll(-(PAGE as isize));
-        assert_eq!(app.scroll_back, 0, "cannot scroll past the newest line");
+        app.scroll(-(app.page() as isize));
+        assert_eq!(app.scroll_back, 0, "cannot scroll past the newest row");
         app.scroll(-1);
         assert_eq!(app.scroll_back, 0);
+    }
+
+    /// History that fits on screen has nothing to scroll.
+    #[test]
+    fn a_short_history_does_not_move() {
+        let mut app = App::new("t".into());
+        app.viewport = (80, 10);
+        app.push(entry("only line"));
+        app.scroll(5);
+        assert_eq!(app.scroll_back, 0);
+    }
+
+    /// The bug this replaced: one press of Up moved the view by however many
+    /// rows the next entry happened to wrap to.
+    #[test]
+    fn one_press_moves_exactly_one_row_however_long_the_lines_are() {
+        let mut app = App::new("t".into());
+        app.viewport = (10, 2);
+        // 4 rows, then 1: five rows of history in a two-row box.
+        app.push(entry(&"x".repeat(40)));
+        app.push(entry("short"));
+
+        app.scroll(1);
+        assert_eq!(app.scroll_back, 1);
+        app.scroll(1);
+        assert_eq!(app.scroll_back, 2, "a wrapped entry is not one step");
+
+        // The top row of the box walks up the wrapped entry one row at a time.
+        // At scroll_back 1 the short line has left the bottom of the box, so
+        // only the wrapped entry is drawn, from its third row.
+        for (back, expect) in [(0, (0, 2, 3)), (1, (0, 1, 2)), (3, (0, 1, 0))] {
+            assert_eq!(window(&app.history, 10, 2, back), expect, "scroll_back {back}");
+        }
     }
 }
