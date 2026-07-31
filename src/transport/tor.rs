@@ -201,23 +201,27 @@ pub async fn wait_until_reachable(svc: &Arc<RunningOnionService>, timeout: Durat
         .map_err(|_| anyhow!("the onion service was still not reachable after {timeout:?}"))?
 }
 
-/// Wait for the first incoming stream and accept it.
+/// Every incoming stream, accepted, as they arrive.
 ///
-/// Returns the accepted stream. Later streams are left unanswered: v1 holds one
-/// conversation at a time, and the contacts book is what makes several make
-/// sense.
-pub async fn accept_one(requests: impl Stream<Item = RendRequest>) -> Result<arti_client::DataStream> {
-    let streams = handle_rend_requests(requests);
-    futures::pin_mut!(streams);
-    let request = streams
-        .next()
-        .await
-        .ok_or_else(|| anyhow!("the incoming-stream channel closed before anyone connected"))?;
-    tracing::info!("incoming stream: {:?}", request.request());
-    request
-        .accept(Connected::new_empty())
-        .await
-        .context("accepting the incoming stream")
+/// A stream that fails to accept is logged and skipped rather than ending the
+/// service: one bad rendezvous must not take the listener down.
+///
+/// The caller decides what to do with each one. v1 holds a single conversation
+/// at a time, so a second caller waits in the queue until the first hangs up —
+/// which is what a phone does, and what the brainstorm asked for.
+pub fn incoming(
+    requests: impl Stream<Item = RendRequest>,
+) -> impl Stream<Item = arti_client::DataStream> {
+    handle_rend_requests(requests).filter_map(|request| async move {
+        tracing::info!("incoming stream: {:?}", request.request());
+        match request.accept(Connected::new_empty()).await {
+            Ok(stream) => Some(stream),
+            Err(e) => {
+                tracing::warn!("accepting an incoming stream failed: {e}");
+                None
+            }
+        }
+    })
 }
 
 /// Dial a `.onion` on [`SERVICE_PORT`] and hand back the open stream.

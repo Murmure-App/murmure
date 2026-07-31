@@ -130,11 +130,6 @@ impl Identity {
         Ok(())
     }
 
-    /// Where this identity is persisted.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// The ed25519 keypair, in the expanded form arti's keystore speaks.
     ///
     /// Returns a fresh value on every call: `HsIdKeypair` is not `Clone`, and
@@ -143,6 +138,19 @@ impl Identity {
         let keypair = ed25519::Keypair::from_bytes(&self.seed);
         let expanded = ed25519::ExpandedKeypair::from(&keypair);
         HsIdKeypair::from(expanded)
+    }
+
+    /// Derive a 32-byte secret from the seed, for a named purpose.
+    ///
+    /// `context` separates purposes: the key sealing the contacts book and the
+    /// key sealing the history must never be the same key, or a flaw in one
+    /// use compromises the other. BLAKE3's `derive_key` is a KDF designed for
+    /// exactly this, so there is no home-made construction here.
+    ///
+    /// Consequence, deliberate and already recorded in the brainstorm: losing
+    /// the seed loses everything it sealed. There is no recovery.
+    pub fn derive_key(&self, context: &str) -> [u8; 32] {
+        blake3::derive_key(context, &self.seed)
     }
 
     /// The `.onion` identity derived from the seed, computed locally.

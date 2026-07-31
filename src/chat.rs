@@ -1,24 +1,22 @@
 //! The conversation loop.
 //!
-//! One open stream, frames in both directions, for as long as both sides stay
-//! connected. Terminal in, terminal out — the TUI replaces the printing later,
-//! not the loop.
+//! One open stream, frames in both directions, until either side hangs up.
+//!
+//! # Who owns the keyboard
+//!
+//! Not this module. `main` owns the one and only stdin reader and hands typed
+//! lines here through a channel, because the idle loop and the conversation both
+//! need them and two concurrent readers on stdin lose lines to each other.
 //!
 //! # Shape
 //!
-//! Three concurrent jobs share one stream:
-//!
-//! - the **reader** pulls frames off the wire and reacts to them;
-//! - the **keyboard** turns typed lines into [`Message::Text`];
-//! - the **writer** is the only thing that touches the write half.
-//!
-//! Reader and keyboard both need to send, so they queue through a channel
-//! instead of sharing the writer behind a lock. One owner, no contention, and
-//! the send order is whatever reached the queue first.
+//! Two concurrent jobs share the stream. The **reader** pulls frames off the
+//! wire; the **writer** is the only thing that touches the write half. Typed
+//! lines and automatic replies (a `Pong` for a `Ping`) both queue to the writer
+//! through one channel, so there is one owner and no lock.
 
-use anyhow::{Context as _, Result};
+use anyhow::{Result, bail};
 use futures::io::{AsyncRead, AsyncWrite};
-use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::sync::mpsc;
 
 use crate::proto::{self, MAX_TEXT, Message};
@@ -26,20 +24,36 @@ use crate::proto::{self, MAX_TEXT, Message};
 /// How many outbound frames may queue before the sender waits.
 ///
 /// Small on purpose: a backlog here means the network is slower than the typing,
-/// and blocking the keyboard is more honest than growing a buffer nobody reads.
+/// and making the typist wait is more honest than growing a buffer.
 const OUTBOX: usize = 32;
 
-/// Run a conversation over an open stream until either side hangs up.
+/// How a conversation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// The peer closed the stream.
+    PeerHungUp,
+    /// We did, with `/bye`.
+    WeHungUp,
+    /// stdin reached EOF: Ctrl-D, or a piped script running out.
+    InputClosed,
+}
+
+/// Run a conversation over an open stream.
 ///
-/// `peer` is what incoming lines get labelled with on screen.
-pub async fn run<R, W>(reader: R, writer: W, peer: &str) -> Result<()>
+/// `lines` is borrowed rather than consumed: when the conversation ends, the
+/// caller goes back to reading commands from the same keyboard.
+pub async fn run<R, W>(
+    reader: R,
+    writer: W,
+    peer: &str,
+    lines: &mut mpsc::Receiver<String>,
+) -> Result<Ended>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (outbox, mut queued) = mpsc::channel::<Message>(OUTBOX);
 
-    // The single owner of the write half.
     let mut writer = writer;
     let writing = tokio::spawn(async move {
         while let Some(msg) = queued.recv().await {
@@ -48,18 +62,17 @@ where
         Ok::<(), anyhow::Error>(())
     });
 
-    // Incoming frames.
-    let peer = peer.to_owned();
+    let peer_label = peer.to_owned();
     let replies = outbox.clone();
     let mut reader = reader;
     let reading = tokio::spawn(async move {
         while let Some(msg) = proto::read_frame(&mut reader).await? {
-            if let Some(line) = render(&msg, &peer) {
+            if let Some(line) = render(&msg, &peer_label) {
                 println!("{line}");
             }
             if let Some(reply) = respond(&msg) {
-                // A closed outbox means the writer is gone, which means the
-                // conversation is over; stop rather than error.
+                // A closed outbox means the writer is gone, i.e. the
+                // conversation is over. Stop rather than error.
                 if replies.send(reply).await.is_err() {
                     break;
                 }
@@ -67,32 +80,47 @@ where
         }
         Ok::<(), anyhow::Error>(())
     });
+    futures::pin_mut!(reading);
 
-    // Typed lines. Ctrl-D ends the conversation.
-    let typing = tokio::spawn(async move {
-        let mut lines = BufReader::new(tokio::io::stdin()).lines();
-        while let Some(line) = lines.next_line().await.context("reading stdin")? {
-            if line.is_empty() {
-                continue;
+    let ended = loop {
+        tokio::select! {
+            // The peer's side of the conversation ended, cleanly or not.
+            outcome = &mut reading => {
+                outcome.map_err(|e| anyhow::anyhow!("the reader task panicked: {e}"))??;
+                break Ended::PeerHungUp;
             }
-            if line.len() > MAX_TEXT {
-                eprintln!("(line dropped: {} bytes, limit is {MAX_TEXT})", line.len());
-                continue;
-            }
-            if outbox.send(Message::Text(line)).await.is_err() {
-                break;
+            typed = lines.recv() => {
+                let Some(line) = typed else { break Ended::InputClosed };
+                match line.trim() {
+                    "" => continue,
+                    "/bye" => break Ended::WeHungUp,
+                    _ => {}
+                }
+                if line.len() > MAX_TEXT {
+                    eprintln!("(line dropped: {} bytes, limit is {MAX_TEXT})", line.len());
+                    continue;
+                }
+                if outbox.send(Message::Text(line)).await.is_err() {
+                    break Ended::PeerHungUp;
+                }
             }
         }
-        Ok::<(), anyhow::Error>(())
-    });
-
-    // Whichever ends first ends the conversation: the peer hung up, or we did.
-    let outcome = tokio::select! {
-        r = reading => r.context("the reader task panicked")?,
-        r = typing  => r.context("the keyboard task panicked")?,
-        r = writing => r.context("the writer task panicked")?,
     };
-    outcome
+
+    // Order matters. The reader task holds a clone of the outbox, so dropping
+    // ours is not enough to end the writer: as long as the reader is parked on
+    // `read_frame` — which it is whenever *we* hang up — that clone keeps the
+    // channel open and `writing.await` never returns. Stop the reader first.
+    reading.abort();
+    drop(outbox);
+    match writing.await {
+        Ok(Ok(())) => {}
+        // A write failing as the peer hangs up is the normal race, not a fault.
+        Ok(Err(e)) if ended == Ended::PeerHungUp => tracing::debug!("write at hang-up: {e:#}"),
+        Ok(Err(e)) => bail!(e),
+        Err(e) => bail!("the writer task panicked: {e}"),
+    }
+    Ok(ended)
 }
 
 /// What a received message puts on screen, if anything.
@@ -115,6 +143,7 @@ fn respond(msg: &Message) -> Option<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
     #[test]
     fn ping_is_answered_with_pong_and_nothing_else_is() {
@@ -131,5 +160,37 @@ mod tests {
         );
         assert_eq!(render(&Message::Ping, "alice"), None);
         assert_eq!(render(&Message::Pong, "alice"), None);
+    }
+
+    /// Both sides of a conversation, over an in-memory duplex: what one types
+    /// is what the other reads.
+    #[test]
+    fn a_typed_line_reaches_the_other_side() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (alice, bob) = tokio::io::duplex(4096);
+            let (alice_r, alice_w) = tokio::io::split(alice);
+            let (bob_r, _bob_w) = tokio::io::split(bob);
+
+            let (tx, mut rx) = mpsc::channel::<String>(4);
+            tx.send("bonjour".to_owned()).await.unwrap();
+            tx.send("/bye".to_owned()).await.unwrap();
+
+            let talking = tokio::spawn(async move {
+                run(
+                    alice_r.compat(),
+                    alice_w.compat_write(),
+                    "them",
+                    &mut rx,
+                )
+                .await
+            });
+
+            let mut bob_r = bob_r.compat();
+            let got = proto::read_frame(&mut bob_r).await.unwrap();
+            assert_eq!(got, Some(Message::Text("bonjour".into())));
+
+            assert_eq!(talking.await.unwrap().unwrap(), Ended::WeHungUp);
+        });
     }
 }
