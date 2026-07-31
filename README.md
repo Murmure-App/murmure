@@ -27,10 +27,16 @@ The first build compiles arti and takes several minutes. Later ones are quick.
 No arguments, no configuration. It prints your `.onion` address, publishes it,
 and listens.
 
-Startup takes **several minutes the first time** — Tor downloads the whole
-directory cold. Later runs, off the cache, are tens of seconds. The input box
-stays greyed out until it is ready and its title counts the progress up, so a
-slow bootstrap never looks like a frozen one. `Ctrl-C` always works.
+Startup is a few seconds to a minute — Tor has to fetch its directory. The input
+box stays greyed out until it is ready and its title counts the progress up, so
+a slow bootstrap never looks like a frozen one. `Ctrl-C` always works.
+
+If the count sits at the same percentage for several minutes, it is not slow, it
+is stuck. To see arti on its own, with no interface in the way:
+
+```sh
+cargo test --release -- --ignored --nocapture reaches_the_tor_network
+```
 
 ## Calling someone
 

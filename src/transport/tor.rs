@@ -311,3 +311,48 @@ pub async fn dial_retrying(
     })
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Does Tor work at all from this machine?
+    ///
+    /// Ignored by default: it needs the network and a cold cache takes minutes.
+    /// Run it when a bootstrap misbehaves and you want arti on its own, with no
+    /// interface in the way:
+    ///
+    /// ```text
+    /// cargo test --release -- --ignored --nocapture reaches_the_tor_network
+    /// ```
+    ///
+    /// It prints arti's own progress, so a slow run and a stuck one look
+    /// different from the first minute.
+    #[tokio::test]
+    #[ignore = "needs the network; minutes on a cold cache"]
+    async fn reaches_the_tor_network() {
+        let dir = std::env::temp_dir().join("murmure-bootstrap-test");
+        // A cold cache on purpose: that is the case that goes wrong.
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let started = Instant::now();
+        let mut last = String::new();
+        let client = bootstrap_client(&dir.join("state"), &dir.join("cache"), |frac, blocked| {
+            let line = match blocked {
+                Some(why) => format!("stuck: {why}"),
+                None => format!("{:.0}%", frac * 100.0),
+            };
+            // One line per change, not per event: arti emits many identical ones.
+            if line != last {
+                println!("[{:>6.1}s] {line}", started.elapsed().as_secs_f32());
+                last = line;
+            }
+        })
+        .await
+        .expect("bootstrap failed");
+
+        println!("bootstrapped in {:.1}s", started.elapsed().as_secs_f32());
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -15,7 +15,27 @@ edition = "2024"
 #   the link step fails on Windows (`LNK1181: cannot open sqlite3.lib`, there is
 #   no system SQLite) and on a fresh Linux without `libsqlite3-dev`. Costs a
 #   minute of C compilation and buys one build recipe on all three platforms.
-arti-client = { version = "=0.44.0", features = [
+#
+# default-features is off to drop `native-tls`, which is nonadditive with
+# `rustls`. The three features that come back are the rest of arti's default set
+# (`tokio`, `compression`, `flowctl-cc`) — dropping those would change behaviour
+# for no reason.
+#
+# rustls rather than native-tls, for two reasons:
+#
+#  1. native-tls is schannel on Windows, Security.framework on macOS, OpenSSL on
+#     Linux. So the TLS ClientHello announces the operating system. For a tool
+#     whose entire purpose is that nobody learns who talks to whom, having the
+#     transport layer volunteer what you run is against the grain. rustls makes
+#     every murmure look alike.
+#  2. It is also the leading suspect for a Windows bootstrap that stalls with
+#     the channel handshake complete and the circuit's CREATE2 never answered.
+#     Unconfirmed — see the field notes in aidd_docs/INSTALL.md.
+arti-client = { version = "=0.44.0", default-features = false, features = [
+    "tokio",
+    "compression",
+    "flowctl-cc",
+    "rustls",
     "experimental-api",
     "onion-service-client",
     "onion-service-service",
@@ -32,7 +52,17 @@ tor-keymgr = "=0.44.0"
 tor-cell = "=0.44.0"
 # PreferredRuntime, to name the concrete TorClient type. arti-client does not
 # re-export it.
-tor-rtcompat = { version = "=0.44.0", features = ["tokio", "native-tls"] }
+tor-rtcompat = { version = "=0.44.0", features = ["tokio", "rustls"] }
+# Not used in murmure's own code: named only to pick rustls' crypto provider.
+# arti pulls rustls in with default features off and selects neither backend, so
+# `CryptoProvider::install_default` would otherwise have to be called by hand —
+# and rustls panics on the first connection if nobody does. Cargo unifies
+# features per crate, so enabling `ring` here settles it for arti's copy too.
+#
+# `ring` rather than `aws-lc-rs`: ring ships pre-generated assembly, while
+# aws-lc-rs wants cmake and NASM installed on Windows. One less thing to make a
+# newcomer install before they can say hello.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # HsId is inherently sensitive: printing it unredacted goes through
 # safelog::DisplayRedacted.
 safelog = "0.9"
