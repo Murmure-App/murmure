@@ -54,6 +54,8 @@ address is a public key, and the discovery key is the public half of one.
 ```text
 /add alice xxxx….onion descriptor:x25519:XXXX…    file them under a name
 /call alice                                       dial (7–50 s, /cancel to stop)
+/send ~/rapport.pdf                               offer a file (during a call)
+/accept   /refuse                                 answer an offer of theirs
 /bye                                              hang up
 /quit                                             leave
 ```
@@ -84,10 +86,29 @@ Two honest limits, both upstream's:
 Adding a contact takes effect without a restart, but the new descriptor has to
 reach the directory first — give it a minute.
 
-## Files
+## Sending a file
+
+During a call, `/send <path>` offers one. Nothing moves until the other person
+types `/accept` — a file lands on their disk, so they decide, not you. `/refuse`
+declines it. One file at a time, and one call at a time.
+
+An accepted file is written to `.murmure/incoming/`. It only gets its real name
+once its BLAKE3 hash matches what was offered; until then it sits under a name
+derived from that hash, with a `.part` extension.
+
+That naming is what makes resuming work. If a call drops mid-transfer, offering
+the same file again picks up exactly where it stopped — the partial can only
+belong to the file whose hash it is named after, so there is no way to splice two
+different files together. Nothing to configure and nothing to remember: offer it
+again, accept again.
+
+`/bye` during a transfer waits for the file to finish rather than truncating it.
+A second `/bye` leaves immediately.
+
+## Files on disk
 
 Everything lives in `.murmure/` next to where you ran it: the identity seed, the
-sealed contacts book, Tor's state, and `murmure.log`.
+sealed contacts book, received files, Tor's state, and `murmure.log`.
 
 `identity.seed` **is** your identity — 32 bytes, mode 0600, never leaves the
 machine. Lose it and you lose your address and your contacts book, which is
@@ -101,7 +122,7 @@ MURMURE_DIR=.murmure-b ./target/release/murmure
 
 ## Status
 
-Text and friends-only discovery work, on macOS and Linux. Windows does not: arti
-hangs fetching its first consensus, on two independent machines and two networks
-— see `aidd_docs/arti-windows-hang.md`. Files and presence do not exist yet; see
-`aidd_docs/INSTALL.md` for the design and what is still open.
+Text, friends-only discovery and file transfer work, on macOS and Linux. Windows
+does not: arti hangs fetching its first consensus, on two independent machines
+and two networks — see `aidd_docs/arti-windows-hang.md`. Presence does not exist
+yet; see `aidd_docs/INSTALL.md` for the design and what is still open.

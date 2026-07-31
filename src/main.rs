@@ -8,9 +8,11 @@
 //! /call <name>                  call them
 //! /contacts                     list the book
 //! /forget <name>                drop a contact
-//! /bye                          hang up (during a call)
 //! /quit                         leave
 //! ```
+//!
+//! During a call, `/send <path>` offers a file, `/accept` and `/refuse` answer
+//! one, and `/bye` hangs up. An accepted file lands in `<run dir>/incoming/`.
 //!
 //! Both sides must be online at the same time. It is a phone call, not a text
 //! message.
@@ -30,6 +32,7 @@
 
 mod chat;
 mod contacts;
+mod files;
 mod identity;
 mod onion;
 mod proto;
@@ -210,6 +213,10 @@ async fn serve(
     .await?;
     stage(screen, started, "Tor is up");
 
+    // Where accepted files land. Under the run directory so that `MURMURE_DIR`
+    // keeps two instances on one machine apart here too.
+    let incoming_dir = run_dir.join("incoming");
+
     screen.status("publishing");
     let clients = authorized(book)?;
     let (handover, service, requests) =
@@ -222,6 +229,7 @@ async fn serve(
         service: &service,
         nickname: &nickname,
         identity,
+        incoming_dir: &incoming_dir,
     };
     // The descriptor is now readable only by the filed contacts, but reaching
     // *them* needs our own key deposited under each of their addresses.
@@ -287,7 +295,7 @@ async fn serve(
                 screen.system("-- incoming call --");
                 screen.status("in a call");
                 let (reader, writer) = stream.split();
-                converse(reader, writer, "they", lines, screen).await;
+                converse(reader, writer, "they", &incoming_dir, lines, screen).await;
                 screen.status("listening");
             }
             Event::Called(None) => bail!("the incoming-stream channel closed"),
@@ -323,6 +331,8 @@ struct Live<'a> {
     service: &'a Arc<RunningOnionService>,
     nickname: &'a HsNickname,
     identity: &'a Identity,
+    /// Where a file accepted during a call is written.
+    incoming_dir: &'a Path,
 }
 
 impl Live<'_> {
@@ -382,13 +392,14 @@ async fn converse<R, W>(
     reader: R,
     writer: W,
     peer: &str,
+    incoming_dir: &Path,
     lines: &mut mpsc::Receiver<String>,
     screen: &Screen,
 ) where
     R: futures::io::AsyncRead + Unpin + Send + 'static,
     W: futures::io::AsyncWrite + Unpin + Send + 'static,
 {
-    match chat::run(reader, writer, peer, lines, screen).await {
+    match chat::run(reader, writer, peer, incoming_dir, lines, screen).await {
         Ok(ended) => screen.system(format!("-- {} --", ended.describe(peer))),
         Err(e) => screen.error(format!("-- call dropped: {e:#} --")),
     }
@@ -463,7 +474,7 @@ async fn command(
                 .address_of(name)
                 .ok_or_else(|| anyhow::anyhow!("no contact called {name} — /add them first"))?
                 .to_owned();
-            call(started, live.client, name, &address, lines, screen).await?;
+            call(started, live, name, &address, lines, screen).await?;
         }
         "/help" => help(screen),
         "/quit" => return Ok(Flow::Quit),
@@ -475,7 +486,7 @@ async fn command(
 /// Dial a contact and hold a conversation.
 async fn call(
     started: Instant,
-    client: &tor::Client,
+    live: &Live<'_>,
     name: &str,
     address: &str,
     lines: &mut mpsc::Receiver<String>,
@@ -496,7 +507,7 @@ async fn call(
     // lines queue silently for up to four minutes and are then delivered to
     // the peer as messages the moment the call connects — which is how a
     // `/add <name> <address>` ends up sent to whoever answered.
-    let dialling = tor::dial_retrying(client, hs_id, DIAL_TIMEOUT, |attempt, err| {
+    let dialling = tor::dial_retrying(live.client, hs_id, DIAL_TIMEOUT, |attempt, err| {
         stage(screen, started, &format!("attempt {attempt} failed: {err}"))
     });
     futures::pin_mut!(dialling);
@@ -521,7 +532,7 @@ async fn call(
     screen.system(format!("-- connected to {name} --"));
     screen.status(format!("in a call with {name}"));
     let (reader, writer) = stream.split();
-    converse(reader, writer, name, lines, screen).await;
+    converse(reader, writer, name, live.incoming_dir, lines, screen).await;
     screen.status("listening");
     Ok(())
 }
@@ -533,8 +544,11 @@ fn help(screen: &Screen) {
         "  /call <name>                  call them",
         "  /contacts                     list the book",
         "  /forget <name>                drop a contact",
-        "  /bye                          hang up (during a call)",
         "  /quit                         leave",
+        "during a call:",
+        "  /send <path>                  offer them a file",
+        "  /accept  /refuse              answer an offer of theirs",
+        "  /bye                          hang up",
         "keys:",
         "  up / down                     scroll one line",
         "  Ctrl-B / Ctrl-F               scroll one page",

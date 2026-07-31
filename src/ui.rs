@@ -61,6 +61,19 @@ pub struct Entry {
     text: String,
 }
 
+impl Entry {
+    /// What this line says.
+    ///
+    /// Exists so a test can react to what the operator would react to, rather
+    /// than to a timer: the conversation loop answers the keyboard before it
+    /// answers the wire, so "type `/accept` once the offer is on screen" is the
+    /// only sequencing that matches how the program is actually used.
+    #[cfg(test)]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
 /// What the rest of the program sends to the screen.
 ///
 /// Public only because it names the channel [`channel`] hands back; nothing

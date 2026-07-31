@@ -38,10 +38,23 @@ pub const MAX_FRAME: usize = 64 * 1024;
 /// message unsendable.
 pub const MAX_TEXT: usize = 32 * 1024;
 
-/// One unit of conversation.
+/// Bytes of file data in one [`Message::FileChunk`].
 ///
-/// Deliberately small. File offers, chunk requests and the candidate exchange of
-/// the direct plane get added when those features exist, not before.
+/// Half of [`MAX_FRAME`], which leaves the enum discriminant and postcard's
+/// length varint far more room than they can ever use. Larger chunks would mean
+/// fewer frames and a longer stall before a `/bye` typed mid-transfer is seen;
+/// this size keeps the loop answering the keyboard several times a second even
+/// on a slow circuit.
+pub const MAX_CHUNK: usize = 32 * 1024;
+
+/// Longest filename accepted from a peer, in bytes.
+///
+/// Enforced on both sides. Names arrive from the network and end up on a
+/// filesystem, so [`crate::files::safe_name`] does the real work; this only
+/// keeps an absurd one off the wire in the first place.
+pub const MAX_NAME: usize = 255;
+
+/// One unit of conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     /// A chat line.
@@ -54,20 +67,53 @@ pub enum Message {
     Ping,
     /// Answer to [`Message::Ping`].
     Pong,
+    /// "I have a file for you." Answered with [`Message::FileAccept`] or
+    /// [`Message::FileReject`], never automatically — a file lands on the
+    /// recipient's disk, so the recipient says yes.
+    ///
+    /// `hash` is BLAKE3 of the whole file. It identifies the transfer across
+    /// restarts, which is what makes resuming safe: the same hash is the same
+    /// bytes, so appending to a partial cannot silently splice two files.
+    FileOffer {
+        name: String,
+        size: u64,
+        hash: [u8; 32],
+    },
+    /// "Send it, starting at this byte." Non-zero when resuming a partial.
+    FileAccept { offset: u64 },
+    /// "No thanks." Also the answer to an offer that arrives mid-transfer.
+    FileReject,
+    /// File data, in order, starting from the accepted offset.
+    FileChunk(Vec<u8>),
+    /// No more data. The recipient verifies the hash before keeping anything.
+    FileDone,
 }
 
 impl Message {
     /// Reject a message that cannot legally be sent, before it reaches the wire.
+    ///
+    /// Runs on both sides: the sender must not emit one, and the reader must not
+    /// hand one up. The limits are what stops a peer from choosing our
+    /// allocation sizes, so they are checked on the way in as well as out.
     fn check(&self) -> Result<()> {
-        if let Message::Text(body) = self
-            && body.len() > MAX_TEXT
-        {
-            bail!(
+        match self {
+            Message::Text(body) if body.len() > MAX_TEXT => bail!(
                 "text body is {} bytes, over the {MAX_TEXT}-byte limit",
                 body.len()
-            );
+            ),
+            Message::FileOffer { name, .. } if name.len() > MAX_NAME => bail!(
+                "filename is {} bytes, over the {MAX_NAME}-byte limit",
+                name.len()
+            ),
+            Message::FileChunk(data) if data.len() > MAX_CHUNK => bail!(
+                "file chunk is {} bytes, over the {MAX_CHUNK}-byte limit",
+                data.len()
+            ),
+            Message::FileChunk(data) if data.is_empty() => {
+                bail!("an empty file chunk says nothing; FileDone ends a transfer")
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -301,6 +347,74 @@ mod tests {
         }
 
         assert!(futures::executor::block_on(read_frame(&mut Broken)).is_err());
+    }
+
+    /// A full-size chunk has to fit a frame, or the largest legal transfer
+    /// message is one that can never be sent.
+    #[test]
+    fn a_full_chunk_still_fits_a_frame() {
+        let full = Message::FileChunk(vec![0u8; MAX_CHUNK]);
+        let mut wire = Vec::new();
+        futures::executor::block_on(write_frame(&mut wire, &full)).unwrap();
+        assert!(wire.len() < MAX_FRAME, "{} bytes", wire.len());
+
+        let mut read = wire.as_slice();
+        let got = futures::executor::block_on(read_frame(&mut read)).unwrap();
+        assert_eq!(got, Some(full));
+    }
+
+    /// The whole file exchange, back to back on one stream.
+    #[test]
+    fn a_transfer_round_trips() {
+        let sent = vec![
+            Message::FileOffer {
+                name: "rapport.pdf".into(),
+                size: 5,
+                hash: [7u8; 32],
+            },
+            Message::FileAccept { offset: 2 },
+            Message::FileChunk(b"llo".to_vec()),
+            Message::FileDone,
+        ];
+
+        let mut wire = Vec::new();
+        futures::executor::block_on(async {
+            for msg in &sent {
+                write_frame(&mut wire, msg).await.unwrap();
+            }
+        });
+
+        let mut read = wire.as_slice();
+        let mut got = Vec::new();
+        futures::executor::block_on(async {
+            while let Some(msg) = read_frame(&mut read).await.unwrap() {
+                got.push(msg);
+            }
+        });
+        assert_eq!(sent, got);
+    }
+
+    /// Every limit that exists to stop a peer choosing our allocation sizes.
+    #[test]
+    fn oversized_file_messages_are_refused_by_the_sender() {
+        for bad in [
+            Message::FileChunk(vec![0u8; MAX_CHUNK + 1]),
+            Message::FileOffer {
+                name: "n".repeat(MAX_NAME + 1),
+                size: 0,
+                hash: [0u8; 32],
+            },
+            // Nothing to write and not an ending: a peer looping on these would
+            // keep the transfer open forever.
+            Message::FileChunk(Vec::new()),
+        ] {
+            let mut wire = Vec::new();
+            assert!(
+                futures::executor::block_on(write_frame(&mut wire, &bad)).is_err(),
+                "{bad:?} must not reach the wire"
+            );
+            assert!(wire.is_empty());
+        }
     }
 
     /// An over-long body is refused by the sender, not discovered by the peer.
