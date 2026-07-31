@@ -52,13 +52,18 @@ your key:     descriptor:x25519:XXXX…XXXX
 to the other person however you like. Neither is a secret — the address is a
 public key, and the discovery key is the public half of one.
 
-> `/copy` asks the terminal to do the copying (OSC 52), so it works over SSH and
-> needs no clipboard library. Some terminals disable it; if nothing lands on the
+**Ctrl+V pastes**, without Shift. It reads the clipboard through `pbpaste`,
+`wl-paste`, `xclip` or `xsel`, whichever the machine has — so there is no
+clipboard library to install and no X11 headers to build against. Paste a file's
+path and it becomes an attachment, same as dropping it.
+
+> `/copy` goes the other way, by asking the terminal to do the copying (OSC 52),
+> which works over SSH. Some terminals disable it; if nothing lands on the
 > clipboard, select the two lines with the mouse instead.
 >
 > There is no Ctrl+C-to-copy: copying needs a selection, and murmure has no
 > notion of one — what you select with the mouse belongs to your terminal, and
-> so does the shortcut that copies it.
+> so does the shortcut that copies it. Ctrl+C stays "get me out of here".
 
 ```text
 /add alice xxxx….onion descriptor:x25519:XXXX…    file them under a name

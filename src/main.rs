@@ -593,6 +593,7 @@ fn help(screen: &Screen) {
         "  up / down                     scroll one line",
         "  Ctrl-B / Ctrl-F               scroll one page",
         "  Ctrl-E                        jump back to the newest line",
+        "  Ctrl-V                        paste (no Shift needed)",
         "  Ctrl-U                        clear the input   Ctrl-C  leave",
     ] {
         screen.say(Kind::System, line);

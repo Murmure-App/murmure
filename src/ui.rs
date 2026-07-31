@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use crossterm::event::{
@@ -406,6 +407,15 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<String>) 
             app.input.clear();
             app.attached.clear();
         }
+        // Ctrl-V, because a terminal reserves Ctrl-Shift-V for itself and
+        // reaching for Shift on every paste is exactly the friction this
+        // removes. It goes through the same path as a real paste, so a copied
+        // file path becomes an attachment here too.
+        KeyCode::Char('v') if ctrl => {
+            if let Some(text) = read_clipboard().await {
+                app.paste(&text);
+            }
+        }
         // Scrolling, bound to keys every keyboard has. A MacBook has no
         // PageUp/PageDown/End except through Fn, so the arrows and the
         // less(1) conventions carry the feature; the named keys stay as
@@ -539,6 +549,57 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         let cursor_x = input.x + 1 + shown.chars().count() as u16;
         frame.set_cursor_position((cursor_x.min(input.right().saturating_sub(2)), input.y + 1));
     }
+}
+
+/// Read the system clipboard, by asking whatever tool owns it.
+///
+/// # Why a subprocess and not a clipboard crate
+///
+/// The Rust clipboard crates link against X11 or Wayland, which turns a build
+/// that works everywhere into one that needs development headers installed on
+/// Linux. The tools below already exist on any machine that has a clipboard at
+/// all, and calling them costs a process and no build dependency.
+///
+/// Tried in order, first one that produces something wins. A machine with no
+/// clipboard tool — a bare TTY, a container — returns `None`, and Ctrl-V then
+/// does nothing rather than failing loudly.
+///
+/// Over SSH this reads the *remote* clipboard, which is usually empty. That is
+/// the same limitation every terminal program has, and the terminal's own paste
+/// (Ctrl-Shift-V, or middle click) is the one that reaches your real clipboard.
+async fn read_clipboard() -> Option<String> {
+    /// A clipboard tool that hangs must not take the interface with it.
+    const PATIENCE: Duration = Duration::from_millis(500);
+
+    const TOOLS: [(&str, &[&str]); 5] = [
+        ("pbpaste", &[]),
+        ("wl-paste", &["--no-newline"]),
+        ("xclip", &["-selection", "clipboard", "-o"]),
+        ("xsel", &["--clipboard", "--output"]),
+        (
+            "powershell.exe",
+            &["-NoProfile", "-Command", "Get-Clipboard"],
+        ),
+    ];
+
+    for (tool, args) in TOOLS {
+        let run = tokio::process::Command::new(tool)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let Ok(Ok(out)) = tokio::time::timeout(PATIENCE, run).await else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    None
 }
 
 /// Put text on the system clipboard, by asking the terminal to do it.
