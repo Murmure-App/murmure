@@ -27,8 +27,10 @@ The first build compiles arti and takes several minutes. Later ones are quick.
 No arguments, no configuration. It prints your `.onion` address, publishes it,
 and listens.
 
-Startup is 10–40 seconds — Tor has to bootstrap. The input box stays greyed out
-until it is ready; that is deliberate, not a freeze. `Ctrl-C` always works.
+Startup takes **several minutes the first time** — Tor downloads the whole
+directory cold. Later runs, off the cache, are tens of seconds. The input box
+stays greyed out until it is ready and its title counts the progress up, so a
+slow bootstrap never looks like a frozen one. `Ctrl-C` always works.
 
 ## Calling someone
 

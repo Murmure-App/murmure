@@ -183,10 +183,17 @@ async fn serve(
     // Input stays refused until the idle loop below is the one reading it.
     // Anything else queues lines nothing is consuming, which is how a command
     // typed at second three fires at second forty.
-    screen.status("bootstrapping Tor (10-40 s)");
+    // A first run downloads the whole directory cold and takes minutes; a warm
+    // cache takes tens of seconds. Say the pessimistic number, then replace it
+    // with arti's own progress as soon as there is one.
+    screen.status("bootstrapping Tor (first run: several minutes)");
     let client = tor::bootstrap_client(
         &run_dir.join("service/state"),
         &run_dir.join("service/cache"),
+        |frac, blocked| match blocked {
+            Some(why) => screen.status(format!("bootstrapping Tor — stuck: {why}")),
+            None => screen.status(format!("bootstrapping Tor — {:.0}%", frac * 100.0)),
+        },
     )
     .await?;
     stage(screen, started, "Tor is up");

@@ -34,7 +34,18 @@ pub type RendRequests = std::pin::Pin<Box<dyn Stream<Item = RendRequest> + Send>
 /// directory: arti stores the keystore and the guard state under `state_dir`,
 /// and two clients writing the same files corrupt each other in ways that have
 /// nothing to do with what we are testing.
-pub async fn bootstrap_client(state_dir: &Path, cache_dir: &Path) -> Result<Client> {
+///
+/// `progress` is called with a fraction from 0.0 to 1.0 and, when arti thinks it
+/// is stuck, the reason. This is not decoration: a first bootstrap downloads the
+/// whole consensus and its microdescriptors cold, which takes **minutes**, not
+/// the tens of seconds a warm cache takes. Without a number on screen there is
+/// no way to tell that wait from a hang — and `blocked()` is what turns "it is
+/// frozen" into "your clock is two hours off".
+pub async fn bootstrap_client(
+    state_dir: &Path,
+    cache_dir: &Path,
+    mut progress: impl FnMut(f32, Option<String>),
+) -> Result<Client> {
     create_private_dir(state_dir)?;
     create_private_dir(cache_dir)?;
 
@@ -47,9 +58,36 @@ pub async fn bootstrap_client(state_dir: &Path, cache_dir: &Path) -> Result<Clie
                 cache_dir.display()
             )
         })?;
-    let client = TorClient::create_bootstrapped(config)
+
+    // Split what `create_bootstrapped` does in one call: the event stream only
+    // exists once the client does, so subscribing has to happen between
+    // construction and bootstrap or the early progress is lost.
+    let client = TorClient::builder()
+        .config(config)
+        .create_unbootstrapped_async()
         .await
-        .map_err(|e| describe(e, "bootstrapping the Tor client"))?;
+        .map_err(|e| describe(e, "creating the Tor client"))?;
+
+    // Scoped: the bootstrap future borrows `client`, and returning it moves.
+    {
+        let mut events = client.bootstrap_events();
+        let booting = client.bootstrap();
+        futures::pin_mut!(booting);
+        loop {
+            tokio::select! {
+                outcome = &mut booting => {
+                    outcome.map_err(|e| describe(e, "bootstrapping the Tor client"))?;
+                    break;
+                }
+                // arti reports a blockage as a best-effort guess, so it reaches
+                // the operator as a symptom, never as a diagnosis.
+                Some(status) = events.next() => progress(
+                    status.as_frac(),
+                    status.blocked().map(|b| b.message().to_string()),
+                ),
+            }
+        }
+    }
     Ok(client)
 }
 
