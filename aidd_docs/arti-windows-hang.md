@@ -71,6 +71,20 @@ running while bootstrap never finishes — which is what the first machine showe
 at `DEBUG` level: `hspool: launching 3 NAIVE and 1 GUARDED circuits` kept
 appearing every 30 s for twelve minutes while nothing else progressed.
 
+## Secondary, unrelated finding: `cargo install arti` fails to link on Windows
+
+Worth its own issue. On a Windows machine with the MSVC build tools and nothing
+else, the default feature set does not link:
+
+```
+LINK : fatal error LNK1181: cannot open input file 'sqlite3.lib'
+```
+
+`rusqlite` looks for a system SQLite, and Windows has none. `cargo install arti
+--features static-sqlite` works around it. A fresh Windows user following the
+install instructions hits this before anything else, so `static-sqlite` may be
+worth defaulting on `cfg(windows)`.
+
 ## Not yet checked
 
 - Whether the `arti` CLI (`arti proxy`) shows the same hang. That would separate
