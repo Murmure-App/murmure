@@ -10,6 +10,15 @@ edition = "2024"
 # onion-service-service  -> publish a v3 onion service (implies `keymgr`)
 # onion-service-client   -> dial a .onion address
 # experimental-api       -> TorClient::launch_onion_service_with_hsid (route A)
+#   and the service-discovery key API used by restricted discovery
+# restricted-discovery   -> publish a descriptor whose introduction points are
+#   encrypted for a named set of clients. Without it the .onion address is a
+#   bearer token: anyone who ever saw it can confirm the service is up. With it,
+#   an unauthorized client cannot even decrypt the descriptor, so the service is
+#   invisible rather than merely closed. Upstream files this under DoS
+#   resistance and says so explicitly — it is not a substitute for access
+#   control, and revoking a client is not immediate (the introduction points are
+#   not rotated). murmure takes it for the confidentiality, not the DoS.
 # static-sqlite          -> compile SQLite from source instead of linking a
 #   system one. tor-dirmgr caches the Tor consensus in SQLite, and without this
 #   the link step fails on Windows (`LNK1181: cannot open sqlite3.lib`, there is
@@ -39,6 +48,7 @@ arti-client = { version = "=0.44.0", default-features = false, features = [
     "experimental-api",
     "onion-service-client",
     "onion-service-service",
+    "restricted-discovery",
     "static-sqlite",
 ] }
 

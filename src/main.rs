@@ -4,12 +4,12 @@
 //! takes commands typed in the input box:
 //!
 //! ```text
-//! /add <name> <address>   file a friend under a name
-//! /call <name>            call them
-//! /contacts               list the book
-//! /forget <name>          drop a contact
-//! /bye                    hang up (during a call)
-//! /quit                   leave
+//! /add <name> <address> <key>   file a friend under a name
+//! /call <name>                  call them
+//! /contacts                     list the book
+//! /forget <name>                drop a contact
+//! /bye                          hang up (during a call)
+//! /quit                         leave
 //! ```
 //!
 //! Both sides must be online at the same time. It is a phone call, not a text
@@ -19,6 +19,14 @@
 //! from it, so it survives restarts and is unforgeable without the seed. The
 //! contacts book is sealed under a key derived from that same seed: losing the
 //! seed loses the identity *and* the book, by design.
+//!
+//! The `<key>` half of `/add` is that friend's service discovery key, also
+//! derived from their seed. Once anyone is filed, murmure runs its service in
+//! restricted discovery mode: the descriptor's introduction points are
+//! encrypted for the listed contacts, so a stranger holding the `.onion`
+//! address cannot even tell whether the service is running. Until the first
+//! contact is filed, the service is discoverable by anyone who has the address,
+//! because arti will not publish a descriptor nobody can read.
 
 mod chat;
 mod contacts;
@@ -31,13 +39,16 @@ mod ui;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use futures::StreamExt as _;
 use safelog::DisplayRedacted as _;
 use tokio::sync::mpsc;
+use tor_hscrypto::pk::{HsClientDescEncKey, HsId};
+use tor_hsservice::config::restricted_discovery::HsClientNickname;
+use tor_hsservice::{HsNickname, RunningOnionService};
 
 use crate::contacts::Contacts;
 use crate::identity::Identity;
@@ -142,7 +153,8 @@ async fn run(run_dir: &Path) -> Result<()> {
         book.len()
     ));
     screen.system(format!("your address: {my_address}"));
-    screen.system("give it to a friend, and compare the fingerprint out loud.");
+    screen.system(format!("your key:     {}", identity.discovery_key()));
+    screen.system("give a friend both lines, and compare the fingerprint out loud.");
     help(&screen);
 
     // ---- publish ---------------------------------------------------------
@@ -199,10 +211,32 @@ async fn serve(
     stage(screen, started, "Tor is up");
 
     screen.status("publishing");
+    let clients = authorized(book)?;
     let (handover, service, requests) =
-        tor::launch_with_identity(&client, &nickname, identity.hs_id_keypair())?;
+        tor::launch_with_identity(&client, &nickname, identity.hs_id_keypair(), &clients)?;
     if handover == KeyHandover::Reused {
         tracing::debug!("the keystore already held this identity; arti did not overwrite it");
+    }
+    let live = Live {
+        client: &client,
+        service: &service,
+        nickname: &nickname,
+        identity,
+    };
+    // The descriptor is now readable only by the filed contacts, but reaching
+    // *them* needs our own key deposited under each of their addresses.
+    live.present_to_contacts(book)?;
+    if clients.is_empty() {
+        screen.system(
+            "no contacts yet, so your service is discoverable by anyone with the address. \
+             /add someone and it goes dark.",
+        );
+    } else {
+        stage(
+            screen,
+            started,
+            &format!("restricted to {} authorised contact(s)", clients.len()),
+        );
     }
 
     // The address we publish must be the one our seed derives, never one arti
@@ -265,7 +299,7 @@ async fn serve(
                 // the line was received — so a `/call` that is working looks
                 // like a `/call` that was swallowed.
                 screen.say(Kind::Mine, format!("> {}", line.trim()));
-                match command(&line, book, &client, lines, started, screen).await {
+                match command(&line, book, &live, lines, started, screen).await {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Quit) => break,
                     // A bad command must not end the program.
@@ -276,6 +310,53 @@ async fn serve(
     }
 
     Ok(())
+}
+
+/// Everything a command has to tell when the contacts book changes.
+///
+/// Grouped rather than passed one by one: adding a contact touches three
+/// places at once — the sealed book, the service's authorised-client list, and
+/// the keystore — and any of the three left behind is a friend who silently
+/// cannot reach us.
+struct Live<'a> {
+    client: &'a tor::Client,
+    service: &'a Arc<RunningOnionService>,
+    nickname: &'a HsNickname,
+    identity: &'a Identity,
+}
+
+impl Live<'_> {
+    /// Republish the descriptor for exactly the contacts now in the book, and
+    /// make sure we hold a key to reach each of them.
+    fn resync(&self, book: &Contacts) -> Result<()> {
+        tor::authorize(self.service, self.nickname, &authorized(book)?)?;
+        self.present_to_contacts(book)
+    }
+
+    /// Deposit our discovery key under every contact's address.
+    fn present_to_contacts(&self, book: &Contacts) -> Result<()> {
+        for (name, contact) in book.iter() {
+            let peer: HsId = contact.address.parse().map_err(|e| {
+                anyhow::anyhow!("{name}'s address is not a valid onion address: {e}")
+            })?;
+            tor::present_to(self.client, peer, self.identity.discovery_secret())
+                .with_context(|| format!("presenting our key to {name}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// The book, in the form arti's restricted discovery config wants.
+fn authorized(book: &Contacts) -> Result<Vec<(HsClientNickname, HsClientDescEncKey)>> {
+    book.iter()
+        .map(|(name, contact)| {
+            let key: HsClientDescEncKey = contact
+                .discovery
+                .parse()
+                .map_err(|e| anyhow::anyhow!("{name}'s discovery key is unusable: {e}"))?;
+            Ok((tor::client_nickname(&contact.address)?, key))
+        })
+        .collect()
 }
 
 /// What woke the idle loop.
@@ -317,7 +398,7 @@ async fn converse<R, W>(
 async fn command(
     line: &str,
     book: &mut Contacts,
-    client: &tor::Client,
+    live: &Live<'_>,
     lines: &mut mpsc::Receiver<String>,
     started: Instant,
     screen: &Screen,
@@ -331,28 +412,47 @@ async fn command(
 
     match verb {
         "/add" => {
-            let (Some(name), Some(address)) = (parts.next(), parts.next()) else {
-                bail!("usage: /add <name> <address>.onion");
+            let (Some(name), Some(address), Some(key)) = (parts.next(), parts.next(), parts.next())
+            else {
+                bail!("usage: /add <name> <address>.onion descriptor:x25519:<key>");
             };
-            book.add(name, address)?;
+            let first = book.len() == 0;
+            book.add(name, address, key)?;
+            live.resync(book)?;
             screen.system(format!("filed {name} as {}", onion::fingerprint(address)));
+            if first {
+                screen.system(
+                    "your service is now restricted: only filed contacts can discover it.",
+                );
+            }
+            screen.system("give them a minute — the new descriptor has to reach the directory.");
         }
         "/forget" => {
             let Some(name) = parts.next() else {
                 bail!("usage: /forget <name>");
             };
             if book.remove(name)? {
+                live.resync(book)?;
                 screen.system(format!("forgot {name}"));
+                // Upstream is explicit that this is not revocation: the
+                // introduction points are not rotated, so a client that already
+                // read the descriptor can still reach them.
+                screen.system(
+                    "they may still reach you until the introduction points rotate on their own.",
+                );
             } else {
                 screen.system(format!("no contact called {name}"));
             }
         }
         "/contacts" => {
             if book.len() == 0 {
-                screen.system("(no contacts yet — /add <name> <address>.onion)");
+                screen.system("(no contacts yet — /add <name> <address>.onion <key>)");
             }
-            for (name, address) in book.iter() {
-                screen.system(format!("  {name:<16} {}", onion::fingerprint(address)));
+            for (name, contact) in book.iter() {
+                screen.system(format!(
+                    "  {name:<16} {}",
+                    onion::fingerprint(&contact.address)
+                ));
             }
         }
         "/call" => {
@@ -363,7 +463,7 @@ async fn command(
                 .address_of(name)
                 .ok_or_else(|| anyhow::anyhow!("no contact called {name} — /add them first"))?
                 .to_owned();
-            call(started, client, name, &address, lines, screen).await?;
+            call(started, live.client, name, &address, lines, screen).await?;
         }
         "/help" => help(screen),
         "/quit" => return Ok(Flow::Quit),
@@ -429,7 +529,7 @@ async fn call(
 fn help(screen: &Screen) {
     for line in [
         "commands:",
-        "  /add <name> <address>.onion   file a friend",
+        "  /add <name> <address> <key>   file a friend (address and key, both)",
         "  /call <name>                  call them",
         "  /contacts                     list the book",
         "  /forget <name>                drop a contact",

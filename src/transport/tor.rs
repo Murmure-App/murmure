@@ -10,13 +10,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use arti_client::TorClient;
+use arti_client::config::Reconfigure;
+use arti_client::{KeystoreSelector, TorClient};
 use futures::{Stream, StreamExt as _};
 use safelog::DisplayRedacted as _;
 use tor_cell::relaycell::msg::Connected;
-use tor_hscrypto::pk::{HsId, HsIdKeypair};
+use tor_hscrypto::pk::{HsClientDescEncKey, HsClientDescEncSecretKey, HsId, HsIdKeypair};
 use tor_hsservice::config::OnionServiceConfigBuilder;
-use tor_hsservice::{HsNickname, RendRequest, RunningOnionService, handle_rend_requests};
+use tor_hsservice::config::restricted_discovery::HsClientNickname;
+use tor_hsservice::{
+    HsNickname, OnionServiceConfig, RendRequest, RunningOnionService, handle_rend_requests,
+};
 use tor_rtcompat::PreferredRuntime;
 
 /// The virtual port murmure listens on inside its onion service.
@@ -152,11 +156,9 @@ pub fn launch_with_identity(
     client: &Client,
     nickname: &HsNickname,
     keypair: HsIdKeypair,
+    authorized: &[(HsClientNickname, HsClientDescEncKey)],
 ) -> Result<(KeyHandover, Arc<RunningOnionService>, RendRequests)> {
-    let config = OnionServiceConfigBuilder::default()
-        .nickname(nickname.clone())
-        .build()
-        .map_err(|e| anyhow!("building the onion service config: {e}"))?;
+    let config = service_config(nickname, authorized)?;
 
     match client.launch_onion_service_with_hsid(config.clone(), keypair) {
         // The two arms return two distinct opaque `impl Stream` types, so they
@@ -172,6 +174,98 @@ pub fn launch_with_identity(
         }
         Err(e) => Err(describe(e, "handing our identity key to arti")),
     }
+}
+
+/// The onion service config for a given set of authorised clients.
+///
+/// # Why the empty case is not restricted
+///
+/// Restricted discovery encrypts the descriptor's introduction points for a
+/// named list of clients, so a service with an empty list is one nobody can
+/// reach — and arti refuses to build that config at all
+/// (`RestrictedDiscoveryConfigBuilder::post_build_validate`: "restricted mode
+/// is enabled but no client key providers are configured"). So a murmure with
+/// no contacts publishes an ordinary descriptor, and goes dark on the first
+/// `/add`. That transition is visible to the operator, because it changes what
+/// the world can learn about them.
+fn service_config(
+    nickname: &HsNickname,
+    authorized: &[(HsClientNickname, HsClientDescEncKey)],
+) -> Result<OnionServiceConfig> {
+    let mut builder = OnionServiceConfigBuilder::default();
+    builder.nickname(nickname.clone());
+
+    if !authorized.is_empty() {
+        let restricted = builder.restricted_discovery();
+        restricted.enabled(true);
+        // `key_dirs` is the other provider arti offers, and it is the one that
+        // supports live reload by watching a directory. murmure does not use
+        // it: it would mean one plaintext `<nickname>.auth` file per contact,
+        // next to a contacts book that is sealed precisely so that reading the
+        // disk does not reveal who you talk to. Passing the keys in memory and
+        // calling `reconfigure` (see [`authorize`]) gets the same live update
+        // without the leak.
+        let keys = restricted.static_keys().access();
+        keys.extend(authorized.iter().cloned());
+    }
+
+    builder
+        .build()
+        .map_err(|e| anyhow!("building the onion service config: {e}"))
+}
+
+/// Replace the set of clients allowed to discover the running service.
+///
+/// This takes effect without a restart: the publisher's config handler re-reads
+/// the authorised clients, marks every descriptor dirty and schedules an upload
+/// (`tor-hsservice-0.44.0/src/publish/reactor.rs:1203`). The new descriptor
+/// still has to propagate to the HSDirs, so a friend added this second may need
+/// a minute before they can find us.
+pub fn authorize(
+    service: &Arc<RunningOnionService>,
+    nickname: &HsNickname,
+    authorized: &[(HsClientNickname, HsClientDescEncKey)],
+) -> Result<()> {
+    let config = service_config(nickname, authorized)?;
+    service
+        .reconfigure(config, Reconfigure::AllOrNothing)
+        .map_err(|e| anyhow!("updating the authorised clients: {e}"))
+}
+
+/// Store our own discovery key in the keystore, filed under a peer's address.
+///
+/// arti looks the key up by the `HsId` it is about to dial
+/// (`HsClientDescEncKeypairSpecifier::new(hsid)`), so reaching a restricted
+/// service means having deposited a key under *that* service's address first.
+/// murmure presents the same secret to everyone — see
+/// [`crate::identity::Identity::discovery_secret`] for why — so this is a pure
+/// bookkeeping step, and doing it twice is not an error.
+pub fn present_to(client: &Client, peer: HsId, secret: HsClientDescEncSecretKey) -> Result<()> {
+    match client.insert_service_discovery_key(KeystoreSelector::Primary, peer, secret) {
+        Ok(_) => Ok(()),
+        // Already deposited on an earlier run. Since the secret is a pure
+        // function of our seed, what is stored is what we would have written.
+        Err(e) if is_key_already_exists(&e) => Ok(()),
+        Err(e) => Err(describe(e, "storing our discovery key for a contact")),
+    }
+}
+
+/// The name arti files a contact's discovery key under.
+///
+/// arti wants a `Slug` — lowercase ASCII, digits, `_` and `-`. A contact's
+/// local name is none of those things reliably ("Alice", "mon pote"), and it is
+/// private besides. The head of their onion address is already lowercase
+/// base32, so it is a valid slug by construction, unique across contacts, and
+/// tells arti nothing the caller did not already hand it.
+pub fn client_nickname(address: &str) -> Result<HsClientNickname> {
+    /// Base32 characters taken from the address. 16 of them is 80 bits — this
+    /// only has to separate a handful of contacts, not resist collision search.
+    const LEN: usize = 16;
+
+    let base32 = address.strip_suffix(".onion").unwrap_or(address);
+    let head: String = base32.chars().take(LEN).collect();
+    head.parse()
+        .map_err(|e| anyhow!("{address} does not yield a usable client nickname: {e}"))
 }
 
 /// Recognise `tor_keymgr::Error::KeyAlreadyExists` through arti-client's opaque
@@ -315,6 +409,35 @@ pub async fn dial_retrying(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ADDR: &str = "haticvmas7sfodcos2yhp7sf43cxifwl5aafgeathnyad4culhdj7ryd.onion";
+    const KEY: &str = "descriptor:x25519:ZPRRMIV6DV6SJFL7SFBSVLJ5VUNPGCDFEVZ7M23LTLVTCCXJQBKA";
+
+    fn nickname() -> HsNickname {
+        "murmure".to_owned().try_into().unwrap()
+    }
+
+    #[test]
+    fn a_contact_address_yields_a_usable_client_nickname() {
+        let nick = client_nickname(ADDR).expect("slug");
+        assert_eq!(nick.to_string(), "haticvmas7sfodco");
+        // With or without the suffix, and stable across calls.
+        assert_eq!(
+            client_nickname(ADDR.trim_end_matches(".onion"))
+                .unwrap()
+                .to_string(),
+            nick.to_string()
+        );
+    }
+
+    /// arti rejects "restricted, but nobody is authorised" at build time, so
+    /// both ends of that branch have to build.
+    #[test]
+    fn the_service_config_builds_with_and_without_authorised_clients() {
+        service_config(&nickname(), &[]).expect("an empty book is not restricted");
+        let clients = vec![(client_nickname(ADDR).unwrap(), KEY.parse().unwrap())];
+        service_config(&nickname(), &clients).expect("one contact is enough to restrict");
+    }
 
     /// Does Tor work at all from this machine?
     ///

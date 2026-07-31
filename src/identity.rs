@@ -22,11 +22,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use rand::RngCore as _;
-use tor_hscrypto::pk::{HsId, HsIdKey, HsIdKeypair};
-use tor_llcrypto::pk::ed25519;
+use tor_hscrypto::pk::{
+    HsClientDescEncKey, HsClientDescEncSecretKey, HsId, HsIdKey, HsIdKeypair,
+};
+use tor_llcrypto::pk::{curve25519, ed25519};
 
 /// Length of the ed25519 secret seed murmure persists.
 pub const SEED_LEN: usize = 32;
+
+/// Key-derivation context for the service-discovery key. Frozen: changing it
+/// changes the key every contact has already authorised.
+const DISCOVERY_CONTEXT: &str = "murmure 2026 service discovery";
 
 /// A murmure identity: one 32-byte ed25519 seed, and everything derived from it.
 pub struct Identity {
@@ -158,6 +164,36 @@ impl Identity {
         blake3::derive_key(context, &self.seed)
     }
 
+    /// The x25519 secret murmure proves itself with to a restricted service.
+    ///
+    /// # One key for every peer, on purpose
+    ///
+    /// The Tor spec files a discovery keypair per *service* you want to reach,
+    /// and arti's keystore indexes it by the service's `HsId`. Generating a
+    /// fresh one per contact would mean three messages to add a friend: their
+    /// address, then a key derived from it, then theirs back. Deriving one key
+    /// from the seed instead makes the exchange symmetric and one-shot — each
+    /// side hands over `<address> <key>` once — and murmure inserts that same
+    /// secret under every contact's `HsId`.
+    ///
+    /// The cost is that two contacts who compare notes see the same public key
+    /// and learn they are talking to the same person. They already both hold
+    /// your `.onion`, which says that far more directly, so nothing leaks that
+    /// was not already out. Third parties see nothing either way: the
+    /// descriptor carries per-client encrypted cookies, never the raw key.
+    ///
+    /// ponytail: revisit if murmure ever grows separable personas, which is the
+    /// one case where linking two contacts would actually cost something.
+    pub fn discovery_secret(&self) -> HsClientDescEncSecretKey {
+        curve25519::StaticSecret::from(self.derive_key(DISCOVERY_CONTEXT)).into()
+    }
+
+    /// The public half, in the `descriptor:x25519:<base32>` form C Tor and arti
+    /// both read. This is what a friend authorises.
+    pub fn discovery_key(&self) -> HsClientDescEncKey {
+        HsClientDescEncKey::from(&self.discovery_secret())
+    }
+
     /// The `.onion` identity derived from the seed, computed locally.
     ///
     /// This is the value phase 3 compares arti's published address against. It
@@ -189,6 +225,25 @@ mod test {
         };
         assert_eq!(a.onion_address(), b.onion_address());
         assert_ne!(a.onion_address(), c.onion_address());
+    }
+
+    #[test]
+    fn discovery_key_is_a_pure_function_of_the_seed() {
+        let a = Identity {
+            seed: [7u8; SEED_LEN],
+            path: PathBuf::from("/nonexistent"),
+        };
+        let b = Identity {
+            seed: [8u8; SEED_LEN],
+            path: PathBuf::from("/nonexistent"),
+        };
+        assert_eq!(a.discovery_key(), a.discovery_key());
+        assert_ne!(a.discovery_key(), b.discovery_key());
+        // The wire form is what a friend pastes into /add, so it has to parse
+        // back to the same key.
+        let text = a.discovery_key().to_string();
+        assert!(text.starts_with("descriptor:x25519:"), "{text}");
+        assert_eq!(text.parse::<HsClientDescEncKey>().unwrap(), a.discovery_key());
     }
 
     #[test]

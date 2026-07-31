@@ -1,6 +1,7 @@
 //! Onion address checks and their human-facing form.
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
+use tor_hscrypto::pk::HsClientDescEncKey;
 
 /// Number of base32 characters in a v3 onion address, before `.onion`.
 const V3_LEN: usize = 56;
@@ -25,6 +26,17 @@ pub fn check_address(address: &str) -> Result<()> {
     {
         bail!("{address} is not lowercase base32");
     }
+    Ok(())
+}
+
+/// Reject anything that is not a `descriptor:x25519:<base32>` discovery key.
+///
+/// Same reason as [`check_address`]: a key that only fails at dial time fails
+/// silently, because a restricted service is *supposed* to be unreachable to a
+/// client it does not recognise. There is no error to tell the two apart.
+pub fn check_discovery_key(key: &str) -> Result<()> {
+    key.parse::<HsClientDescEncKey>()
+        .with_context(|| format!("{key} is not a service discovery key"))?;
     Ok(())
 }
 
@@ -53,6 +65,19 @@ mod tests {
     use super::*;
 
     const GOOD: &str = "haticvmas7sfodcos2yhp7sf43cxifwl5aafgeathnyad4culhdj7ryd.onion";
+    const GOOD_KEY: &str = "descriptor:x25519:ZPRRMIV6DV6SJFL7SFBSVLJ5VUNPGCDFEVZ7M23LTLVTCCXJQBKA";
+
+    #[test]
+    fn discovery_keys_need_the_full_prefix() {
+        assert!(check_discovery_key(GOOD_KEY).is_ok());
+        // lowercase base32 is equally valid
+        assert!(check_discovery_key(&GOOD_KEY.to_lowercase()).is_ok());
+        // the bare key material, without the two labels
+        assert!(check_discovery_key(GOOD_KEY.rsplit(':').next().unwrap()).is_err());
+        // an onion address pasted into the key slot
+        assert!(check_discovery_key(GOOD).is_err());
+        assert!(check_discovery_key("descriptor:ed25519:AAAA").is_err());
+    }
 
     #[test]
     fn fingerprint_takes_both_ends() {
