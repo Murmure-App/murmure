@@ -48,8 +48,17 @@ your address: xxxxxxxx…xxxx.onion
 your key:     descriptor:x25519:XXXX…XXXX
 ```
 
-Send both to the other person however you like. Neither is a secret — the
-address is a public key, and the discovery key is the public half of one.
+`/copy` puts both on your clipboard, in the order `/add` wants them. Send them
+to the other person however you like. Neither is a secret — the address is a
+public key, and the discovery key is the public half of one.
+
+> `/copy` asks the terminal to do the copying (OSC 52), so it works over SSH and
+> needs no clipboard library. Some terminals disable it; if nothing lands on the
+> clipboard, select the two lines with the mouse instead.
+>
+> There is no Ctrl+C-to-copy: copying needs a selection, and murmure has no
+> notion of one — what you select with the mouse belongs to your terminal, and
+> so does the shortcut that copies it.
 
 ```text
 /add alice xxxx….onion descriptor:x25519:XXXX…    file them under a name
@@ -88,8 +97,11 @@ reach the directory first — give it a minute.
 
 ## Sending a file
 
-During a call, `/send <path>` offers one. Nothing moves until the other person
-types `/accept` — a file lands on their disk, so they decide, not you. `/refuse`
+During a call, `/send <path>` offers one — or **drag the file onto the window**,
+which shows as `[image.png]` in the input box and offers it when you press
+Enter. Backspace on an empty line removes it again.
+
+Nothing moves until the other person types `/accept` — a file lands on their disk, so they decide, not you. `/refuse`
 declines it. One file at a time, and one call at a time.
 
 An accepted file is written to `.murmure/incoming/`. It only gets its real name
