@@ -328,9 +328,25 @@ mod tests {
     ///
     /// It prints arti's own progress, so a slow run and a stuck one look
     /// different from the first minute.
+    /// Arti's own logs go to stdout here, unlike in the binary where they go to
+    /// a file so the TUI can own the screen. `RUST_LOG` selects them:
+    ///
+    /// ```text
+    /// RUST_LOG=tor_proto=trace,tor_circmgr=debug,tor_chanmgr=debug
+    /// ```
+    ///
+    /// Without this the test says "15%" and nothing else, which is exactly the
+    /// blindness it exists to remove.
     #[tokio::test]
     #[ignore = "needs the network; minutes on a cold cache"]
     async fn reaches_the_tor_network() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .try_init();
+
         let dir = std::env::temp_dir().join("murmure-bootstrap-test");
         // A cold cache on purpose: that is the case that goes wrong.
         let _ = std::fs::remove_dir_all(&dir);
