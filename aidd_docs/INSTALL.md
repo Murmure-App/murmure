@@ -2,9 +2,19 @@
 
 Vision technique et guide d'installation.
 
-**Date** : 2026-07-31
-**Statut** : pile choisie et auditée, prête à coder
+**Date** : 2026-07-31, révisé le 2026-08-01
+**Statut** : **v1 livrée sur macOS et Linux.** Windows ne fonctionne pas — arti
+se fige au premier consensus, voir `aidd_docs/arti-windows-hang.md`.
 **Source amont** : `aidd_docs/brainstorm/2026_07_30-messagerie-pair-a-pair-terminal.md`
+
+> Ce document a été écrit avant la première ligne de code. Les sections
+> **Decisions**, **Audit summary** et **Ce que le choix C coûte** décrivent le
+> raisonnement d'origine et restent exactes ; elles sont conservées comme
+> archive. Les sections **Stack summary**, **Architecture**, **Folder
+> structure** et **Install steps** décrivent le code réel et ont été corrigées
+> le 2026-08-01. Là où la réalité a démenti le plan, c'est marqué sur place
+> plutôt que réécrit en silence — un plan dont on efface les erreurs
+> n'apprend rien à la relecture.
 
 ---
 
@@ -31,13 +41,13 @@ définitif.
 | Architecture | Monolithe, **une seule crate binaire**, avec un trait `Transport` à deux implémentations | Un développeur solo, moins de dix utilisateurs. La seule abstraction posée est celle du transport, parce qu'il y aura réellement deux implémentations — pas une interface spéculative. |
 | **Séparation contrôle / données** | **Tor porte le contrôle, un canal direct porte les données** | Le débit de Tor (0,1-0,25 Mo/s) est sans conséquence pour du texte et rédhibitoire pour des fichiers. Découpler les deux permet de payer le prix de l'anonymat là où il sert, et pas ailleurs. Restaure l'échelle à trois chemins du brainstorm. |
 | Langage | **Rust** (MSRV 1.91) | Seul langage maîtrisé qui donne à la fois l'écosystème Tor natif, un binaire unique multi-OS, et pas de runtime à installer chez le correspondant. |
-| Interface | **ratatui + crossterm**, TUI | Exigence « mode texte riche, pas de fenêtre graphique ». crossterm couvre Windows, ce qui répond à la réserve posée sur cet OS. |
-| Transport — plan de contrôle | **arti** — service onion Tor v3 (`arti-client`, feature `onion-service-service`) | Le seul des trois candidats qui ne trahit pas l'objectif métadonnées. Supprime aussi entièrement le problème du NAT, y compris en 4G/CGNAT. Porte la découverte, l'authentification, la présence et **tout le texte**. |
+| Interface | **ratatui + crossterm**, TUI | Exigence « mode texte riche, pas de fenêtre graphique ». crossterm couvre Windows, ce qui répond à la réserve posée sur cet OS. ⚠️ **Démenti le 2026-08-01, mais pas par crossterm** : la TUI s'affiche correctement sous Windows Terminal ; c'est arti qui se fige avant. |
+| Transport — plan de contrôle | **arti** — service onion Tor v3 (`arti-client`, feature `onion-service-service`) | Le seul des trois candidats qui ne trahit pas l'objectif métadonnées. Supprime aussi entièrement le problème du NAT, y compris en 4G/CGNAT. Porte la découverte, l'authentification, la présence et **tout le texte**. ✅ Vérifié le 2026-08-01 entre macOS et Linux, sur le même réseau **et** via un partage de connexion 5G — donc deux NAT et deux FAI différents. |
 | Transport — plan de données | **`quinn`** (QUIC brut), à la demande, **v2** | Pour les fichiers et images uniquement. Les candidats s'échangent par le canal Tor déjà authentifié, puis connexion directe à pleine vitesse. Échec ⇒ repli sur Tor, lent mais fonctionnel. |
 | Annuaire identifiant → adresse | **Annuaire distribué de Tor (HSDir)** | Résout la dernière inconnue technique du brainstorm sans rien héberger. Les descripteurs v3 sont chiffrés en aveugle : un répertoire ne peut pas énumérer les services qu'il relaie. |
 | Identité | **Clé ed25519 = adresse `.onion` v3**, graine de 32 octets possédée par murmure, déposée dans le keystore arti (`ArtiNativeKeystore`) | L'exigence « identifiant dérivé de la clé, inusurpable » n'est pas à implémenter : c'est la définition de l'adresse onion v3. ✅ Tranché le 2026-07-31 : murmure **fournit** sa clé à arti via `launch_onion_service_with_hsid`, il ne la lit pas. Voir « La propriété de la clé d'identité — tranchée ». |
 | Authentification du correspondant | **Restricted discovery** (Arti ≥ 1.7.0), clés client **x25519** | Un service onion authentifie le serveur mais pas le client. La restricted discovery restreint jusqu'à la *récupération du descripteur* aux seuls contacts autorisés : « entre amis uniquement » devient une propriété du transport. |
-| Intégrité des transferts | **`bao-tree`** (streaming vérifié BLAKE3, séparable d'iroh) | Permet de vérifier chaque bloc *à l'arrivée* contre le hash racine, au lieu de tout jeter à la fin. Avec un débit de 0,1 Mo/s sur circuits recyclables, ce n'est pas un confort mais une nécessité. |
+| Intégrité des transferts | ~~`bao-tree`~~ → **BLAKE3 du fichier entier** | ❌ **Renversé le 2026-08-01, en écrivant `files.rs`.** Le streaming vérifié défend contre une source qu'on n'a pas choisie ; ici le flux est un circuit onion déjà chiffré et authentifié, et le pair est authentifié par l'adresse `.onion` comparée à l'oral. Un expéditeur qui voudrait envoyer de mauvais octets proposerait simplement un autre fichier. Ce qu'il fallait vraiment, c'est l'intégrité contre la corruption et une **identité de transfert** pour reprendre au bon endroit : un hash du fichier entier donne les deux, sans dépendance supplémentaire. Le fichier partiel est nommé d'après ce hash, ce qui rend structurellement impossible de recoller deux fichiers différents. Raisonnement complet en tête de `src/files.rs`. |
 | Chiffrement du canal | **Aucune couche ajoutée** — celui de Tor (ntor v3) | Décision délibérée. Empiler du Noise sur un circuit onion ajoute une surface d'erreur sans gain : la crypto maison est exclue, et une composition maison de primitives auditées en est une forme. |
 | Stockage local | **Fichiers chiffrés `chacha20poly1305`**, pas de SGBD | Carnet de moins de dix contacts et un historique par conversation. SQLite serait une dépendance pour ce qu'un fichier scellé fait. |
 | Hébergement | **Aucun** — le réseau Tor, 0 €/mois définitivement | Contrainte dure. Aucun serveur opéré, aucun compte, aucune facture possible. |
@@ -47,17 +57,38 @@ définitif.
 
 ## Stack summary
 
-| Couche | Crate / techno | Version au 31/07/2026 |
+État réel du `Cargo.toml` au 2026-08-01. Chaque dépendance y porte le
+commentaire qui dit pourquoi elle est là — ce tableau n'en est que l'index.
+
+| Couche | Crate / techno | Version réelle |
 | --- | --- | --- |
-| Transport contrôle & annuaire | `arti-client` (features `onion-service-service`, `onion-service-client`, `experimental-api`, plus `restricted-discovery` à venir) | **0.44.0** (30 juin 2026) |
-| Transport données (v2) | `quinn` | 0.11+ |
-| Runtime async | `tokio` | 1.x |
-| Interface terminal | `ratatui` + `crossterm` | ratatui 0.29+ / crossterm 0.29 |
-| Identité | `ed25519-dalek` | 2.2 |
-| Chiffrement au repos | `chacha20poly1305` | 0.10 |
-| Intégrité des fichiers | `bao-tree` (+ `blake3`) | 1.x |
+| Transport contrôle & annuaire | `arti-client` (features `onion-service-service`, `onion-service-client`, `experimental-api`, `restricted-discovery`, `static-sqlite`, `rustls`) | **=0.44.0**, épinglé |
+| Crates arti nommées directement | `tor-hsservice`, `tor-hscrypto`, `tor-llcrypto`, `tor-keymgr`, `tor-cell`, `tor-rtcompat` | **=0.44.0**, épinglées |
+| Runtime async | `tokio` | 1.x, feature `full` |
+| Interface terminal | `ratatui` + `crossterm` | ratatui **0.30.2** / crossterm **0.29** (`event-stream`) |
+| Identité | ~~`ed25519-dalek`~~ → `tor-llcrypto` | Jamais ajoutée : arti réexporte déjà ed25519 et curve25519, et une seconde copie de dalek dans l'arbre voudrait dire deux types incompatibles pour la même clé. |
+| Chiffrement au repos | `chacha20poly1305` | **0.11**, feature `zeroize` |
+| Effacement mémoire | `zeroize` | 1.x — déjà tiré par arti, donc gratuit |
+| Intégrité des fichiers | ~~`bao-tree`~~ → `blake3` seul | Voir la ligne « Intégrité des transferts » des décisions. |
+| Presse-papiers | `data-encoding` | 2.x — base64 pour OSC 52, déjà tiré par arti |
 | Sérialisation du protocole | `serde` + `postcard` | 1.x / 1.x |
+| Journalisation | `tracing` + `tracing-subscriber`, `safelog` | vers un fichier, jamais stdout — la TUI possède l'écran |
+| Transport données (v2) | `quinn` | **Pas encore ajouté.** v2 n'est pas commencée. |
 | Compilateur | Rust stable | **≥ 1.91** (MSRV imposé par arti 0.44) |
+
+> **`static-sqlite` n'était pas prévu et n'est pas optionnel.** `tor-dirmgr`
+> cache le consensus dans SQLite ; sans cette feature, l'édition de liens
+> échoue sous Windows (`LNK1181: cannot open sqlite3.lib`, il n'y a pas de
+> SQLite système) et sur un Linux nu sans `libsqlite3-dev`. Coûte une minute
+> de compilation C et achète une seule recette de build sur les trois OS.
+
+> **`rustls` plutôt que `native-tls`**, pour une raison qui tient au projet et
+> pas au confort : native-tls est schannel sous Windows, Security.framework
+> sous macOS, OpenSSL sous Linux — donc le ClientHello TLS annonce le système
+> d'exploitation. Pour un outil dont la raison d'être est que personne
+> n'apprenne qui parle à qui, que la couche transport annonce spontanément ce
+> qu'on fait tourner va à contresens. rustls fait que tous les murmure se
+> ressemblent.
 
 **Intégrations externes** : le réseau Tor, et rien d'autre. Aucun service payant, aucun compte
 tiers, aucun serveur à opérer.
@@ -84,33 +115,34 @@ tiers, aucun serveur à opérer.
 
 ## Architecture
 
+Tel que construit. En pointillés, ce qui est prévu et non écrit.
+
 ```mermaid
 graph TD
-    User([Utilisateur]) --> UI[ui — ratatui + crossterm]
-    UI --> App[app — état, conversations, événements]
-    App --> Contacts[contacts — carnet + présence]
-    App --> History[history — éphémère ou scellé]
-    App --> Files[files — découpe, reprise, bao-tree]
-    App --> Proto[proto — trames texte / fichier / ping / candidats]
-    Proto --> Transport{{trait Transport}}
-    Transport --> TorPath[transport::tor — plan de contrôle, permanent]
-    Transport --> DirectPath[transport::direct — plan de données, à la demande, v2]
+    User([Utilisateur]) --> UI[ui — ratatui, souris, presse-papiers]
+    UI --> Main[main — commandes, boucle d'inactivité]
+    Main --> Contacts[contacts — carnet scellé]
+    Main --> Chat[chat — une conversation à la fois]
+    Chat --> Files[files — offre, hash, reprise, noms sûrs]
+    Chat --> Proto[proto — trames longueur-préfixées]
+    Proto --> TorPath[transport::tor — plan de contrôle, permanent]
     TorPath --> Arti[[arti-client]]
-    DirectPath --> Quinn[[quinn]]
     Arti --> TorNet{{Réseau Tor}}
-    Quinn --> Net{{Connexion directe}}
-    Proto -. échange de candidats .-> DirectPath
-    Identity[identity — clé ed25519 = adresse .onion] --> TorPath
-    Identity --> History
-    Contacts --> TorPath
-    History --> Disk[(Fichiers locaux chiffrés)]
-    Files --> Disk
+    Identity[identity — graine 32 o = adresse .onion] --> TorPath
+    Identity --> Store
+    Contacts --> Store[store — chacha20poly1305]
+    Store --> Disk[(Fichiers scellés)]
+    Files --> Incoming[(incoming/)]
+    Proto -. v2 : échange de candidats .-> DirectPath
+    DirectPath[transport::direct — v2, non écrit]:::todo -.-> Quinn[[quinn]]:::todo
+    Quinn -.-> Net{{Connexion directe}}:::todo
+    classDef todo stroke-dasharray: 5 5,color:#888
 ```
 
 La frontière structurante passe entre `proto` et `transport`. `proto` ne connaît que des trames
-sérialisées et un pair identifié ; les implémentations de `Transport` ne connaissent que des
-octets et une adresse. C'est la seule abstraction posée dans ce projet, et elle l'est parce qu'il
-y aura réellement deux implémentations — pas une interface à implémentation unique.
+sérialisées et un pair identifié ; `transport::tor` ne connaît que des octets et une adresse. La
+frontière est donc bien là où elle était prévue — mais elle est tenue par la discipline des
+signatures, pas par un trait. Voir « Folder structure ».
 
 **Le plan de contrôle Tor est permanent et porte tout** : découverte, authentification, présence,
 messages texte, et la négociation du plan de données. **Le plan de données direct est ouvert à la
@@ -172,34 +204,54 @@ notre clé » de « quelqu'un d'autre occupe ce surnom ».
 
 ## Folder structure
 
+Réel au 2026-08-01. Le plan d'origine est conservé dessous, avec ce qui l'a
+démenti.
+
 ```
 murmure/
 ├── Cargo.toml                  # une seule crate, versions arti épinglées avec "="
 ├── src/
-│   ├── main.rs                 # CLI, chargement config, boucle principale
-│   ├── identity.rs             # clé ed25519, adresse .onion, keystore sur disque
+│   ├── main.rs                 # commandes tapées, boucle d'inactivité, publication
+│   ├── identity.rs             # graine 32 o, adresse .onion, clé de découverte
 │   ├── transport/
-│   │   ├── mod.rs              # trait Transport — la seule abstraction du projet
-│   │   ├── tor.rs              # arti : publie le service onion, ouvre les circuits sortants
-│   │   └── direct.rs           # v2 — quinn, candidats reçus par le canal Tor
-│   ├── proto.rs                # trames : texte, offre de fichier, chunk, ping, candidats
-│   ├── contacts.rs             # carnet, empreintes courtes, clés de restricted discovery
-│   ├── history.rs              # deux modes : rien conservé, ou scellé chacha20poly1305
-│   ├── files.rs                # découpe en chunks, état de reprise, vérification BLAKE3
-│   └── ui/
-│       ├── mod.rs              # boucle de rendu ratatui, raccourcis clavier
-│       ├── chat.rs             # zone conversation
-│       └── contacts.rs         # zone carnet + indicateurs de présence
-├── tests/
-│   └── loopback.rs             # deux instances sur une machine, un message aller-retour
+│   │   ├── mod.rs              # pas de trait Transport — dit pourquoi (voir plus bas)
+│   │   └── tor.rs              # arti : publie, autorise, appelle
+│   ├── proto.rs                # trames longueur-préfixées : texte, offre, chunk, ping
+│   ├── chat.rs                 # une conversation : clavier, réception, transfert
+│   ├── contacts.rs             # carnet scellé, adresses + clés de découverte
+│   ├── files.rs                # offre, hash, reprise, noms sûrs, nettoyage d'affichage
+│   ├── store.rs                # scellement chacha20poly1305 sur disque
+│   ├── onion.rs                # validation d'adresse et de clé, empreinte courte
+│   └── ui.rs                   # ratatui : historique, saisie, souris, presse-papiers
 └── aidd_docs/
     ├── INSTALL.md
+    ├── arti-windows-hang.md    # rapport de bug amont, prêt à déposer
     └── brainstorm/
         └── 2026_07_30-messagerie-pair-a-pair-terminal.md
 ```
 
-Pas de `packages/`, pas de `crates/`, pas de dossier vide « pour plus tard ». `transport/direct.rs`
-n'existe qu'en v2 — il est listé ici pour montrer où il ira, pas pour être créé vide.
+Trois écarts avec le plan, tous délibérés :
+
+- **`ui/` n'a pas été éclaté en trois fichiers.** `ui.rs` tient dans un seul
+  fichier et ne parle qu'à deux canaux ; le découper en `mod.rs` + `chat.rs` +
+  `contacts.rs` aurait créé trois fichiers pour une seule boucle de rendu.
+- **`history.rs` n'existe pas.** Rien n'est conservé entre deux lancements. Le
+  mode scellé reste possible — `store.rs` est écrit pour ça et le carnet s'en
+  sert déjà — mais tant que personne ne l'a demandé, ne rien écrire sur le
+  disque est la meilleure propriété de confidentialité disponible, pas un
+  manque.
+- **`tests/loopback.rs` n'existe pas.** Les tests d'intégration réels vivent
+  dans `chat.rs` : deux conversations sur un duplex en mémoire, qui réagissent
+  à ce qui s'affiche à l'écran plutôt qu'à des frappes préprogrammées. Ils ont
+  trouvé deux vraies bogues de concurrence qu'un aller-retour en boucle locale
+  n'aurait pas vues.
+
+**Et surtout : le trait `Transport` n'est pas écrit.** C'était « la seule
+abstraction du projet » ; elle attend sa seconde implémentation pour exister.
+Une interface à implémentation unique ne factorise rien, elle déplace
+seulement le code d'un fichier à l'autre. `transport/mod.rs` porte cette
+décision en toutes lettres pour que la prochaine lecture ne la prenne pas pour
+un oubli.
 
 ---
 
@@ -229,6 +281,12 @@ de signalisation authentifié entre les deux pairs. C'est précisément le servi
 > fois ses relais et sa découverte désactivés, il ne reste d'iroh que `iroh-blobs`, payé d'une
 > seconde API en `0.x` posée sur une pile dont on neutralise la moitié des mécanismes. `bao-tree`
 > seul donne la propriété recherchée — la vérification bloc par bloc — sans ce coût.
+>
+> ⚠️ **Le rejet d'iroh tient toujours, mais son argument de repli est tombé** : `bao-tree` a été
+> écarté à son tour en écrivant `files.rs` (voir les décisions). La propriété « vérification bloc
+> par bloc » s'est révélée ne pas être celle dont murmure avait besoin — ce qu'il fallait, c'était
+> une identité de transfert pour la reprise. iroh reste écarté sur son motif d'origine, qui est de
+> conception et non technique : le relais observe qui parle à qui.
 
 ---
 
@@ -239,9 +297,9 @@ Installation manuelle — ce document ne génère aucun fichier.
 1. **Installer Rust ≥ 1.91** : `rustup toolchain install stable && rustup default stable`, puis
    vérifier avec `rustc --version` (arti 0.44 impose 1.91 en MSRV).
 2. **Initialiser la crate** : `cargo init murmure --bin` à la racine du dépôt existant.
-3. **Ajouter les dépendances**, en épinglant arti à l'exact :
-   `cargo add arti-client@=0.44.0 --features onion-service-service,restricted-discovery`
-   puis `cargo add tokio --features full`, `cargo add ratatui crossterm ed25519-dalek chacha20poly1305 blake3 serde postcard`.
+3. ~~**Ajouter les dépendances**~~ — la liste réelle a divergé de celle-ci ; voir « Stack summary »,
+   ou plus simplement le `Cargo.toml`, qui porte le pourquoi de chaque ligne. Ce qui reste vrai :
+   **épingler arti à l'exact** (`=0.44.0`, pas `0.44`).
 4. **Vérifier que la compilation passe sur les trois OS visés** avant d'écrire la moindre ligne de
    logique. arti tire une chaîne de dépendances conséquente ; découvrir un problème de
    compilation Windows après trois soirées de code coûte cher. À noter : docs.rs signale un échec
@@ -255,8 +313,48 @@ Installation manuelle — ce document ne génère aucun fichier.
    même machine s'y connecte et reçoit son écho. Environ 9 s à froid sur un état déjà amorcé,
    23 s sur une machine vierge. Plan et critères d'acceptation :
    `aidd_docs/tasks/2026_07/2026_07_31-keystore-onion-milestone.md`.
-7. **Second jalon** : le critère de réussite du brainstorm — deux machines, deux villes, comparaison
-   d'empreinte à l'oral, un message, puis un fichier avec confirmation explicite.
+7. ~~**Second jalon**~~ ✅ **Franchi le 2026-08-01.** Le critère de réussite du brainstorm est
+   atteint : deux machines (macOS et Linux), comparaison d'empreinte à l'oral, messages, puis un
+   fichier avec accord explicite du destinataire et reprise après coupure. Vérifié sur le même
+   réseau **et** via un partage de connexion 5G, donc deux NAT et deux FAI. La restricted
+   discovery a été validée dans la foulée : le service se reconfigure à chaud au premier `/add`,
+   sans redémarrage.
+
+**Pour installer et utiliser murmure, ce document n'est plus le bon endroit** :
+`README.md` pour l'usage, `POUR-TON-POTE.md` pour une installation pas à pas
+depuis le bundle git. Les étapes ci-dessus sont conservées comme trace de
+l'ordre dans lequel le projet a été monté.
+
+### Ce que la v1 livre réellement
+
+- Service onion v3 sous une clé possédée par murmure, adresse vérifiée par
+  comparaison d'octets contre la graine.
+- **Restricted discovery** : sans contact, le service est visible de qui a
+  l'adresse ; au premier `/add`, le descripteur devient illisible pour tout
+  autre que les contacts autorisés. Bascule à chaud.
+- Conversation texte, un appel à la fois, avec empreinte courte à comparer.
+- **Transfert de fichier** avec accord explicite du destinataire, reprise après
+  coupure indexée par le hash, et vérification avant de donner son vrai nom au
+  fichier.
+- TUI : historique défilable, glisser-déposer, `Ctrl-V`, sélection souris avec
+  copie au relâchement, `/copy` par OSC 52.
+
+### Posture de sécurité, au-delà du transport
+
+Trois défenses qui ne figuraient pas au plan et qu'il a fallu écrire :
+
+- **Le nom de fichier d'un pair est une frontière de confiance.** Il devient un
+  chemin sur le disque, donc `files::safe_name` jette tout composant de chemin
+  et refuse les caractères de contrôle et les surcharges bidi Unicode — un
+  `U+202E` fait lire `innocentexe.png` à ce qui reste un exécutable.
+- **Le texte d'un pair aussi.** Il part vers un terminal, qui obéit aux
+  séquences d'échappement : un ESC brut permet d'écraser le presse-papiers
+  d'en face via OSC 52. Nettoyé par `files::sanitize_for_display`.
+- **La graine et les clés dérivées s'effacent à la libération** (`zeroize`),
+  y compris le carnet déchiffré, qui est le graphe social en clair.
+
+Aucune de ces trois n'était visible depuis le plan : elles viennent d'un audit
+mené une fois le code écrit.
 
 ---
 
@@ -338,9 +436,20 @@ levé depuis le 2026-07-31 ; il a coûté une soirée, comme prévu. Restent :
 
 ### Ce qui reste ouvert après ce document
 
-- **La reprise de transfert entre sessions** : `bao-tree` fournit la vérification bloc par bloc,
-  mais l'état du transfert partiel (quels blocs reçus, où le noter, comment le reprendre après
-  redémarrage) reste à concevoir dans `files.rs`.
+- ~~**La reprise de transfert entre sessions**~~ ✅ **Résolu le 2026-08-01**, et sans le mécanisme
+  prévu. Pas de journal d'état, pas de liste de blocs reçus : le fichier partiel est **nommé
+  d'après le hash BLAKE3 du fichier entier**, avec l'extension `.part`. Sa taille *est* l'état de
+  reprise, et un partiel portant un hash donné ne peut être qu'un préfixe du fichier qui a ce
+  hash — donc recoller deux fichiers différents est structurellement impossible plutôt
+  qu'interdit par une vérification. Rien à noter, rien à nettoyer, rien à corrompre.
+
+- ⚠️ **Windows ne fonctionne pas.** arti se fige pendant le téléchargement du premier consensus,
+  un cœur à 100 %, sur **deux machines et deux réseaux indépendants**, avec le CLI `arti` seul
+  comme avec `arti-client` embarqué. Sept hypothèses éliminées avec preuves (réseau, horloge, TLS,
+  compression, code applicatif, blocage de verrou, contrôle de congestion #2651). Cause racine non
+  trouvée : il faudrait attacher un débogueur natif pour voir quel fil tourne en boucle. Rapport
+  amont rédigé et prêt à déposer — `aidd_docs/arti-windows-hang.md`. En attendant, murmure est
+  macOS et Linux.
 - **Le réglage du coût de la présence**, désormais chiffré comme le vrai problème d'UX du projet.
   Complication découverte au jalon keystore : `OnionServiceStatus::state()` **n'est pas un oracle
   de joignabilité**. L'état agrégé reste `Bootstrapping` dès que l'un des deux composants (gestion
@@ -350,8 +459,15 @@ levé depuis le 2026-07-31 ; il a coûté une soirée, comme prévu. Restent :
   connexions, et le statut annonce toujours `Bootstrapping`. **Ne pas brancher un indicateur de
   présence dessus** — il sous-déclare. La seule preuve de joignabilité est une connexion réussie,
   ce qui renchérit encore le coût de la présence.
-- **La forme de l'identifiant échangé au premier contact** : adresse `.onion` + clé client x25519,
-  échange asymétrique. À vérifier que l'empreinte courte reste comparable à l'oral.
+- ~~**La forme de l'identifiant échangé au premier contact**~~ ✅ **Réglé, et l'asymétrie
+  redoutée n'a pas eu lieu.** murmure dérive **une seule** clé de découverte de sa graine et la
+  présente à tout le monde, au lieu d'une paire par service à joindre. L'échange redevient donc
+  symétrique et en un coup : chacun donne `<adresse> <clé>` une fois, `/copy` met les deux dans le
+  presse-papiers dans l'ordre où `/add` les attend. L'empreinte courte reste celle de l'adresse
+  seule, donc toujours comparable à l'oral. Coût accepté : deux contacts qui comparent leurs
+  notes voient la même clé publique et en déduisent qu'ils parlent à la même personne — ils
+  détiennent déjà tous deux la même adresse `.onion`, qui le dit plus directement. Raisonnement
+  complet sur `Identity::discovery_secret`.
 - **Les vanguards ne sont pas activés.** La feature `vanguards` d'`arti-client` est absente de
   `Cargo.toml`. Sans elle, les chemins du service onion sont plus exposés à l'énumération des
   points d'introduction que ce qu'une mise en production demanderait. Hors périmètre du jalon
@@ -369,4 +485,6 @@ levé depuis le 2026-07-31 ; il a coûté une soirée, comme prévu. Restent :
 - [`tor_keymgr` — gestion des clés et keystore](https://tpo.pages.torproject.net/core/doc/rust/tor_keymgr/index.html)
 - [PETS 2025 — Improving the Performance and Security of Tor's Onion Services](https://petsymposium.org/popets/2025/popets-2025-0029.pdf) (chiffres de latence)
 - [Tor Metrics — OnionPerf latencies](https://metrics.torproject.org/onionperf-latencies.html)
-- [`ratatui`](https://crates.io/crates/ratatui) · [`ed25519-dalek`](https://crates.io/crates/ed25519-dalek) · [`chacha20poly1305`](https://crates.io/crates/chacha20poly1305)
+- [`ratatui`](https://crates.io/crates/ratatui) · [`chacha20poly1305`](https://crates.io/crates/chacha20poly1305) · [`zeroize`](https://crates.io/crates/zeroize)
+- [OSC 52 — écriture du presse-papiers par séquence d'échappement](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html)
+- [Unicode UAX #9 — algorithme bidirectionnel](https://www.unicode.org/reports/tr9/) (les caractères refusés dans les noms de fichiers)
