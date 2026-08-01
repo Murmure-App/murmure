@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::store;
 
@@ -47,8 +48,12 @@ pub struct Contacts {
     entries: BTreeMap<String, Contact>,
     #[serde(skip)]
     path: PathBuf,
+    /// The key this book is sealed under, derived from the identity seed.
+    ///
+    /// Wiped on drop: it opens the file that *is* the social graph, so it is
+    /// worth exactly as much as the graph itself.
     #[serde(skip)]
-    key: [u8; 32],
+    key: Zeroizing<[u8; 32]>,
 }
 
 impl Contacts {
@@ -76,8 +81,12 @@ impl Contacts {
 
     /// Seal the book back to disk.
     fn save(&self) -> Result<()> {
-        let plaintext = postcard::to_stdvec(self)
-            .map_err(|e| anyhow::anyhow!("encoding the contacts book: {e}"))?;
+        // The encoded book is the social graph in the clear. It exists in memory
+        // for as long as it takes to seal it, and not a moment longer.
+        let plaintext = Zeroizing::new(
+            postcard::to_stdvec(self)
+                .map_err(|e| anyhow::anyhow!("encoding the contacts book: {e}"))?,
+        );
         store::write_sealed(&self.path, &self.key, &plaintext)
     }
 

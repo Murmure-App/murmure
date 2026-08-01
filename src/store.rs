@@ -27,6 +27,7 @@ use anyhow::{Context as _, Result, bail};
 use chacha20poly1305::aead::{Aead as _, KeyInit as _};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore as _;
+use zeroize::Zeroizing;
 
 /// Length of the XChaCha20-Poly1305 nonce, in bytes.
 const NONCE_LEN: usize = 24;
@@ -52,7 +53,12 @@ pub fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
 ///
 /// Fails on a wrong key and on any tampering — Poly1305 authenticates, so a
 /// flipped bit is an error rather than corrupted plaintext.
-pub fn open(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
+///
+/// The plaintext comes back in a `Zeroizing` wrapper because everything sealed
+/// here is sealed for a reason: handing back a bare `Vec` would put the very
+/// thing we encrypt into a freed allocation the moment the caller is done with
+/// it. Callers deref it like an ordinary `Vec<u8>`.
+pub fn open(key: &[u8; 32], sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if sealed.len() < NONCE_LEN {
         bail!("sealed data is {} bytes, too short to hold a nonce", sealed.len());
     }
@@ -61,6 +67,7 @@ pub fn open(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
 
     XChaCha20Poly1305::new(key.into())
         .decrypt(&XNonce::from(nonce), ciphertext)
+        .map(Zeroizing::new)
         .map_err(|_| {
             anyhow::anyhow!(
                 "could not open the sealed file: wrong identity seed, or the file was tampered with"
@@ -103,7 +110,7 @@ pub fn write_sealed(path: &Path, key: &[u8; 32], plaintext: &[u8]) -> Result<()>
 }
 
 /// Read and open a sealed file, or [`None`] if it does not exist yet.
-pub fn read_sealed(path: &Path, key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+pub fn read_sealed(path: &Path, key: &[u8; 32]) -> Result<Option<Zeroizing<Vec<u8>>>> {
     match fs::read(path) {
         Ok(sealed) => Ok(Some(open(key, &sealed).with_context(|| {
             format!("opening {}", path.display())
@@ -121,7 +128,7 @@ mod tests {
     fn sealed_data_round_trips() {
         let key = [3u8; 32];
         let sealed = seal(&key, b"alice = haticv...onion").unwrap();
-        assert_eq!(open(&key, &sealed).unwrap(), b"alice = haticv...onion");
+        assert_eq!(open(&key, &sealed).unwrap().as_slice(), b"alice = haticv...onion");
     }
 
     #[test]
@@ -172,11 +179,11 @@ mod tests {
         let key = [9u8; 32];
 
         write_sealed(&path, &key, b"alice").unwrap();
-        assert_eq!(read_sealed(&path, &key).unwrap().unwrap(), b"alice");
+        assert_eq!(read_sealed(&path, &key).unwrap().unwrap().as_slice(), b"alice");
 
         // A rewrite replaces rather than appends.
         write_sealed(&path, &key, b"bob").unwrap();
-        assert_eq!(read_sealed(&path, &key).unwrap().unwrap(), b"bob");
+        assert_eq!(read_sealed(&path, &key).unwrap().unwrap().as_slice(), b"bob");
 
         let _ = fs::remove_dir_all(&dir);
     }

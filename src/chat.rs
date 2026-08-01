@@ -346,7 +346,13 @@ async fn handle(
     screen: &Screen,
 ) -> Result<bool> {
     match msg {
-        Message::Text(body) => screen.say(Kind::Theirs, format!("{peer}> {body}")),
+        Message::Text(body) => {
+            // The peer's raw bytes must not reach the terminal: see
+            // `files::sanitize_for_display` for why a chat line is exactly as
+            // dangerous as a filename here.
+            let body = files::sanitize_for_display(&body);
+            screen.say(Kind::Theirs, format!("{peer}> {body}"));
+        }
         Message::Ping => {
             if outbox.send(Message::Pong).await.is_err() {
                 return Ok(false);

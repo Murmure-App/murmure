@@ -92,8 +92,21 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 serde = { version = "1.0.229", features = ["derive"] }
 postcard = { version = "1.1.3", features = ["use-std"] }
-chacha20poly1305 = "0.11.0"
+# `zeroize` is not on by default: the cipher keeps the expanded key in its own
+# state, and without this that state is left in freed memory on drop. Costs
+# nothing — zeroize is already in the tree below.
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 blake3 = "1.8.5"
+
+# Wipe key material on drop rather than leaving it in freed memory, where a core
+# dump or a swapped-out page can outlive the process. Not a defence against a
+# live attacker who can already read our memory — it shortens the window, which
+# is all any userspace program can do.
+#
+# Free, in both senses: arti already compiles zeroize, and `Zeroizing<T>` is a
+# wrapper with a Drop impl, so no derive macro and no `derive` feature. The
+# fields that hold key material change type; nothing else in the tree moves.
+zeroize = "1"
 ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 

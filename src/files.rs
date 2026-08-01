@@ -138,19 +138,11 @@ pub fn safe_name(raw: &str) -> Result<String> {
         bail!("the peer sent a {}-byte filename", last.len());
     }
     // The operator decides whether to accept by reading this name, so anything
-    // that makes it display differently from what it is gets refused.
-    //
-    // `is_control` covers C0 and C1 but *not* the bidirectional overrides, which
-    // Unicode files as format characters: U+202E turns `innocent<RLO>gnp.exe`
-    // into `innocentexe.png` on screen while remaining an executable. They are
-    // listed rather than derived because std exposes no character categories,
-    // and a named list of exactly what reorders text is clearer than a
-    // dependency that would answer the same question.
-    const BIDI: [char; 12] = [
-        '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
-        '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
-    ];
-    if last.chars().any(|c| c.is_control() || BIDI.contains(&c)) {
+    // that makes it display differently from what it is gets refused outright
+    // rather than cleaned — a cleaned name would still save under a different
+    // string than the one shown. See [`has_display_spoofing_chars`] for what
+    // that covers and why.
+    if last.chars().any(has_display_spoofing_chars) {
         bail!("the peer sent a filename containing invisible or reordering characters");
     }
     // Reserved on Windows, harmless on Unix, refused everywhere so that a file
@@ -159,6 +151,38 @@ pub fn safe_name(raw: &str) -> Result<String> {
         bail!("the peer sent {last:?}, which is not a portable filename");
     }
     Ok(last)
+}
+
+/// Would this character make text display as something other than what it is?
+///
+/// `is_control` covers C0 and C1 — including ESC, which is how a terminal is
+/// told to do anything at all, from moving the cursor to overwriting the
+/// system clipboard via OSC 52 (the same mechanism [`crate::ui::copy_to_clipboard`]
+/// uses on purpose). It does *not* cover the Unicode bidirectional overrides,
+/// which Unicode files as format characters rather than control characters:
+/// U+202E turns `innocent<RLO>gnp.exe` into `innocentexe.png` on screen while
+/// remaining an executable. They are listed rather than derived because std
+/// exposes no character categories, and a named list of exactly what reorders
+/// text is clearer than a dependency that would answer the same question.
+fn has_display_spoofing_chars(c: char) -> bool {
+    const BIDI: [char; 12] = [
+        '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+        '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+    ];
+    c.is_control() || BIDI.contains(&c)
+}
+
+/// Strip whatever would let a peer's chat text control our terminal instead of
+/// merely appearing on it.
+///
+/// A `Message::Text` body reaches the screen the same way a `FileOffer` name
+/// does — printed straight into the operator's terminal — and needs the same
+/// defence `safe_name` gives a filename. Unlike a filename, refusing the whole
+/// message is not an option (there is nothing else to fall back to and no
+/// sender to ask again), so the offending characters are dropped rather than
+/// the message rejected.
+pub fn sanitize_for_display(raw: &str) -> String {
+    raw.chars().filter(|c| !has_display_spoofing_chars(*c)).collect()
 }
 
 /// Where an incoming file is written while it is still incomplete.
@@ -285,6 +309,26 @@ mod tests {
         assert!(safe_name("notes\u{0000}.txt").is_err());
         // An NTFS alternate data stream, and a drive letter.
         assert!(safe_name("notes.txt:hidden").is_err());
+    }
+
+    /// A chat line has no filesystem to escape, but the same characters would
+    /// still hand a peer our terminal — an ESC byte can drive OSC 52 (write the
+    /// clipboard), move the cursor, or hide/overwrite what came before it.
+    #[test]
+    fn a_hostile_chat_line_is_cleaned_not_rejected() {
+        assert_eq!(sanitize_for_display("bonjour"), "bonjour");
+        // A raw ESC starting an OSC 52 clipboard write, terminated by BEL.
+        assert_eq!(
+            sanitize_for_display("hi\u{1b}]52;c;cG93bmVk\u{07}there"),
+            "hi]52;c;cG93bmVkthere"
+        );
+        // The same bidi override that spoofs a filename spoofs a chat line too.
+        assert_eq!(
+            sanitize_for_display("innocent\u{202e}gnp.exe"),
+            "innocentgnp.exe"
+        );
+        // Never panics or rejects — there is no sender to ask again.
+        assert_eq!(sanitize_for_display(""), "");
     }
 
     #[test]

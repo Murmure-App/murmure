@@ -26,6 +26,7 @@ use tor_hscrypto::pk::{
     HsClientDescEncKey, HsClientDescEncSecretKey, HsId, HsIdKey, HsIdKeypair,
 };
 use tor_llcrypto::pk::{curve25519, ed25519};
+use zeroize::Zeroizing;
 
 /// Length of the ed25519 secret seed murmure persists.
 pub const SEED_LEN: usize = 32;
@@ -36,8 +37,13 @@ const DISCOVERY_CONTEXT: &str = "murmure 2026 service discovery";
 
 /// A murmure identity: one 32-byte ed25519 seed, and everything derived from it.
 pub struct Identity {
-    /// The secret seed. Never printed, never logged.
-    seed: [u8; SEED_LEN],
+    /// The secret seed. Never printed, never logged, and wiped on drop.
+    ///
+    /// `Zeroizing` rather than a bare array: this is the one value the whole
+    /// threat model rests on, and an array is `Copy`, so leaving it bare means
+    /// every move leaves a readable copy behind on the stack. The wrapper is
+    /// not `Copy`, which makes those accidental copies a compile error.
+    seed: Zeroizing<[u8; SEED_LEN]>,
     /// Where the seed lives on disk. Only `check_permissions` reads it, and that
     /// has nothing to check off Unix — hence the allow rather than a cfg on the
     /// field, which would make the two constructors platform-specific too.
@@ -57,9 +63,13 @@ impl Identity {
 
     /// Load an existing seed file.
     fn load(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path)
-            .with_context(|| format!("reading the identity seed at {}", path.display()))?;
-        let seed: [u8; SEED_LEN] = bytes.as_slice().try_into().map_err(|_| {
+        // The read buffer holds the seed too, so it is wiped on the way out
+        // rather than left in a freed allocation.
+        let bytes = Zeroizing::new(
+            fs::read(path)
+                .with_context(|| format!("reading the identity seed at {}", path.display()))?,
+        );
+        let seed: Zeroizing<[u8; SEED_LEN]> = bytes.as_slice().try_into().map(Zeroizing::new).map_err(|_| {
             anyhow::anyhow!(
                 "{} is {} bytes, expected exactly {SEED_LEN}; \
                  delete it to generate a fresh identity",
@@ -75,8 +85,10 @@ impl Identity {
 
     /// Generate a seed from the OS CSPRNG and write it with 0600 permissions.
     fn create(path: &Path) -> Result<Self> {
-        let mut seed = [0u8; SEED_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut seed);
+        // Wrapped before it is filled, not after: a bare array would be filled,
+        // copied into the wrapper, and the original left behind untouched.
+        let mut seed = Zeroizing::new([0u8; SEED_LEN]);
+        rand::rngs::OsRng.fill_bytes(seed.as_mut());
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -96,7 +108,7 @@ impl Identity {
         let mut file = opts
             .open(path)
             .with_context(|| format!("creating the identity seed at {}", path.display()))?;
-        file.write_all(&seed)
+        file.write_all(seed.as_slice())
             .with_context(|| format!("writing the identity seed at {}", path.display()))?;
         file.sync_all()
             .with_context(|| format!("flushing the identity seed at {}", path.display()))?;
@@ -160,8 +172,8 @@ impl Identity {
     ///
     /// Consequence, deliberate and already recorded in the brainstorm: losing
     /// the seed loses everything it sealed. There is no recovery.
-    pub fn derive_key(&self, context: &str) -> [u8; 32] {
-        blake3::derive_key(context, &self.seed)
+    pub fn derive_key(&self, context: &str) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(blake3::derive_key(context, self.seed.as_ref()))
     }
 
     /// The x25519 secret murmure proves itself with to a restricted service.
@@ -185,7 +197,10 @@ impl Identity {
     /// ponytail: revisit if murmure ever grows separable personas, which is the
     /// one case where linking two contacts would actually cost something.
     pub fn discovery_secret(&self) -> HsClientDescEncSecretKey {
-        curve25519::StaticSecret::from(self.derive_key(DISCOVERY_CONTEXT)).into()
+        // `*` copies the bytes out so `StaticSecret` can own them; the wrapper
+        // wipes its own copy at the end of the statement, and `StaticSecret`
+        // zeroizes on drop in turn.
+        curve25519::StaticSecret::from(*self.derive_key(DISCOVERY_CONTEXT)).into()
     }
 
     /// The public half, in the `descriptor:x25519:<base32>` form C Tor and arti
@@ -212,15 +227,15 @@ mod test {
     #[test]
     fn address_is_a_pure_function_of_the_seed() {
         let a = Identity {
-            seed: [7u8; SEED_LEN],
+            seed: Zeroizing::new([7u8; SEED_LEN]),
             path: PathBuf::from("/nonexistent"),
         };
         let b = Identity {
-            seed: [7u8; SEED_LEN],
+            seed: Zeroizing::new([7u8; SEED_LEN]),
             path: PathBuf::from("/nonexistent"),
         };
         let c = Identity {
-            seed: [8u8; SEED_LEN],
+            seed: Zeroizing::new([8u8; SEED_LEN]),
             path: PathBuf::from("/nonexistent"),
         };
         assert_eq!(a.onion_address(), b.onion_address());
@@ -230,11 +245,11 @@ mod test {
     #[test]
     fn discovery_key_is_a_pure_function_of_the_seed() {
         let a = Identity {
-            seed: [7u8; SEED_LEN],
+            seed: Zeroizing::new([7u8; SEED_LEN]),
             path: PathBuf::from("/nonexistent"),
         };
         let b = Identity {
-            seed: [8u8; SEED_LEN],
+            seed: Zeroizing::new([8u8; SEED_LEN]),
             path: PathBuf::from("/nonexistent"),
         };
         assert_eq!(a.discovery_key(), a.discovery_key());
@@ -249,7 +264,7 @@ mod test {
     #[test]
     fn address_is_a_well_formed_v3_onion() {
         let id = Identity {
-            seed: [1u8; SEED_LEN],
+            seed: Zeroizing::new([1u8; SEED_LEN]),
             path: PathBuf::from("/nonexistent"),
         };
         let addr = id.onion_address().display_unredacted().to_string();
