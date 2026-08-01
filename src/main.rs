@@ -596,6 +596,10 @@ fn help(screen: &Screen) {
         "  left / right / Home / End     move inside what you are typing",
         "  Ctrl-V                        paste (no Shift needed)",
         "  Ctrl-U                        clear the input   Ctrl-C  leave",
+        "mouse:",
+        "  drag over the history         select it; releasing copies it",
+        "  wheel                         scroll",
+        "  Shift-drag                    your terminal's own selection instead",
     ] {
         screen.say(Kind::System, line);
     }
