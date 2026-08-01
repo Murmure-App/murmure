@@ -19,14 +19,15 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use futures::StreamExt as _;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc;
 
 /// How many lines of history are kept.
@@ -42,6 +43,9 @@ const SCROLLBACK: usize = 2_000;
 /// so a page turn keeps one line of context. This is only the value before the
 /// first frame has been drawn.
 const PAGE: usize = 10;
+
+/// Rows one notch of the mouse wheel moves.
+const WHEEL_STEP: usize = 3;
 
 /// What kind of line this is, which decides how it is coloured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +157,64 @@ pub fn channel() -> (Screen, mpsc::UnboundedReceiver<Update>) {
     (Screen(tx), rx)
 }
 
+/// One on-screen row, wrapped from an [`Entry`] in [`App::history`].
+///
+/// This is the single source of truth for "what is on screen where": the same
+/// `Vec<Row>` is used to draw, to resolve a mouse click to a piece of text, and
+/// to page-scroll — so those three can never disagree with each other the way
+/// a separate row-counting approximation could.
+#[derive(Debug, Clone)]
+struct Row {
+    /// Index into `history` this row was wrapped from. Consecutive rows that
+    /// share this join back into their entry's original text with no
+    /// separator — that is what makes a selected address come back whole
+    /// however it happened to wrap on screen.
+    entry: usize,
+    /// Char offset within that entry's text where this row starts.
+    offset: usize,
+    kind: Kind,
+    text: String,
+}
+
+/// One end of a mouse selection: which entry, and how far into its text.
+///
+/// Anchored to the *entry*, not to a screen row or a `(row, col)` pair. A
+/// screen row's meaning changes the instant the view scrolls, but an entry
+/// index does not — so a selection survives new messages arriving mid-drag,
+/// the same way scrolling a real terminal's history does not lose its
+/// selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Anchor {
+    entry: usize,
+    offset: usize,
+}
+
+/// A mouse-drag text selection: where it started, and where the mouse is (or
+/// was, once released) now.
+#[derive(Debug, Clone, Copy)]
+struct Selection {
+    anchor: Anchor,
+    current: Anchor,
+}
+
+impl Selection {
+    /// The two ends in document order, earliest first.
+    ///
+    /// `(entry, offset)` sorts correctly because entries are chronological and
+    /// a row's offset only increases left-to-right within one entry — so
+    /// lexicographic order on the pair is reading order, regardless of which
+    /// direction the mouse actually dragged.
+    fn ordered(&self) -> (Anchor, Anchor) {
+        let a = (self.anchor.entry, self.anchor.offset);
+        let b = (self.current.entry, self.current.offset);
+        if a <= b {
+            (self.anchor, self.current)
+        } else {
+            (self.current, self.anchor)
+        }
+    }
+}
+
 /// Everything drawn, and where the view is.
 struct App {
     /// Shown in the title bar, next to the address.
@@ -189,6 +251,23 @@ struct App {
     /// clamped or paged without it. Seeded with a plausible terminal so the
     /// first keypress behaves even if it lands before the first draw.
     viewport: (usize, usize),
+    /// Where the history box's *inner* area starts on screen, as of the last
+    /// frame — the coordinate a mouse event's `(column, row)` is measured
+    /// against to find which [`Row`] it landed on.
+    body_origin: (u16, u16),
+    /// The rows drawn last frame, in on-screen order. A mouse click is
+    /// resolved against exactly this, not recomputed, so a selection always
+    /// matches pixels the operator actually saw.
+    rows: Vec<Row>,
+    /// The current text selection, if any. Sticks around after the mouse is
+    /// released so the highlight stays visible, and is replaced or cleared by
+    /// the next press.
+    selection: Option<Selection>,
+    /// Set while the left button is held down over the history, so a `Drag`
+    /// event extends the existing selection instead of starting a new one —
+    /// crossterm can deliver a stray `Drag` without a matching `Down` on some
+    /// terminals, and this is what tells that apart from a real one.
+    dragging: bool,
     /// Whether typed lines are accepted at all. False until Tor is up.
     accepting: bool,
 }
@@ -204,6 +283,10 @@ impl App {
             attached: Vec::new(),
             scroll_back: 0,
             viewport: (80, PAGE),
+            body_origin: (0, 0),
+            rows: Vec::new(),
+            selection: None,
+            dragging: false,
             accepting: false,
         }
     }
@@ -370,9 +453,19 @@ pub async fn run(
     // event instead of a burst of keystrokes. Without it a dropped path arrives
     // character by character and there is nothing to recognise it by.
     let bracketed = crossterm::execute!(std::io::stdout(), EnableBracketedPaste).is_ok();
+    // Mouse capture is what lets murmure draw its own selection highlight and
+    // copy it on release. The trade-off, and it is a real one: the terminal's
+    // own native selection stops working while this is on, because the
+    // terminal no longer sees clicks and drags at all — they come here
+    // instead. Shift-drag is every terminal's escape hatch back to its own
+    // selection, for selecting scrollback murmure itself does not keep.
+    let mouse = crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
 
     let result = event_loop(&mut terminal, &mut updates, typed, title).await;
 
+    if mouse {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    }
     if bracketed {
         // Leaving it on would make the shell after us receive pastes wrapped in
         // escape sequences it does not expect.
@@ -424,7 +517,8 @@ async fn event_loop(
                         }
                     }
                     Some(Ok(Event::Paste(text))) => app.paste(&text),
-                    // Resize and mouse events just need a redraw.
+                    Some(Ok(Event::Mouse(m))) => handle_mouse(m, &mut app),
+                    // A resize just needs a redraw.
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e).context("reading a terminal event"),
                     None => return Ok(()),
@@ -557,33 +651,29 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     // ---- history ----
     //
     // Anchored on the *bottom*: the newest line must always be the last visible
-    // row. `Paragraph` renders top-down and clips whatever overflows the bottom,
-    // so picking "the last N entries" is not enough — with wrapping on, a
-    // 62-character address occupies two or three rows, the selection overflows,
-    // and the newest lines are drawn past the edge and never seen.
+    // row. Wrapping is done by hand (see [`visible_rows`]) rather than left to
+    // `Paragraph`'s own word-wrap, so the row a mouse click lands on is exactly
+    // the row that got drawn — a second wrapping pass that came out even one
+    // row different would point a click at the wrong text.
     let inner_w = body.width.saturating_sub(2).max(1) as usize;
     let inner_h = body.height.saturating_sub(2) as usize;
     // Remembered for the next keypress: paging and clamping both need to know
     // how tall a screen is and how wide a row wraps.
     app.viewport = (inner_w, inner_h);
+    app.body_origin = (body.x + 1, body.y + 1);
     // A terminal that just got narrower turns entries into more rows, which can
     // leave the offset pointing past the oldest one.
     app.scroll(0);
-    let (start, end, hidden_rows) = window(&app.history, inner_w, inner_h, app.scroll_back);
+    app.rows = visible_rows(&app.history, inner_w, inner_h, app.scroll_back);
 
     let lines: Vec<Line> = app
-        .history
+        .rows
         .iter()
-        .skip(start)
-        .take(end - start)
-        .map(|entry| Line::styled(entry.text.clone(), style_for(entry.kind)))
+        .map(|row| build_line(row, &app.selection))
         .collect();
 
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((hidden_rows, 0))
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
         body,
     );
 
@@ -752,60 +842,222 @@ fn as_dropped_file(text: &str) -> Option<PathBuf> {
     expanded.is_file().then_some(expanded)
 }
 
-/// How many rows one entry occupies once wrapped to `width`.
+/// Split `text` into rows of at most `width` characters, each paired with the
+/// char offset where it starts.
+///
+/// Hard-wrapped, not word-wrapped: chat lines are short enough that breaking
+/// mid-word costs nothing, and hard-wrapping is exact — a row is precisely
+/// `width` characters until the last one — which is what lets [`visible_rows`]
+/// find the row under a mouse click by arithmetic instead of by re-running a
+/// word-wrap algorithm and hoping it agrees with what was drawn.
 ///
 /// Counts characters, not grapheme clusters or display width. Close enough for
-/// the accented Latin text this carries, and it can only ever be off by a row —
-/// never panic, never lose the newest line.
-fn rows_for(text: &str, width: usize) -> usize {
-    text.chars().count().div_ceil(width).max(1)
+/// the accented Latin text this carries.
+fn wrap(text: &str, width: usize) -> Vec<(usize, &str)> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![(0, text)];
+    }
+    let bounds: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let mut rows = Vec::with_capacity(bounds.len().div_ceil(width));
+    let mut i = 0;
+    while i < bounds.len() {
+        let end_i = (i + width).min(bounds.len());
+        let end_byte = bounds.get(end_i).copied().unwrap_or(text.len());
+        rows.push((i, &text[bounds[i]..end_byte]));
+        i = end_i;
+    }
+    rows
 }
 
-/// Pick the slice of history to draw, anchored `scroll_back` rows above the
-/// bottom.
+/// How many rows one entry occupies once wrapped to `width`.
+fn rows_for(text: &str, width: usize) -> usize {
+    wrap(text, width).len()
+}
+
+/// Every row a `height`-tall, `width`-wide box shows, anchored `scroll_back`
+/// rows above the bottom.
 ///
-/// Returns the half-open entry range and how many rows of the *first* entry to
-/// hide. `Paragraph` renders top-down from that offset and clips at the bottom
-/// edge, so a partly visible entry works at either end without help.
-fn window(
+/// Rows come back whole — never a fraction of one hanging off the top edge —
+/// which is the piece the old ratatui-`Wrap`-plus-scroll-offset approach
+/// could not give without extra bookkeeping: that scheme drew a partial row on
+/// purpose (see the removed `hidden_rows`). Owning the wrap makes "row zero of
+/// what's drawn" and "row zero of what a mouse click can land on" the same
+/// row, with nothing to keep in sync between them.
+fn visible_rows(
     history: &VecDeque<Entry>,
     width: usize,
     height: usize,
     scroll_back: usize,
-) -> (usize, usize, u16) {
+) -> Vec<Row> {
     if height == 0 || history.is_empty() {
-        return (history.len(), history.len(), 0);
+        return Vec::new();
     }
+    let needed = scroll_back + height;
 
-    // The whole history is one column of rows. Work out which row sits at the
-    // top of the box, then find the entry it falls inside.
-    let total: usize = history.iter().map(|e| rows_for(&e.text, width)).sum();
-    let top = total.saturating_sub(scroll_back + height);
-
-    let mut start = 0usize;
-    let mut above = 0usize;
-    for entry in history.iter() {
-        let rows = rows_for(&entry.text, width);
-        if above + rows > top {
-            break;
-        }
-        above += rows;
-        start += 1;
-    }
-
-    // Take just enough entries to fill the box. Anything past the bottom edge
-    // would be drawn and clipped, which costs work and changes nothing.
-    let mut end = start;
-    let mut drawn = 0usize;
-    for entry in history.iter().skip(start) {
-        drawn += rows_for(&entry.text, width);
-        end += 1;
-        if drawn >= top - above + height {
+    // Wrap from the newest entry backwards, stopping once enough rows exist to
+    // cover the window asked for — touches a couple of screens' worth of
+    // entries, never the whole scrollback.
+    let mut rows_rev: Vec<Row> = Vec::new();
+    for (idx, entry) in history.iter().enumerate().rev() {
+        let mut this_entry: Vec<Row> = wrap(&entry.text, width)
+            .into_iter()
+            .rev()
+            .map(|(offset, s)| Row {
+                entry: idx,
+                offset,
+                kind: entry.kind,
+                text: s.to_owned(),
+            })
+            .collect();
+        rows_rev.append(&mut this_entry);
+        if rows_rev.len() >= needed {
             break;
         }
     }
+    rows_rev.reverse();
 
-    (start, end, u16::try_from(top - above).unwrap_or(u16::MAX))
+    // Scrolled further back than there is history to show: pin to the oldest
+    // row rather than answering with an empty window, which would blank the box
+    // instead. `App::scroll` clamps to this same limit, so a scroll key cannot
+    // get here — but a terminal *resize* can: narrowing the window rewraps every
+    // entry into more rows, and widening it into fewer, leaving the stored
+    // `scroll_back` stale until the next keypress.
+    let total = rows_rev.len();
+    let scroll_back = scroll_back.min(total.saturating_sub(height));
+    let end = total.saturating_sub(scroll_back);
+    let start = end.saturating_sub(height);
+    rows_rev[start..end].to_vec()
+}
+
+/// A row as a [`Line`], with the part inside `selection` (if any of it falls
+/// on this row) drawn reversed.
+fn build_line(row: &Row, selection: &Option<Selection>) -> Line<'static> {
+    let base = style_for(row.kind);
+    let whole = || Line::styled(row.text.clone(), base);
+
+    let Some(sel) = selection else { return whole() };
+    let (from, to) = sel.ordered();
+    if row.entry < from.entry || row.entry > to.entry {
+        return whole();
+    }
+
+    let len = row.text.chars().count();
+    let row_end = row.offset + len;
+    let sel_start = (if row.entry == from.entry { from.offset } else { 0 }).clamp(row.offset, row_end);
+    let sel_end = (if row.entry == to.entry { to.offset } else { row_end }).clamp(row.offset, row_end);
+    if sel_start >= sel_end {
+        return whole();
+    }
+
+    let chars: Vec<char> = row.text.chars().collect();
+    let (local_start, local_end) = (sel_start - row.offset, sel_end - row.offset);
+    let highlight = base.add_modifier(Modifier::REVERSED);
+    Line::from(vec![
+        Span::styled(chars[..local_start].iter().collect::<String>(), base),
+        Span::styled(chars[local_start..local_end].iter().collect::<String>(), highlight),
+        Span::styled(chars[local_end..].iter().collect::<String>(), base),
+    ])
+}
+
+/// Resolve a mouse position to the [`Row`] it lands on, if any, as an
+/// [`Anchor`] into that row's entry.
+///
+/// Clamps rather than refusing: dragging above, left of, or below the box is
+/// how a selection is extended past the visible edge in every terminal, and
+/// clamping to the nearest row and column is what makes that keep working
+/// here instead of dropping the drag.
+fn anchor_at(app: &App, column: u16, row: u16) -> Option<Anchor> {
+    if app.rows.is_empty() {
+        return None;
+    }
+    let (origin_x, origin_y) = app.body_origin;
+    let r = (row.saturating_sub(origin_y) as usize).min(app.rows.len() - 1);
+    let c = column.saturating_sub(origin_x) as usize;
+
+    let line = &app.rows[r];
+    let local = c.min(line.text.chars().count());
+    Some(Anchor {
+        entry: line.entry,
+        offset: line.offset + local,
+    })
+}
+
+/// The text a finished selection covers, read from the *entries themselves*
+/// rather than the wrapped rows — so an address selected across several rows
+/// comes back as the one unbroken string it always was, never split at
+/// whatever column it happened to wrap on screen. Entries are joined with a
+/// newline; `None` when there is nothing left to select (an empty history, or
+/// a selection whose start has already scrolled out of it).
+fn selected_text(history: &VecDeque<Entry>, sel: Selection) -> Option<String> {
+    let last = history.len().checked_sub(1)?;
+    let (from, to) = sel.ordered();
+    if from.entry > last {
+        return None;
+    }
+    let to_entry = to.entry.min(last);
+
+    let mut out = String::new();
+    for (idx, entry) in history
+        .iter()
+        .enumerate()
+        .take(to_entry + 1)
+        .skip(from.entry)
+    {
+        let chars: Vec<char> = entry.text.chars().collect();
+        let start = if idx == from.entry { from.offset.min(chars.len()) } else { 0 };
+        let end = if idx == to.entry { to.offset.min(chars.len()) } else { chars.len() };
+        if idx != from.entry {
+            out.push('\n');
+        }
+        out.extend(&chars[start..end.max(start)]);
+    }
+    Some(out).filter(|s| !s.is_empty())
+}
+
+/// React to one mouse event over the history box.
+fn handle_mouse(m: MouseEvent, app: &mut App) {
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.dragging = false;
+            app.selection = anchor_at(app, m.column, m.row).map(|a| Selection {
+                anchor: a,
+                current: a,
+            });
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(anchor) = anchor_at(app, m.column, m.row) else {
+                return;
+            };
+            match app.selection.as_mut() {
+                Some(sel) => sel.current = anchor,
+                // A `Down` was missed (some terminals send a bare `Drag` for
+                // the first movement), so treat this as where it started.
+                None => app.selection = Some(Selection { anchor, current: anchor }),
+            }
+            app.dragging = true;
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            match app.selection {
+                // Pressed and released with no movement: a plain click,
+                // clearing whatever was highlighted before rather than leaving
+                // a zero-width "selection" behind.
+                Some(sel) if !app.dragging || sel.anchor == sel.current => {
+                    app.selection = None;
+                }
+                Some(sel) => {
+                    if let Some(text) = selected_text(&app.history, sel) {
+                        copy_to_clipboard(&text);
+                    }
+                }
+                None => {}
+            }
+            app.dragging = false;
+        }
+        MouseEventKind::ScrollUp => app.scroll(WHEEL_STEP as isize),
+        MouseEventKind::ScrollDown => app.scroll(-(WHEEL_STEP as isize)),
+        _ => {}
+    }
 }
 
 fn style_for(kind: Kind) -> Style {
@@ -843,18 +1095,14 @@ mod tests {
         }
         history.push_back(entry("the newest line"));
 
-        let (start, end, hidden) = window(&history, width, height, 0);
-        assert_eq!(end, history.len(), "the newest entry must be included");
-        assert!(start < end);
+        let rows = visible_rows(&history, width, height, 0);
 
-        // Rows actually drawn, minus the ones scrolled off the top, must fit.
-        let drawn: usize = history
-            .iter()
-            .skip(start)
-            .take(end - start)
-            .map(|e| rows_for(&e.text, width))
-            .sum();
-        assert_eq!(drawn - hidden as usize, height);
+        // Exactly a boxful, and every row whole — never a fraction of one
+        // hanging off the top edge.
+        assert_eq!(rows.len(), height);
+        let last = rows.last().unwrap();
+        assert_eq!(last.entry, history.len() - 1, "the newest entry must be included");
+        assert_eq!(last.text, "the newest line");
     }
 
     /// A dropped file is recognised however the terminal escaped it, and a
@@ -1002,15 +1250,23 @@ mod tests {
     #[test]
     fn an_empty_or_zero_sized_window_does_not_panic() {
         let empty = VecDeque::new();
-        assert_eq!(window(&empty, 20, 5, 0), (0, 0, 0));
+        assert!(visible_rows(&empty, 20, 5, 0).is_empty());
 
         let mut one = VecDeque::new();
         one.push_back(entry("hello"));
-        assert_eq!(window(&one, 20, 0, 0), (1, 1, 0));
+        assert!(visible_rows(&one, 20, 0, 0).is_empty(), "no rows fit in no height");
+
         // Scrolled back further than the history is tall. `App::scroll` clamps
-        // so this cannot arrive from the keyboard, but a window that answered
-        // with an empty range would blank the box instead of pinning to the top.
-        assert_eq!(window(&one, 20, 5, 99), (0, 1, 0));
+        // so this cannot arrive from the keyboard, but a resize leaves a stale
+        // `scroll_back` behind — and answering with no rows would blank the box
+        // instead of pinning to the top.
+        let rows = visible_rows(&one, 20, 5, 99);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "hello");
+        assert_eq!(rows[0].offset, 0);
+
+        // A zero width must not divide by zero or loop forever either.
+        assert_eq!(visible_rows(&one, 0, 5, 0).len(), "hello".len());
     }
 
     #[test]
@@ -1082,10 +1338,19 @@ mod tests {
         assert_eq!(app.scroll_back, 2, "a wrapped entry is not one step");
 
         // The top row of the box walks up the wrapped entry one row at a time.
-        // At scroll_back 1 the short line has left the bottom of the box, so
-        // only the wrapped entry is drawn, from its third row.
-        for (back, expect) in [(0, (0, 2, 3)), (1, (0, 1, 2)), (3, (0, 1, 0))] {
-            assert_eq!(window(&app.history, 10, 2, back), expect, "scroll_back {back}");
+        // Five rows in total: the long entry's four (offsets 0/10/20/30), then
+        // "short". Each step back moves the two-row window up by exactly one.
+        for (back, expect) in [
+            (0, [(0, 30), (1, 0)]),
+            (1, [(0, 20), (0, 30)]),
+            (2, [(0, 10), (0, 20)]),
+            (3, [(0, 0), (0, 10)]),
+        ] {
+            let got: Vec<(usize, usize)> = visible_rows(&app.history, 10, 2, back)
+                .iter()
+                .map(|r| (r.entry, r.offset))
+                .collect();
+            assert_eq!(got, expect, "scroll_back {back}");
         }
     }
 }
