@@ -78,11 +78,58 @@ pub struct Direct {
     pub fingerprint: [u8; 32],
 }
 
+/// Most files one message may carry.
+///
+/// From the network, so it is not the peer's to choose: each one becomes a
+/// pending offer the operator has to look at, and a message with a thousand
+/// would be a way to bury the screen.
+pub const MAX_FILES: usize = 16;
+
+/// What a file looks like on the wire, before anyone agrees to take it.
+///
+/// The same three fields as [`crate::files::Offer`], kept separate because that
+/// one is the local view and this one is what a peer sends us — the boundary
+/// where the name still has to be sanitised.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRef {
+    pub name: String,
+    pub size: u64,
+    pub hash: [u8; 32],
+}
+
+/// One piece of a message: some text, or a file sitting where it was put.
+///
+/// A sequence rather than text with placeholder characters. A placeholder would
+/// be a character a peer could also type, so the count in the text and the
+/// count in the list could disagree — a desynchronisation to detect and reject.
+/// With a sequence there is nothing to keep in step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Piece {
+    Text(String),
+    File(FileRef),
+}
+
 /// One unit of conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     /// A chat line.
     Text(String),
+    /// A message, with any files the sender put inside it.
+    ///
+    /// This is what replaces "a file transfer is its own conversation": the
+    /// files keep the position they were dropped at, several can ride one
+    /// message, and the sentence around them arrives at the same time rather
+    /// than before or after.
+    ///
+    /// Sending one still moves no data. Each file becomes an offer the
+    /// recipient answers one by one — a file lands on their disk, so they are
+    /// still the ones who say yes.
+    Post {
+        pieces: Vec<Piece>,
+        /// The sender is asking for the files to travel outside Tor. Applies to
+        /// every file in the message; the recipient still decides.
+        direct: bool,
+    },
     /// "Are you still there?" — answered with [`Message::Pong`].
     ///
     /// Only meaningful on an already-open stream, where it is free. Presence for
@@ -114,11 +161,15 @@ pub enum Message {
     /// transfer goes over Tor as usual. A `None` against a direct offer is a
     /// refusal of the *route*, not of the file.
     FileAccept {
+        /// Which file, of those the message carried. The hash identifies it
+        /// with no bookkeeping on either side — it is already what the transfer
+        /// is named after on disk.
+        hash: [u8; 32],
         offset: u64,
         direct: Option<Direct>,
     },
     /// "No thanks." Also the answer to an offer that arrives mid-transfer.
-    FileReject,
+    FileReject { hash: [u8; 32] },
     /// "I agreed to go direct, but I could not reach you — falling back."
     ///
     /// Needed because the recipient is sitting on a listening socket waiting
@@ -154,6 +205,36 @@ impl Message {
             ),
             Message::FileChunk(data) if data.is_empty() => {
                 bail!("an empty file chunk says nothing; FileDone ends a transfer")
+            }
+            Message::Post { pieces, .. } => {
+                let text: usize = pieces
+                    .iter()
+                    .map(|p| match p {
+                        Piece::Text(t) => t.len(),
+                        Piece::File(_) => 0,
+                    })
+                    .sum();
+                if text > MAX_TEXT {
+                    bail!("message text is {text} bytes, over the {MAX_TEXT}-byte limit");
+                }
+                let files = pieces.iter().filter(|p| matches!(p, Piece::File(_))).count();
+                if files > MAX_FILES {
+                    bail!("a message carrying {files} files is over the {MAX_FILES} limit");
+                }
+                for p in pieces {
+                    if let Piece::File(f) = p
+                        && f.name.len() > MAX_NAME
+                    {
+                        bail!(
+                            "filename is {} bytes, over the {MAX_NAME}-byte limit",
+                            f.name.len()
+                        );
+                    }
+                }
+                if pieces.is_empty() {
+                    bail!("an empty message says nothing");
+                }
+                Ok(())
             }
             Message::FileAccept {
                 direct: Some(d), ..
@@ -432,6 +513,7 @@ mod tests {
                 direct: false,
             },
             Message::FileAccept {
+                hash: [7u8; 32],
                 offset: 2,
                 direct: None,
             },
@@ -491,6 +573,7 @@ mod tests {
                 direct: true,
             },
             Message::FileAccept {
+                hash: [1u8; 32],
                 offset: 0,
                 direct: Some(Direct {
                     candidates: vec![
@@ -527,6 +610,7 @@ mod tests {
         let one: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
 
         let empty = Message::FileAccept {
+            hash: [0u8; 32],
             offset: 0,
             direct: Some(Direct {
                 candidates: Vec::new(),
@@ -534,6 +618,7 @@ mod tests {
             }),
         };
         let flood = Message::FileAccept {
+            hash: [0u8; 32],
             offset: 0,
             direct: Some(Direct {
                 candidates: vec![one; MAX_CANDIDATES + 1],
@@ -554,6 +639,7 @@ mod tests {
         futures::executor::block_on(write_frame(
             &mut wire,
             &Message::FileAccept {
+                hash: [0u8; 32],
                 offset: 12,
                 direct: None,
             },

@@ -143,7 +143,7 @@ async fn run(run_dir: &Path) -> Result<()> {
 
     // ---- the interface ---------------------------------------------------
     let (screen, updates) = ui::channel();
-    let (typed, mut lines) = mpsc::channel::<String>(KEYBOARD);
+    let (typed, mut lines) = mpsc::channel::<ui::Typed>(KEYBOARD);
     let interface = tokio::spawn(ui::run(
         updates,
         typed,
@@ -188,7 +188,7 @@ async fn serve(
     expected: tor_hscrypto::pk::HsId,
     screen: &Screen,
     book: &mut Contacts,
-    lines: &mut mpsc::Receiver<String>,
+    lines: &mut mpsc::Receiver<ui::Typed>,
 ) -> Result<()> {
     let nickname = NICKNAME
         .to_owned()
@@ -306,12 +306,18 @@ async fn serve(
             // The interface is gone: Ctrl-C, or the terminal closed.
             Event::Typed(None) => break,
             Event::Typed(Some(line)) => {
+                // A message carrying files only means something during a call:
+                // there is nobody to offer them to out here.
+                let Some(line) = line.as_line() else {
+                    screen.error("files only go somewhere during a call — /call someone first");
+                    continue;
+                };
                 // Echo the command before running it. Without this, pressing
                 // Enter only clears the input box and nothing on screen shows
                 // the line was received — so a `/call` that is working looks
                 // like a `/call` that was swallowed.
                 screen.say(Kind::Mine, format!("> {}", line.trim()));
-                match command(&line, book, &live, lines, started, screen).await {
+                match command(line, book, &live, lines, started, screen).await {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Quit) => break,
                     // A bad command must not end the program.
@@ -381,7 +387,7 @@ enum Event {
     /// this enum is built on every loop iteration.
     Called(Option<Box<arti_client::DataStream>>),
     /// The operator typed a line. [`None`] means the interface closed.
-    Typed(Option<String>),
+    Typed(Option<ui::Typed>),
 }
 
 /// What the idle loop does after a command.
@@ -400,7 +406,7 @@ async fn converse<R, W>(
     writer: W,
     peer: &str,
     incoming_dir: &Path,
-    lines: &mut mpsc::Receiver<String>,
+    lines: &mut mpsc::Receiver<ui::Typed>,
     screen: &Screen,
 ) -> Flow
 where
@@ -424,7 +430,7 @@ async fn command(
     line: &str,
     book: &mut Contacts,
     live: &Live<'_>,
-    lines: &mut mpsc::Receiver<String>,
+    lines: &mut mpsc::Receiver<ui::Typed>,
     started: Instant,
     screen: &Screen,
 ) -> Result<Flow> {
@@ -520,7 +526,7 @@ async fn call(
     live: &Live<'_>,
     name: &str,
     address: &str,
-    lines: &mut mpsc::Receiver<String>,
+    lines: &mut mpsc::Receiver<ui::Typed>,
     screen: &Screen,
 ) -> Result<Flow> {
     let hs_id: tor_hscrypto::pk::HsId = address
@@ -546,7 +552,7 @@ async fn call(
     let stream = loop {
         tokio::select! {
             outcome = &mut dialling => break outcome.inspect_err(|_| screen.status("listening"))?,
-            line = lines.recv() => match line.as_deref().map(str::trim) {
+            line = lines.recv() => match line.as_ref().map(|l| l.as_line().unwrap_or("").trim()) {
                 // The interface is gone.
                 None => return Ok(Flow::Quit),
                 Some("/cancel") => {
@@ -586,10 +592,11 @@ fn help(screen: &Screen) {
         "  /copy                         your address and key, to the clipboard",
         "  /quit                         leave",
         "during a call:",
-        "  /send <path>                  offer them a file (or drop one on the window)",
+        "  drop files on the window      they ride the message, where you put them",
+        "  /send <path>                  offer one without a message",
         "  /send --direct <path>         offer it outside Tor: much faster, but it",
         "                                shows them your IP. They decide.",
-        "  /accept  /refuse              answer an offer of theirs",
+        "  /accept  /refuse              answer an offer (/accept 2 picks one)",
         "  /bye                          hang up",
         "keys:",
         "  up / down                     scroll one line",

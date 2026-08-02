@@ -110,13 +110,20 @@ reach the directory first — give it a minute.
 
 ## Sending a file
 
-During a call, `/send <path>` offers one — or **drag the file onto the window**,
-which shows as `[image.png]` in the input box and offers it when you press
-Enter.
+During a call, **drop files into your message**, wherever you want them:
 
-The chip lands where the cursor is, and behaves like a single character from
-there on: the arrows step over it in one press, Backspace removes it whole, and
-you can type on either side of it.
+```text
+the holiday photos: [beach.jpg] [sunset.jpg] — the second one is better
+```
+
+Enter sends the sentence and the files as one thing. The other side sees your
+message with the chips in place, and answers file by file: `/accept` takes the
+first, `/accept 2` picks one, `/refuse` declines. `/send <path>` still offers a
+file on its own if there is nothing to say around it.
+
+A chip lands where the cursor is and behaves like a single character from there
+on: the arrows step over it in one press, Backspace removes it whole, and you
+can type on either side of it.
 
 Nothing moves until the other person types `/accept` — a file lands on their disk, so they decide, not you. `/refuse`
 declines it. One file at a time, and one call at a time.

@@ -219,6 +219,46 @@ impl Selection {
     }
 }
 
+/// What the interface hands to the rest of the program when Enter is pressed.
+///
+/// Not a bare `String` any more, and that is the whole point of files living
+/// inside messages: the input line has a *shape* — words, then a file, then
+/// more words — and flattening it to text throws that shape away. A command is
+/// still just a line, so the common case stays as cheap as it was.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Typed {
+    /// An ordinary line: a command, or a message with nothing attached.
+    Line(String),
+    /// A message carrying files at the positions they were put.
+    Post {
+        parts: Vec<Part>,
+        /// The operator asked for the files to leave Tor. Applies to the whole
+        /// message: `--direct` is a property of the sending, not of one file.
+        direct: bool,
+    },
+}
+
+/// One piece of a submitted message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Part {
+    Text(String),
+    File(PathBuf),
+}
+
+impl Typed {
+    /// The line, when it is one. `None` for a message carrying files.
+    ///
+    /// Every command is a plain line, so the places that only understand
+    /// commands — the idle loop, the dialling loop — ask this and refuse the
+    /// rest, rather than each learning what a message with files is.
+    pub fn as_line(&self) -> Option<&str> {
+        match self {
+            Typed::Line(s) => Some(s.as_str()),
+            Typed::Post { .. } => None,
+        }
+    }
+}
+
 /// One thing on the input line.
 ///
 /// A dropped file is a single item, not the 60-odd characters of its path: the
@@ -451,51 +491,63 @@ impl App {
     /// is there to be edited around, not to interleave with the message: a
     /// transfer needs the other side to accept it, so pretending the text and
     /// the file arrive together would be a lie about what happens next.
-    fn submit(&mut self) -> Vec<String> {
+    fn submit(&mut self) -> Vec<Typed> {
         let items = std::mem::take(&mut self.items);
         self.cursor = 0;
 
-        let files: Vec<&PathBuf> = items
-            .iter()
-            .filter_map(|i| match i {
-                Item::File(p) => Some(p),
-                Item::Char(_) => None,
-            })
-            .collect();
+        let has_files = items.iter().any(|i| matches!(i, Item::File(_)));
 
-        let text: String = items
-            .iter()
-            .filter_map(|i| match i {
-                Item::Char(c) => Some(*c),
-                Item::File(_) => None,
-            })
-            .collect();
-        let text = text.trim();
-
-        // Typing `/send` and *then* dropping a file is the obvious way to try
-        // it, and the chips already carry the path. What is left over must not
-        // be sent as a second command: on its own it would only produce a usage
-        // error, and with `--direct` it would arrive as a *second* transfer
-        // while the chip's is already running — "already sending a file".
-        //
-        // The flag has to be carried over rather than dropped, which is the
-        // part that was wrong: the file went out over Tor while the operator
-        // had asked for a direct link and been told nothing.
-        let carried = match text {
-            "/send" => Some(""),
-            "/send --direct" => Some("--direct "),
-            _ => None,
-        };
-        let route = carried.filter(|_| !files.is_empty());
-
-        let mut lines: Vec<String> = files
-            .iter()
-            .map(|p| format!("/send {}{}", route.unwrap_or(""), p.display()))
-            .collect();
-        if !text.is_empty() && route.is_none() {
-            lines.push(text.to_owned());
+        // No file: an ordinary line, which is every command and most messages.
+        if !has_files {
+            let text: String = items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Char(c) => Some(*c),
+                    Item::File(_) => None,
+                })
+                .collect();
+            let text = text.trim();
+            return if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![Typed::Line(text.to_owned())]
+            };
         }
-        lines
+
+        // With files, the shape is what is being sent: runs of text and files,
+        // in the order they sit on the line. Consecutive characters fold into
+        // one `Text` piece; a file ends the run it was dropped into.
+        let mut parts: Vec<Part> = Vec::new();
+        let mut run = String::new();
+        // `/send --direct` typed before dropping is how the route is asked for;
+        // the verb itself means nothing now that the file rides the message.
+        let mut direct = false;
+        for item in &items {
+            match item {
+                Item::Char(c) => run.push(*c),
+                Item::File(p) => {
+                    // `/send` typed before dropping is the obvious way to try
+                    // this, and it now means nothing — the file rides the
+                    // message. Dropping the verb here keeps it out of the text
+                    // rather than sending "\send" to the other person.
+                    let kept = run.trim();
+                    if kept == "/send --direct" {
+                        direct = true;
+                    } else if !kept.is_empty() && kept != "/send" {
+                        parts.push(Part::Text(kept.to_owned()));
+                    }
+                    run.clear();
+                    parts.push(Part::File(p.clone()));
+                }
+            }
+        }
+        let tail = run.trim();
+        if tail == "/send --direct" {
+            direct = true;
+        } else if !tail.is_empty() && tail != "/send" {
+            parts.push(Part::Text(tail.to_owned()));
+        }
+        vec![Typed::Post { parts, direct }]
     }
 
     fn push(&mut self, entry: Entry) {
@@ -520,7 +572,7 @@ impl App {
 /// closed by the caller, or on Ctrl-C.
 pub async fn run(
     mut updates: mpsc::UnboundedReceiver<Update>,
-    typed: mpsc::Sender<String>,
+    typed: mpsc::Sender<Typed>,
     title: String,
 ) -> Result<()> {
     // `ratatui::init` enters the alternate screen, turns on raw mode, and
@@ -569,7 +621,7 @@ async fn expire_at(deadline: Option<Instant>) {
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     updates: &mut mpsc::UnboundedReceiver<Update>,
-    typed: mpsc::Sender<String>,
+    typed: mpsc::Sender<Typed>,
     title: String,
 ) -> Result<()> {
     let mut app = App::new(title);
@@ -638,7 +690,7 @@ async fn event_loop(
 }
 
 /// Handle one key. Returns `true` when the operator wants out.
-async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<String>) -> Result<bool> {
+async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<Typed>) -> Result<bool> {
     // Windows reports both press and release; acting on both doubles every key.
     if key.kind != KeyEventKind::Press {
         return Ok(false);
@@ -1328,9 +1380,17 @@ mod tests {
 
         // A space is inserted before the chip so the two do not run together.
         assert_eq!(app.input_display(), "tiens [image.png]");
+        // One message, with the file where it was put — not a command and a
+        // line pretending to be unrelated.
         assert_eq!(
             app.submit(),
-            vec!["/send /tmp/mes docs/image.png".to_owned(), "tiens".to_owned()]
+            vec![Typed::Post {
+                parts: vec![
+                    Part::Text("tiens".into()),
+                    Part::File(PathBuf::from("/tmp/mes docs/image.png")),
+                ],
+                direct: false,
+            }]
         );
         // Submitting empties the line, so the next one starts clean.
         assert!(app.items.is_empty());
@@ -1369,8 +1429,8 @@ mod tests {
         assert!(app.backspace());
         assert_eq!(app.input_display(), "voici  merci !");
         assert!(
-            app.submit().iter().all(|l| !l.starts_with("/send")),
-            "the file is gone, so nothing may be offered"
+            matches!(&app.submit()[..], [Typed::Line(_)]),
+            "the file is gone, so what is left is an ordinary line"
         );
     }
 
@@ -1382,7 +1442,14 @@ mod tests {
         app.attach(PathBuf::from("/tmp/image.JPG"));
 
         assert_eq!(app.input_display(), "/send [image.JPG]");
-        assert_eq!(app.submit(), vec!["/send /tmp/image.JPG".to_owned()]);
+        assert_eq!(
+            app.submit(),
+            vec![Typed::Post {
+                parts: vec![Part::File(PathBuf::from("/tmp/image.JPG"))],
+                direct: false,
+            }],
+            "the verb is absorbed, not sent as text"
+        );
     }
 
     /// The bug this fixes: typing `/send --direct` and dropping a file sent the
@@ -1397,8 +1464,11 @@ mod tests {
         assert_eq!(app.input_display(), "/send --direct [gros.pdf]");
         assert_eq!(
             app.submit(),
-            vec!["/send --direct /tmp/gros.pdf".to_owned()],
-            "one command, and it must still be the direct one"
+            vec![Typed::Post {
+                parts: vec![Part::File(PathBuf::from("/tmp/gros.pdf"))],
+                direct: true,
+            }],
+            "the route asked for must survive"
         );
     }
 
@@ -1411,10 +1481,14 @@ mod tests {
 
         assert_eq!(
             app.submit(),
-            vec![
-                "/send /tmp/note.txt".to_owned(),
-                "regarde /send --direct c'est pratique".to_owned(),
-            ]
+            vec![Typed::Post {
+                parts: vec![
+                    Part::Text("regarde /send --direct c'est pratique".into()),
+                    Part::File(PathBuf::from("/tmp/note.txt")),
+                ],
+                direct: false,
+            }],
+            "a sentence mentioning the verb is still a sentence"
         );
     }
 

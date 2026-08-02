@@ -131,6 +131,41 @@ struct Sending {
     route: Route,
 }
 
+/// A file a peer put in a message, waiting for our answer.
+struct Offered {
+    offer: Offer,
+    /// Whether the sender asked for it to travel outside Tor. A property of how
+    /// this transfer was proposed, not of the file.
+    direct: bool,
+}
+
+/// A file we put in a message, waiting for theirs.
+///
+/// The path is kept because a `FileAccept` names a hash, and the hash alone
+/// does not say where the file is on our disk.
+struct Outgoing {
+    hash: [u8; 32],
+    path: PathBuf,
+    name: String,
+    size: u64,
+    route: Route,
+}
+
+/// Take one offer out of the queue: the numbered one, or the oldest.
+///
+/// Numbers are what the operator sees on screen, so they start at 1.
+fn take_pending(pending: &mut Vec<Offered>, which: Option<usize>) -> Result<Offered> {
+    if pending.is_empty() {
+        bail!("nothing to answer");
+    }
+    let index = match which {
+        None => 0,
+        Some(n) if n >= 1 && n <= pending.len() => n - 1,
+        Some(n) => bail!("there is no file {n}; there are {}", pending.len()),
+    };
+    Ok(pending.remove(index))
+}
+
 /// A file coming in, and how far it has got.
 struct Receiving {
     file: std::fs::File,
@@ -149,7 +184,7 @@ pub async fn run<R, W>(
     writer: W,
     peer: &str,
     incoming_dir: &Path,
-    lines: &mut mpsc::Receiver<String>,
+    lines: &mut mpsc::Receiver<crate::ui::Typed>,
     screen: &Screen,
 ) -> Result<Ended>
 where
@@ -183,7 +218,13 @@ where
     // All conversation state, owned here and nowhere else.
     let mut sending: Option<Sending> = None;
     let mut receiving: Option<Receiving> = None;
-    let mut pending: Option<Offer> = None;
+    // Offers waiting for an answer, oldest first. A message can carry several
+    // files, so this is a queue rather than a slot — and `/accept` with no
+    // number takes the oldest, which is what "the one I just saw" means.
+    let mut pending: Vec<Offered> = Vec::new();
+    // Files we put in a message and have not been answered about yet. Keyed by
+    // hash because that is what a `FileAccept` names.
+    let mut offered: Vec<Outgoing> = Vec::new();
     // Set once the operator has asked to leave but a transfer is still running.
     // Ending the call there would truncate a file mid-flight, and the recipient
     // would have no way to tell that from a network drop.
@@ -193,10 +234,6 @@ where
     // True once the reader task has ended and we chose to stay for a direct
     // transfer. Guards the branch, since polling a finished handle panics.
     let mut peer_gone = false;
-    // Whether the offer waiting for an answer asked to go outside Tor. Kept
-    // beside `pending` rather than inside `Offer`, because it is a property of
-    // how this one transfer was proposed, not of the file.
-    let mut pending_direct = false;
     // A transfer running outside Tor lives in its own task: it owns the file
     // and the socket, and reports back through the channel.
     let mut direct_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -229,6 +266,18 @@ where
                     leaving = Some(Ended::InputClosed);
                     continue;
                 };
+                // A message carrying files is not a command and never was one:
+                // it goes out as a Post, with the files where they were put.
+                let line = match line {
+                    crate::ui::Typed::Post { parts, direct } => {
+                        match post(parts, direct, &mut offered, &outbox, screen).await {
+                            Ok(()) => {}
+                            Err(e) => screen.error(format!("{e:#}")),
+                        }
+                        continue;
+                    }
+                    crate::ui::Typed::Line(s) => s,
+                };
                 match classify(&line) {
                     Typed::Nothing => continue,
                     // `/bye` goes back to listening, `/quit` leaves the program.
@@ -252,20 +301,19 @@ where
                     )),
                     Typed::Send(path, route) => {
                         if let Err(e) =
-                            start_sending(&path, route, &mut sending, &outbox, screen).await
+                            start_sending(&path, route, &mut offered, &outbox, screen).await
                         {
                             screen.error(format!("{e:#}"));
                         }
                     }
-                    Typed::Accept => {
-                        let wanted = pending_direct;
+                    Typed::Accept(which) => {
                         if let Err(e) = accept(
                             incoming_dir,
                             &mut pending,
+                            which,
                             &mut receiving,
                             &mut direct_task,
                             &direct_done_tx,
-                            wanted,
                             &outbox,
                             screen,
                         )
@@ -273,16 +321,19 @@ where
                         {
                             screen.error(format!("{e:#}"));
                         }
-                        pending_direct = false;
                     }
-                    Typed::Refuse => match pending.take() {
-                        Some(offer) => {
-                            screen.system(format!("refused {:?}", offer.name));
-                            if outbox.send(Message::FileReject).await.is_err() {
+                    Typed::Refuse(which) => match take_pending(&mut pending, which) {
+                        Ok(o) => {
+                            screen.system(format!("refused {:?}", o.offer.name));
+                            if outbox
+                                .send(Message::FileReject { hash: o.offer.hash })
+                                .await
+                                .is_err()
+                            {
                                 break Ended::PeerHungUp;
                             }
                         }
-                        None => screen.error("nothing to refuse"),
+                        Err(e) => screen.error(format!("{e:#}")),
                     },
                     Typed::Message(text) => {
                         if text.len() > MAX_TEXT {
@@ -328,7 +379,7 @@ where
             Some(msg) = inbox.recv() => {
                 let outcome = handle(
                     msg, peer, incoming_dir,
-                    &mut pending, &mut pending_direct, &mut receiving, &mut sending,
+                    &mut pending, &mut receiving, &mut sending, &mut offered,
                     &mut direct_task, &direct_done_tx,
                     &outbox, screen,
                 ).await;
@@ -436,10 +487,10 @@ async fn handle(
     msg: Message,
     peer: &str,
     incoming_dir: &Path,
-    pending: &mut Option<Offer>,
-    pending_direct: &mut bool,
+    pending: &mut Vec<Offered>,
     receiving: &mut Option<Receiving>,
     sending: &mut Option<Sending>,
+    offered: &mut Vec<Outgoing>,
     direct_task: &mut Option<tokio::task::JoinHandle<()>>,
     direct_done: &mpsc::Sender<DirectDone>,
     outbox: &mpsc::Sender<Message>,
@@ -460,56 +511,81 @@ async fn handle(
         }
         Message::Pong => {}
 
+        // The old one-file-per-conversation offer. Kept so a peer running the
+        // previous version is still understood: it is the same thing as a Post
+        // carrying exactly one file and no text.
         Message::FileOffer { name, size, hash, direct } => {
-            // The name is about to be shown to the operator, who decides on the
-            // strength of it. Sanitise before it reaches the screen, not just
-            // before it reaches the filesystem.
-            let name = files::safe_name(&name)?;
-            if size == 0 || size > files::MAX_FILE {
-                bail!("{peer} offered a file of {size} bytes, which is not a size we take");
-            }
-            if receiving.is_some() || pending.is_some() {
-                // One at a time, like one call at a time.
-                let _ = outbox.send(Message::FileReject).await;
-                screen.system(format!("{peer} offered another file; one at a time"));
-                return Ok(true);
-            }
-
-            let offer = Offer { name, size, hash };
-            let resume = files::resume_offset(incoming_dir, &offer.hash, offer.size);
-            screen.system(format!(
-                "-- {peer} offers {:?} ({}) --",
-                offer.name,
-                files::human(offer.size)
-            ));
-            if resume > 0 {
-                screen.system(format!(
-                    "   {} already here from an earlier attempt; /accept resumes",
-                    files::human(resume)
-                ));
-            }
-            if direct {
-                // Said plainly, because agreeing is what would expose them:
-                // a direct link hands the peer our IP address and shows both
-                // ISPs that these two addresses are exchanging data.
-                screen.system(format!(
-                    "   {peer} asked to send this outside Tor — faster, but it would \
-                     show them your IP address"
-                ));
-                screen.system("   /accept still takes it over Tor for now");
-            }
-            screen.system("   /accept to take it, /refuse to decline");
-            *pending = Some(offer);
-            *pending_direct = direct;
+            screen.system(format!("-- {peer} offers a file --"));
+            take_offer(
+                proto::FileRef { name, size, hash },
+                direct, peer, incoming_dir, pending, screen,
+            )?;
         }
 
-        Message::FileAccept { offset, direct } => {
-            let Some(s) = sending.as_mut() else {
+        Message::Post { pieces, direct } => {
+            // Rebuilt into one line so the sentence and its files read as what
+            // they are — one message — instead of arriving as unrelated events.
+            let mut shown = String::new();
+            let mut files = Vec::new();
+            for piece in pieces {
+                match piece {
+                    proto::Piece::Text(t) => {
+                        // Straight from the network to a terminal: same trust
+                        // boundary as a filename, same treatment.
+                        shown.push_str(&files::sanitize_for_display(&t));
+                    }
+                    proto::Piece::File(f) => {
+                        let name = files::safe_name(&f.name)?;
+                        if !shown.is_empty() && !shown.ends_with(' ') {
+                            shown.push(' ');
+                        }
+                        shown.push_str(&format!("[{name}]"));
+                        files.push(proto::FileRef { name, ..f });
+                    }
+                }
+            }
+            screen.say(Kind::Theirs, format!("{peer}> {}", shown.trim()));
+
+            for f in files {
+                take_offer(f, direct, peer, incoming_dir, pending, screen)?;
+            }
+            if !pending.is_empty() {
+                screen.system(format!(
+                    "   /accept to take {}, /refuse to decline{}",
+                    if pending.len() == 1 { "it" } else { "them one by one" },
+                    if pending.len() == 1 { "" } else { " — or /accept 2 for a particular one" },
+                ));
+            }
+        }
+
+        Message::FileAccept { hash, offset, direct } => {
+            // Which file, of those we put in a message. The hash says so, so no
+            // ordering has to be agreed between the two sides.
+            let Some(i) = offered.iter().position(|o| o.hash == hash) else {
                 bail!("{peer} accepted a file we never offered");
             };
-            if offset > s.size {
+            if sending.is_some() {
+                // One transfer at a time on the wire, even when a message
+                // carried several. They stay queued, not lost.
+                bail!("{peer} accepted a second file while one is still going");
+            }
+            let out = offered.remove(i);
+            if offset > out.size {
                 bail!("{peer} asked to resume past the end of the file");
             }
+            let file = std::fs::File::open(&out.path)
+                .with_context(|| format!("reopening {}", out.path.display()))?;
+            *sending = Some(Sending {
+                file,
+                name: out.name.clone(),
+                accepted: false,
+                sent: 0,
+                size: out.size,
+                next_report: PROGRESS_EVERY,
+                path: out.path.clone(),
+                route: out.route,
+            });
+            let s = sending.as_mut().expect("just set");
             if let Some(d) = direct {
                 if s.route != Route::Direct {
                     bail!("{peer} answered with a direct link we never asked for");
@@ -557,10 +633,17 @@ async fn handle(
             });
         }
 
-        Message::FileReject => {
-            match sending.take() {
-                Some(s) => screen.system(format!("-- {peer} declined {:?} --", s.name)),
-                None => screen.system(format!("-- {peer} declined a file --")),
+        Message::FileReject { hash } => {
+            match offered.iter().position(|o| o.hash == hash) {
+                Some(i) => {
+                    let out = offered.remove(i);
+                    screen.system(format!("-- {peer} declined {:?} --", out.name));
+                }
+                // Declining what is already going out: stop it.
+                None => match sending.take() {
+                    Some(s) => screen.system(format!("-- {peer} declined {:?} --", s.name)),
+                    None => screen.system(format!("-- {peer} declined a file --")),
+                },
             }
         }
 
@@ -612,20 +695,122 @@ async fn handle(
     Ok(true)
 }
 
+
+/// Queue one offered file, after checking it is one we would take.
+fn take_offer(
+    f: proto::FileRef,
+    direct: bool,
+    peer: &str,
+    incoming_dir: &Path,
+    pending: &mut Vec<Offered>,
+    screen: &Screen,
+) -> Result<()> {
+    let name = files::safe_name(&f.name)?;
+    if f.size == 0 || f.size > files::MAX_FILE {
+        bail!("{peer} offered a file of {} bytes, which is not a size we take", f.size);
+    }
+    let offer = Offer { name, size: f.size, hash: f.hash };
+    let resume = files::resume_offset(incoming_dir, &offer.hash, offer.size);
+
+    let n = pending.len() + 1;
+    screen.system(format!(
+        "   [{n}] {:?} ({}){}",
+        offer.name,
+        files::human(offer.size),
+        match resume {
+            0 => String::new(),
+            r => format!(" — {} already here, /accept resumes", files::human(r)),
+        }
+    ));
+    if direct {
+        // Said plainly, because agreeing is what exposes them: a direct link
+        // hands the peer our IP and shows both ISPs these two are exchanging
+        // data. The number above is what turns that into a per-file choice.
+        screen.system("       asked to go outside Tor — faster, shows them your IP");
+    }
+    pending.push(Offered { offer, direct });
+    Ok(())
+}
+
+/// Send a message, with the files the operator put inside it.
+///
+/// Nothing moves yet: this is the offer. Each file becomes something the far
+/// side answers one by one, because each one lands on their disk.
+async fn post(
+    parts: Vec<crate::ui::Part>,
+    direct: bool,
+    offered: &mut Vec<Outgoing>,
+    outbox: &mpsc::Sender<Message>,
+    screen: &Screen,
+) -> Result<()> {
+    let mut pieces = Vec::new();
+    let mut shown = String::new();
+    let mut fresh = Vec::new();
+
+    for part in parts {
+        match part {
+            crate::ui::Part::Text(t) => {
+                shown.push_str(&t);
+                pieces.push(proto::Piece::Text(t));
+            }
+            crate::ui::Part::File(path) => {
+                // Reading and hashing happens here rather than at accept time:
+                // a file that cannot be read must fail before the message goes,
+                // not after the other person has said yes to it.
+                let offer = files::describe(&path)?;
+                if !shown.is_empty() && !shown.ends_with(' ') {
+                    shown.push(' ');
+                }
+                shown.push_str(&format!("[{}]", offer.name));
+                pieces.push(proto::Piece::File(proto::FileRef {
+                    name: offer.name.clone(),
+                    size: offer.size,
+                    hash: offer.hash,
+                }));
+                fresh.push(Outgoing {
+                    hash: offer.hash,
+                    path,
+                    name: offer.name,
+                    size: offer.size,
+                    route: if direct { Route::Direct } else { Route::Tor },
+                });
+            }
+        }
+    }
+    if pieces.is_empty() {
+        return Ok(());
+    }
+
+    screen.say(Kind::Mine, format!("you> {}", shown.trim()));
+    if !fresh.is_empty() {
+        screen.system(format!(
+            "-- offered {} file(s); waiting for them to accept --",
+            fresh.len()
+        ));
+    }
+    offered.extend(fresh);
+    outbox
+        .send(Message::Post { pieces, direct })
+        .await
+        .map_err(|_| anyhow::anyhow!("the conversation ended"))
+}
+
 /// Offer a file, after checking we can actually read it.
 async fn start_sending(
     path: &Path,
     route: Route,
-    sending: &mut Option<Sending>,
+    offered: &mut Vec<Outgoing>,
     outbox: &mpsc::Sender<Message>,
     screen: &Screen,
 ) -> Result<()> {
-    if sending.is_some() {
-        bail!("already sending a file; one at a time");
-    }
     let offer = files::describe(path)?;
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    // Registered exactly where a file put inside a message is registered.
+    // Keeping two lists — one for `/send`, one for a message — is what made a
+    // `FileAccept` land on "a file we never offered" depending on which verb
+    // had been used.
+    if offered.iter().any(|o| o.hash == offer.hash) {
+        bail!("that file is already offered and waiting for an answer");
+    }
 
     screen.system(format!(
         "-- offered {:?} ({}); waiting for them to accept --",
@@ -638,16 +823,11 @@ async fn start_sending(
         // spelled out rather than only the person answering.
         screen.system("   asked for a direct link — they decide, and it shows them your IP");
     }
-    // Held back until the peer accepts: `sent` stays at zero and the pump reads
-    // nothing until a FileAccept sets the offset.
-    *sending = Some(Sending {
-        file,
-        name: offer.name.clone(),
-        accepted: false,
-        sent: 0,
-        size: offer.size,
-        next_report: PROGRESS_EVERY,
+    offered.push(Outgoing {
+        hash: offer.hash,
         path: path.to_path_buf(),
+        name: offer.name.clone(),
+        size: offer.size,
         route,
     });
     outbox
@@ -749,17 +929,19 @@ async fn pull_direct(
 #[allow(clippy::too_many_arguments)]
 async fn accept(
     incoming_dir: &Path,
-    pending: &mut Option<Offer>,
+    pending: &mut Vec<Offered>,
+    which: Option<usize>,
     receiving: &mut Option<Receiving>,
     direct_task: &mut Option<tokio::task::JoinHandle<()>>,
     direct_done: &mpsc::Sender<DirectDone>,
-    wanted_direct: bool,
     outbox: &mpsc::Sender<Message>,
     screen: &Screen,
 ) -> Result<()> {
-    let Some(offer) = pending.take() else {
-        bail!("nothing to accept");
-    };
+    if receiving.is_some() || direct_task.as_ref().is_some_and(|t| !t.is_finished()) {
+        bail!("one file at a time — this one waits until the current transfer ends");
+    }
+    let taken = take_pending(pending, which)?;
+    let (offer, wanted_direct) = (taken.offer, taken.direct);
     std::fs::create_dir_all(incoming_dir)
         .with_context(|| format!("creating {}", incoming_dir.display()))?;
 
@@ -793,6 +975,7 @@ async fn accept(
                     }));
                     return outbox
                         .send(Message::FileAccept {
+                            hash: offer.hash,
                             offset,
                             direct: Some(direct),
                         })
@@ -816,6 +999,7 @@ async fn accept(
         .with_context(|| format!("opening {}", partial.display()))?;
 
     screen.system(format!("-- taking {:?} --", offer.name));
+    let hash = offer.hash;
     *receiving = Some(Receiving {
         offer,
         file,
@@ -823,7 +1007,7 @@ async fn accept(
         next_report: offset + PROGRESS_EVERY,
     });
     outbox
-        .send(Message::FileAccept { offset, direct: None })
+        .send(Message::FileAccept { hash, offset, direct: None })
         .await
         .map_err(|_| anyhow::anyhow!("the conversation ended"))
 }
@@ -885,10 +1069,10 @@ enum Typed {
     HangUp(Ended),
     /// `/send <path>`, or `/send --direct <path>`.
     Send(PathBuf, Route),
-    /// `/accept`.
-    Accept,
-    /// `/refuse`.
-    Refuse,
+    /// `/accept`, optionally naming which file of the message.
+    Accept(Option<usize>),
+    /// `/refuse`, likewise.
+    Refuse(Option<usize>),
     /// Any other `/word`. Held back rather than sent.
     UnknownCommand(String),
     /// Something to say, with any `//` escape already unwrapped.
@@ -922,8 +1106,10 @@ fn classify(line: &str) -> Typed {
         // Typing `/quit` mid-call used to be refused, which meant `/bye` then
         // `/quit`: two commands for one intention nobody splits in their head.
         "/quit" => Typed::HangUp(Ended::Quit),
-        "/accept" => Typed::Accept,
-        "/refuse" => Typed::Refuse,
+        // A message can carry several files, so the verbs take a number. No
+        // number means the oldest, which is what "the one I just saw" means.
+        "/accept" => Typed::Accept(rest.parse().ok()),
+        "/refuse" => Typed::Refuse(rest.parse().ok()),
         // The whole remainder, not the first word: paths have spaces in them,
         // and quoting rules would be one more thing to explain.
         // The whole remainder is the path, so `--direct` is only a flag when it
@@ -957,6 +1143,11 @@ mod tests {
     use super::*;
     use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
+    /// A plain typed line, which is what every command is.
+    fn line(s: &str) -> crate::ui::Typed {
+        crate::ui::Typed::Line(s.to_owned())
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("murmure-chat-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -982,8 +1173,8 @@ mod tests {
 
     #[test]
     fn the_file_verbs_are_recognised() {
-        assert_eq!(classify("/accept"), Typed::Accept);
-        assert_eq!(classify("/refuse"), Typed::Refuse);
+        assert_eq!(classify("/accept"), Typed::Accept(None));
+        assert_eq!(classify("/refuse"), Typed::Refuse(None));
         assert_eq!(
             classify("/send /tmp/rapport.pdf"),
             Typed::Send(PathBuf::from("/tmp/rapport.pdf"), Route::Tor)
@@ -1048,9 +1239,9 @@ mod tests {
             let (alice_r, alice_w) = tokio::io::split(alice);
             let (bob_r, _bob_w) = tokio::io::split(bob);
 
-            let (tx, mut rx) = mpsc::channel::<String>(4);
-            tx.send("bonjour".to_owned()).await.unwrap();
-            tx.send("/bye".to_owned()).await.unwrap();
+            let (tx, mut rx) = mpsc::channel::<crate::ui::Typed>(4);
+            tx.send(line("bonjour")).await.unwrap();
+            tx.send(line("/bye")).await.unwrap();
             let (screen, _updates) = crate::ui::channel();
 
             let talking = tokio::spawn(async move {
@@ -1113,8 +1304,8 @@ mod tests {
             let (ar, aw) = tokio::io::split(a);
             let (br, bw) = tokio::io::split(b);
 
-            let (a_tx, mut a_rx) = mpsc::channel::<String>(8);
-            let (b_tx, mut b_rx) = mpsc::channel::<String>(8);
+            let (a_tx, mut a_rx) = mpsc::channel::<crate::ui::Typed>(8);
+            let (b_tx, mut b_rx) = mpsc::channel::<crate::ui::Typed>(8);
             let (a_screen, a_updates) = crate::ui::channel();
             let (b_screen, b_updates) = crate::ui::channel();
 
@@ -1122,7 +1313,7 @@ mod tests {
                 Route::Direct => "--direct ",
                 Route::Tor => "",
             };
-            a_tx.send(format!("/send {flag}{}", source.display()))
+            a_tx.send(line(&format!("/send {flag}{}", source.display())))
                 .await
                 .unwrap();
 
@@ -1153,7 +1344,7 @@ mod tests {
     /// Watch a screen and type `reply` the first time a line matches.
     async fn react(
         mut updates: mpsc::UnboundedReceiver<crate::ui::Update>,
-        keyboard: mpsc::Sender<String>,
+        keyboard: mpsc::Sender<crate::ui::Typed>,
         triggers: &'static [&'static str],
         reply: String,
     ) {
@@ -1162,7 +1353,7 @@ mod tests {
                 continue;
             };
             if triggers.iter().any(|t| entry.text().contains(t)) {
-                let _ = keyboard.send(reply).await;
+                let _ = keyboard.send(line(&reply)).await;
                 return;
             }
         }
@@ -1217,6 +1408,109 @@ mod tests {
         assert!(landed.exists(), "the resumed file must still land");
         assert_eq!(std::fs::read(&landed).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// The shape the whole rework exists for: one message, a sentence, and two
+    /// files sitting inside it — answered one at a time, by number.
+    #[test]
+    fn a_message_can_carry_several_files() {
+        let dir = scratch("post");
+        let (from, to) = (dir.join("out"), dir.join("in"));
+        std::fs::create_dir_all(&from).unwrap();
+        let one = from.join("photo1.png");
+        let two = from.join("photo2.png");
+        std::fs::write(&one, vec![1u8; 5000]).unwrap();
+        std::fs::write(&two, vec![2u8; 7000]).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (a, b) = tokio::io::duplex(256 * 1024);
+            let (ar, aw) = tokio::io::split(a);
+            let (br, bw) = tokio::io::split(b);
+            let (a_tx, mut a_rx) = mpsc::channel::<crate::ui::Typed>(8);
+            let (b_tx, mut b_rx) = mpsc::channel::<crate::ui::Typed>(8);
+            let (a_screen, a_updates) = crate::ui::channel();
+            let (b_screen, b_updates) = crate::ui::channel();
+
+            // Exactly what the input box produces from "voici [1] et [2] !".
+            a_tx.send(crate::ui::Typed::Post {
+                parts: vec![
+                    crate::ui::Part::Text("voici".into()),
+                    crate::ui::Part::File(one.clone()),
+                    crate::ui::Part::Text("et".into()),
+                    crate::ui::Part::File(two.clone()),
+                ],
+                direct: false,
+            })
+            .await
+            .unwrap();
+
+            // Alice leaves once both have gone.
+            let watch_a = tokio::spawn(react_n(a_updates, a_tx, "-- sent ", 2, "/bye".to_owned()));
+            // Bob takes the second one first, on purpose: the number has to
+            // pick, not the order they arrived in.
+            let watch_b = tokio::spawn(react_seq(
+                b_updates,
+                b_tx,
+                vec![("[2]".to_owned(), "/accept 2".to_owned()), ("-- received".to_owned(), "/accept 1".to_owned())],
+            ));
+
+            let to_b = to.clone();
+            let bob = tokio::spawn(async move {
+                run(br.compat(), bw.compat_write(), "alice", &to_b, &mut b_rx, &b_screen).await
+            });
+            let unused = dir.join("unused");
+            let alice = tokio::spawn(async move {
+                run(ar.compat(), aw.compat_write(), "bob", &unused, &mut a_rx, &a_screen).await
+            });
+            alice.await.unwrap().unwrap();
+            bob.await.unwrap().unwrap();
+            watch_a.abort();
+            watch_b.abort();
+        });
+
+        assert_eq!(std::fs::read(to.join("photo1.png")).unwrap(), vec![1u8; 5000]);
+        assert_eq!(std::fs::read(to.join("photo2.png")).unwrap(), vec![2u8; 7000]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Answer once per trigger, in order, then stop.
+    async fn react_seq(
+        mut updates: mpsc::UnboundedReceiver<crate::ui::Update>,
+        keyboard: mpsc::Sender<crate::ui::Typed>,
+        mut script: Vec<(String, String)>,
+    ) {
+        while let Some(update) = updates.recv().await {
+            let crate::ui::Update::Line(entry) = update else { continue };
+            let Some((needle, reply)) = script.first() else { return };
+            if entry.text().contains(needle.as_str()) {
+                let reply = reply.clone();
+                script.remove(0);
+                let _ = keyboard.send(line(&reply)).await;
+            }
+        }
+    }
+
+    /// Reply once `needle` has been seen `count` times.
+    async fn react_n(
+        mut updates: mpsc::UnboundedReceiver<crate::ui::Update>,
+        keyboard: mpsc::Sender<crate::ui::Typed>,
+        needle: &'static str,
+        count: usize,
+        reply: String,
+    ) {
+        let mut seen = 0;
+        while let Some(update) = updates.recv().await {
+            let crate::ui::Update::Line(entry) = update else { continue };
+            if entry.text().contains(needle) {
+                seen += 1;
+                if seen == count {
+                    let _ = keyboard.send(line(&reply)).await;
+                    return;
+                }
+            }
+        }
     }
 
     /// A refused offer leaves nothing behind.
