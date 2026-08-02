@@ -131,6 +131,9 @@ can type on either side of it.
 Nothing moves until the other person types `/accept` — a file lands on their disk, so they decide, not you. `/refuse`
 declines it. One file at a time, and one call at a time.
 
+A running transfer draws a **progress bar in the title line** — name, percent
+and both sizes — for either direction and either route.
+
 An accepted file is written to `.murmure/incoming/`. It only gets its real name
 once its BLAKE3 hash matches what was offered; until then it sits under a name
 derived from that hash, with a `.part` extension.

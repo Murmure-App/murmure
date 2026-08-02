@@ -54,8 +54,66 @@ const OUTBOX: usize = 32;
 /// busy: the alternative is buffering a file in memory on the way to the disk.
 const INBOX: usize = 32;
 
-/// How often a running transfer reports progress, in bytes.
-const PROGRESS_EVERY: u64 = 1024 * 1024;
+
+/// How often a running transfer refreshes the bar.
+///
+/// Time-based, not byte-based: on a direct link a byte threshold fires
+/// hundreds of times a second and redraws the whole interface for nothing,
+/// while over Tor the same threshold can take ten seconds to come round. What
+/// the reader wants is a bar that moves at a steady, readable rate either way.
+const REFRESH: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Live progress, throttled.
+///
+/// Owns the last-drawn instant so callers do not each reinvent the throttle;
+/// the direct tasks and the chunk pump all go through this.
+struct Progress {
+    name: String,
+    total: u64,
+    verb: &'static str,
+    last: std::time::Instant,
+}
+
+impl Progress {
+    fn new(verb: &'static str, name: impl Into<String>, total: u64) -> Self {
+        Self {
+            name: name.into(),
+            total,
+            verb,
+            // Far enough back that the first call always draws.
+            last: std::time::Instant::now() - REFRESH,
+        }
+    }
+
+    /// Draw the bar if enough time has passed. `done` is bytes so far.
+    fn show(&mut self, done: u64, screen: &Screen) {
+        if self.last.elapsed() < REFRESH {
+            return;
+        }
+        self.last = std::time::Instant::now();
+        screen.status(format!("{} {} {}", self.verb, self.name, bar(done, self.total)));
+    }
+}
+
+/// A bar, a percentage and the two sizes, in one line.
+fn bar(done: u64, total: u64) -> String {
+    /// Characters of bar. Narrow enough to leave the name and sizes visible on
+    /// an 80-column terminal, which is the narrowest anyone actually uses.
+    const WIDTH: u64 = 20;
+
+    let done = done.min(total);
+    // A zero total is "nothing to do", so it reads as finished rather than as
+    // a division by zero.
+    let filled = (done * WIDTH).checked_div(total).unwrap_or(WIDTH);
+    let percent = (done * 100).checked_div(total).unwrap_or(100);
+    format!(
+        "[{}{}] {percent:>3}%  {} / {}",
+        "\u{2588}".repeat(filled as usize),
+        "\u{2591}".repeat((WIDTH - filled) as usize),
+        files::human(done),
+        files::human(total),
+    )
+}
 
 /// How a conversation ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,8 +180,8 @@ struct Sending {
     sent: u64,
     /// Total size, for the progress line.
     size: u64,
-    /// Next progress report, in bytes sent.
-    next_report: u64,
+    /// The bar, and its own throttle.
+    progress: Progress,
     /// Where this file lives, kept so a direct transfer can reopen it in its
     /// own task rather than moving the handle out from under the chunk pump.
     path: PathBuf,
@@ -230,7 +288,7 @@ struct Receiving {
     file: std::fs::File,
     offer: Offer,
     written: u64,
-    next_report: u64,
+    progress: Progress,
 }
 
 /// Run a conversation over an open stream.
@@ -292,6 +350,9 @@ where
     // ever go up: a number that is reused is a number that means two things.
     let mut next_number = 0usize;
     let mut next_batch = 0usize;
+    // Whether a transfer was running last time round, so the status line can be
+    // handed back exactly once when it stops.
+    let mut was_running = false;
     // Set once the operator has asked to leave but a transfer is still running.
     // Ending the call there would truncate a file mid-flight, and the recipient
     // would have no way to tell that from a network drop.
@@ -543,6 +604,16 @@ where
             take_everything = false;
         }
 
+        // The bar is the status line, so something has to put the status back
+        // when the transfer ends — otherwise it sits frozen at 100% for the
+        // rest of the call. One place, because the four ways a transfer can
+        // finish all mean the same thing here.
+        let running = busy(&sending, &receiving, &direct_task);
+        if was_running && !running {
+            screen.status(format!("in a call with {peer}"));
+        }
+        was_running = running;
+
         // The transfer that was holding the call open has finished.
         if let Some(end) = leaving
             && !busy(&sending, &receiving, &direct_task)
@@ -706,7 +777,7 @@ async fn handle(
                 accepted: false,
                 sent: 0,
                 size: out.size,
-                next_report: PROGRESS_EVERY,
+                progress: Progress::new("sending", out.name.clone(), out.size),
                 path: out.path.clone(),
                 route: out.route,
             });
@@ -723,8 +794,15 @@ async fn handle(
                         // writers on one transfer would interleave.
                         let s = sending.take().expect("checked just above");
                         let done = direct_done.clone();
+                        let sc = screen.clone();
                         *direct_task = Some(tokio::spawn(async move {
-                            let outcome = match push_direct(s.path, offset, stream).await {
+                            let outcome = match push_direct(
+                                s.path, offset, stream,
+                                Progress::new("sending", s.name.clone(), s.size),
+                                sc,
+                            )
+                            .await
+                            {
                                 Ok(()) => DirectDone::Sent(s.name),
                                 Err(e) => DirectDone::Failed(format!("{e:#}")),
                             };
@@ -751,7 +829,6 @@ async fn handle(
                 .context("seeking to the resume point")?;
             s.accepted = true;
             s.sent = offset;
-            s.next_report = offset + PROGRESS_EVERY;
             screen.system(match offset {
                 0 => format!("-- sending {:?} --", s.name),
                 _ => format!("-- resuming {:?} from {} --", s.name, files::human(offset)),
@@ -795,14 +872,7 @@ async fn handle(
             }
             std::io::Write::write_all(&mut r.file, &data).context("writing to the partial file")?;
             r.written += data.len() as u64;
-            if r.written >= r.next_report {
-                screen.system(format!(
-                    "   {} of {}",
-                    files::human(r.written),
-                    files::human(r.offer.size)
-                ));
-                r.next_report = r.written + PROGRESS_EVERY;
-            }
+            r.progress.show(r.written, screen);
         }
 
         Message::FileDone => {
@@ -977,6 +1047,8 @@ async fn push_direct(
     path: PathBuf,
     offset: u64,
     mut stream: crate::transport::direct::Link<quinn::SendStream>,
+    mut progress: Progress,
+    screen: Screen,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
@@ -988,6 +1060,7 @@ async fn push_direct(
         .context("seeking to the resume point")?;
 
     let mut buf = vec![0u8; MAX_CHUNK];
+    let mut sent = offset;
     loop {
         let n = file.read(&mut buf).await.context("reading the file")?;
         if n == 0 {
@@ -997,6 +1070,8 @@ async fn push_direct(
             .write_all(&buf[..n])
             .await
             .context("writing to the direct link")?;
+        sent += n as u64;
+        progress.show(sent, &screen);
     }
     // Closes the stream cleanly, which is what tells the far side it has it all.
     stream.finish().context("closing the direct link")?;
@@ -1012,6 +1087,8 @@ async fn pull_direct(
     listener: crate::transport::direct::Listener,
     incoming_dir: PathBuf,
     offer: Offer,
+    mut progress: Progress,
+    screen: Screen,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
 
@@ -1036,6 +1113,7 @@ async fn pull_direct(
             break;
         }
         written += n as u64;
+        progress.show(written, &screen);
         if written > offer.size {
             bail!("the peer sent more than the {} offered", files::human(offer.size));
         }
@@ -1093,8 +1171,10 @@ async fn accept(
                     let done = direct_done.clone();
                     let dir = incoming_dir.to_path_buf();
                     let mine = offer.clone();
+                    let sc = screen.clone();
+                    let bar = Progress::new("receiving", mine.name.clone(), mine.size);
                     *direct_task = Some(tokio::spawn(async move {
-                        let outcome = match pull_direct(listener, dir, mine.clone()).await {
+                        let outcome = match pull_direct(listener, dir, mine.clone(), bar, sc).await {
                             Ok(()) => DirectDone::Received(Box::new(mine)),
                             Err(e) => DirectDone::Failed(format!("{e:#}")),
                         };
@@ -1127,11 +1207,12 @@ async fn accept(
 
     screen.system(format!("-- taking {:?} --", offer.name));
     let hash = offer.hash;
+    let bar = Progress::new("receiving", offer.name.clone(), offer.size);
     *receiving = Some(Receiving {
         offer,
         file,
         written: offset,
-        next_report: offset + PROGRESS_EVERY,
+        progress: bar,
     });
     outbox
         .send(Message::FileAccept { hash, offset, direct: None })
@@ -1176,14 +1257,7 @@ fn pump(sending: &mut Option<Sending>, screen: &Screen) -> Result<Option<Message
     }
     buf.truncate(filled);
     s.sent += filled as u64;
-    if s.sent >= s.next_report {
-        screen.system(format!(
-            "   {} of {}",
-            files::human(s.sent),
-            files::human(s.size)
-        ));
-        s.next_report = s.sent + PROGRESS_EVERY;
-    }
+    s.progress.show(s.sent, screen);
     Ok(Some(Message::FileChunk(buf)))
 }
 
@@ -1759,6 +1833,34 @@ mod tests {
         let text = format!("{err}");
         assert!(text.contains("[4]") && text.contains("[7]"), "{text}");
         assert_eq!(pending.len(), 2, "a bad number takes nothing");
+    }
+
+
+    /// The bar has to stay honest at both ends and never overflow its width.
+    #[test]
+    fn the_bar_fills_from_empty_to_full() {
+        let empty = bar(0, 1000);
+        assert!(empty.contains("  0%"), "{empty}");
+        assert!(empty.contains('\u{2591}') && !empty.contains('\u{2588}'), "{empty}");
+
+        let half = bar(500, 1000);
+        assert!(half.contains(" 50%"), "{half}");
+
+        let full = bar(1000, 1000);
+        assert!(full.contains("100%"), "{full}");
+        assert!(!full.contains('\u{2591}'), "{full}");
+
+        // Every bar is the same width, whatever it says.
+        let width = |s: &str| s.chars().filter(|c| *c == '\u{2588}' || *c == '\u{2591}').count();
+        assert_eq!(width(&empty), width(&half));
+        assert_eq!(width(&half), width(&full));
+
+        // A peer claiming more than it offered must not make it wrap round.
+        let over = bar(2000, 1000);
+        assert!(over.contains("100%"), "{over}");
+        assert_eq!(width(&over), width(&full));
+        // And a zero-sized total must not divide by zero.
+        assert!(bar(0, 0).contains("100%"));
     }
 
     /// A refused offer leaves nothing behind.
