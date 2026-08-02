@@ -594,6 +594,7 @@ fn help(screen: &Screen) {
         "  Ctrl-B / Ctrl-F               scroll one page",
         "  Ctrl-E                        jump back to the newest line",
         "  left / right / Home / End     move inside what you are typing",
+        "                                a dropped file counts as one step",
         "  Ctrl-V                        paste (no Shift needed)",
         "  Ctrl-U                        clear the input   Ctrl-C  leave",
         "mouse:",

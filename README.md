@@ -112,7 +112,11 @@ reach the directory first — give it a minute.
 
 During a call, `/send <path>` offers one — or **drag the file onto the window**,
 which shows as `[image.png]` in the input box and offers it when you press
-Enter. Backspace on an empty line removes it again.
+Enter.
+
+The chip lands where the cursor is, and behaves like a single character from
+there on: the arrows step over it in one press, Backspace removes it whole, and
+you can type on either side of it.
 
 Nothing moves until the other person types `/accept` — a file lands on their disk, so they decide, not you. `/refuse`
 declines it. One file at a time, and one call at a time.

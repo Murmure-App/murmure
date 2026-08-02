@@ -219,6 +219,38 @@ impl Selection {
     }
 }
 
+/// One thing on the input line.
+///
+/// A dropped file is a single item, not the 60-odd characters of its path: the
+/// path is noise in a one-line box, and treating the chip as one unit is what
+/// lets the cursor step over it and Backspace remove it whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Item {
+    Char(char),
+    File(PathBuf),
+}
+
+impl Item {
+    /// How the item reads on screen.
+    fn shown(&self) -> String {
+        match self {
+            Item::Char(c) => c.to_string(),
+            Item::File(p) => format!(
+                "[{}]",
+                p.file_name().unwrap_or(p.as_os_str()).to_string_lossy()
+            ),
+        }
+    }
+
+    /// Columns it occupies, which is what the cursor's position is counted in.
+    fn width(&self) -> usize {
+        match self {
+            Item::Char(_) => 1,
+            Item::File(_) => self.shown().chars().count(),
+        }
+    }
+}
+
 /// Everything drawn, and where the view is.
 struct App {
     /// Shown in the title bar, next to the address.
@@ -228,19 +260,19 @@ struct App {
     title: String,
     /// Scrollback, oldest first.
     history: VecDeque<Entry>,
-    /// What is being typed.
-    input: String,
-    /// Where the text cursor sits in [`Self::input`], as a byte index on a char
-    /// boundary. Kept as bytes because that is what `String::insert` and
-    /// `String::remove` take; every move goes through a boundary search, so it
-    /// can never land mid-character.
-    cursor: usize,
-    /// Files dropped on the window, waiting to be sent.
+    /// The input line: typed characters and dropped files, in the order they
+    /// were put there.
     ///
-    /// A terminal turns a drag-and-drop into a paste of the file's path, which
-    /// is 60-odd characters of noise in a one-line input box. The path is kept
-    /// here and shown as `[name]`, so what is on screen is what was dropped.
-    attached: Vec<PathBuf>,
+    /// One `Vec` of single characters rather than a string plus a separate list
+    /// of attachments. That costs a few bytes per character on a line that is
+    /// never more than a few hundred long, and buys two things worth far more:
+    /// a file sits *where it was dropped* instead of being herded to the end,
+    /// and the cursor becomes a plain index — no byte offsets, so no way to
+    /// land mid-character and no boundary search on every move.
+    items: Vec<Item>,
+    /// Where the cursor sits, as an index into [`Self::items`]. Ranges from 0 to
+    /// `items.len()` inclusive: the far end is "after everything".
+    cursor: usize,
     /// Screen rows scrolled up from the bottom. Zero means following the tail.
     ///
     /// Rows, not entries. Counting entries is the obvious thing and it is
@@ -290,9 +322,8 @@ impl App {
             status: "starting".to_owned(),
             title,
             history: VecDeque::new(),
-            input: String::new(),
+            items: Vec::new(),
             cursor: 0,
-            attached: Vec::new(),
             scroll_back: 0,
             viewport: (80, PAGE),
             body_origin: (0, 0),
@@ -343,7 +374,7 @@ impl App {
     /// actually there is treated as one.
     fn paste(&mut self, text: &str) {
         if let Some(path) = as_dropped_file(text) {
-            self.attached.push(path);
+            self.attach(path);
             return;
         }
         // Newlines would submit several lines at once from a source that is not
@@ -359,80 +390,92 @@ impl App {
 
     /// Type one character where the cursor is.
     fn insert(&mut self, c: char) {
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
+        self.items.insert(self.cursor, Item::Char(c));
+        self.cursor += 1;
     }
 
-    /// Delete the character before the cursor. `false` when there was none.
+    /// Put a dropped file where the cursor is.
+    ///
+    /// A space goes in front when the character before it is not already one,
+    /// so `voici` plus a drop reads `voici [a.pdf]` rather than `voici[a.pdf]`.
+    /// It is inserted as a real character rather than faked at display time:
+    /// anything drawn that is not in `items` would put the cursor's column out
+    /// of step with what is on screen.
+    fn attach(&mut self, path: PathBuf) {
+        if matches!(self.items.get(self.cursor.wrapping_sub(1)), Some(Item::Char(c)) if *c != ' ') {
+            self.insert(' ');
+        }
+        self.items.insert(self.cursor, Item::File(path));
+        self.cursor += 1;
+    }
+
+    /// Delete whatever is before the cursor — a character or a whole file.
+    /// `false` when there was nothing.
     fn backspace(&mut self) -> bool {
-        let Some(prev) = self.input[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-        else {
+        if self.cursor == 0 {
             return false;
-        };
-        self.input.remove(prev);
-        self.cursor = prev;
+        }
+        self.cursor -= 1;
+        self.items.remove(self.cursor);
         true
     }
 
-    /// Move the cursor one character left or right, stopping at either end.
+    /// Move the cursor one item left or right, stopping at either end. A file
+    /// counts as one step, however long its name is.
     fn move_cursor(&mut self, right: bool) {
         self.cursor = if right {
-            self.input[self.cursor..]
-                .char_indices()
-                .nth(1)
-                .map_or(self.input.len(), |(i, _)| self.cursor + i)
+            (self.cursor + 1).min(self.items.len())
         } else {
-            self.input[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map_or(0, |(i, _)| i)
+            self.cursor.saturating_sub(1)
         };
     }
 
-    /// What the input box shows: what is being typed, then the attachments.
-    ///
-    /// Attachments come last because they are the most recent thing that
-    /// happened — dropping a file on `/send` used to render `[image.jpg] /send`,
-    /// which reads backwards. Putting them after the text also keeps them clear
-    /// of the cursor, which only ever moves inside the typed part.
+    /// What the input box shows.
     fn input_display(&self) -> String {
-        let mut shown = self.input.clone();
-        for path in &self.attached {
-            let name = path
-                .file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy();
-            if !shown.is_empty() && !shown.ends_with(' ') {
-                shown.push(' ');
-            }
-            shown.push_str(&format!("[{name}]"));
-        }
-        shown
+        self.items.iter().map(Item::shown).collect()
     }
 
-    /// The lines Enter should send: one `/send` per attachment, then the text.
+    /// Which column the cursor is drawn in, counted over what is displayed —
+    /// a file is as wide as its chip, not one column.
+    fn cursor_column(&self) -> usize {
+        self.items[..self.cursor].iter().map(Item::width).sum()
+    }
+
+    /// The lines Enter should send: one `/send` per file, then the text.
     ///
     /// Emitting commands rather than a new event type keeps the interface's only
     /// output a line of text, exactly as if it had been typed — so the idle loop
     /// and the conversation need to know nothing about drag-and-drop.
+    ///
+    /// Files go first regardless of where they sit on the line. Their position
+    /// is there to be edited around, not to interleave with the message: a
+    /// transfer needs the other side to accept it, so pretending the text and
+    /// the file arrive together would be a lie about what happens next.
     fn submit(&mut self) -> Vec<String> {
-        let mut lines: Vec<String> = self
-            .attached
-            .drain(..)
-            .map(|p| format!("/send {}", p.display()))
+        let items = std::mem::take(&mut self.items);
+        self.cursor = 0;
+
+        let mut lines: Vec<String> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::File(p) => Some(format!("/send {}", p.display())),
+                Item::Char(_) => None,
+            })
             .collect();
 
-        let text = std::mem::take(&mut self.input);
-        self.cursor = 0;
+        let text: String = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Char(c) => Some(*c),
+                Item::File(_) => None,
+            })
+            .collect();
         // Typing `/send` and *then* dropping a file is the obvious way to try
         // it. The chips already carry the whole command, so the bare verb left
         // over would only produce "usage: /send <path>" after the file went.
         let redundant = !lines.is_empty() && text.trim() == "/send";
         if !text.trim().is_empty() && !redundant {
-            lines.push(text);
+            lines.push(text.trim().to_owned());
         }
         lines
     }
@@ -603,9 +646,8 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<String>) 
 
     match key.code {
         KeyCode::Char('u') if ctrl => {
-            app.input.clear();
+            app.items.clear();
             app.cursor = 0;
-            app.attached.clear();
         }
         // Ctrl-V, because a terminal reserves Ctrl-Shift-V for itself and
         // reaching for Shift on every paste is exactly the friction this
@@ -634,17 +676,15 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<String>) 
         KeyCode::Home => app.cursor = 0,
         // End belongs to the input box; Ctrl-E is the one that jumps the history
         // back to the newest line, and it is the one the help names.
-        KeyCode::End => app.cursor = app.input.len(),
-        // Once the text is gone, Backspace takes attachments off the end, so a
-        // file dropped by mistake is removed the way anything else is.
+        KeyCode::End => app.cursor = app.items.len(),
+        // Removes a file the same way it removes a character, because on this
+        // line a file *is* one item.
         KeyCode::Backspace => {
-            if !app.backspace() {
-                app.attached.pop();
-            }
+            app.backspace();
         }
         KeyCode::Delete => {
-            if app.cursor < app.input.len() {
-                app.input.remove(app.cursor);
+            if app.cursor < app.items.len() {
+                app.items.remove(app.cursor);
             }
         }
         KeyCode::Enter => {
@@ -764,9 +804,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     // Put the real cursor where the text is, so the terminal's own blink is the
     // cursor and there is nothing to draw. No cursor while input is refused.
     if app.accepting {
-        // Counted over the typed text only, up to the cursor. The attachment
-        // chips are drawn after it, so they never shift it.
-        let before = app.input[..app.cursor].chars().count() as u16;
+        // Counted in displayed columns, so a chip the cursor has stepped over
+        // moves it by the width of the name rather than by one.
+        let before = app.cursor_column() as u16;
         let cursor_x = input.x + 1 + before;
         frame.set_cursor_position((cursor_x.min(input.right().saturating_sub(2)), input.y + 1));
     }
@@ -1212,81 +1252,116 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Type a string into a fresh app, left to right.
+    fn typed(s: &str) -> App {
+        let mut app = App::new("t".into());
+        for c in s.chars() {
+            app.insert(c);
+        }
+        app
+    }
+
     /// The cursor moves inside the line, and edits land where it is.
     #[test]
     fn the_cursor_moves_and_edits_in_the_middle() {
-        let mut app = App::new("t".into());
-        for c in "bonjur".chars() {
-            app.insert(c);
-        }
+        let mut app = typed("bonjur");
         // Two steps back from the end lands between `j` and `u`.
         app.move_cursor(false);
         app.move_cursor(false);
         app.insert('o');
-        assert_eq!(app.input, "bonjour");
+        assert_eq!(app.input_display(), "bonjour");
         assert_eq!(app.cursor, 5, "the cursor follows what was just typed");
 
         // Backspace takes what is before the cursor, not what is at the end.
         assert!(app.backspace());
-        assert_eq!(app.input, "bonjur");
+        assert_eq!(app.input_display(), "bonjur");
 
         // Neither end runs off.
         app.cursor = 0;
         app.move_cursor(false);
         assert_eq!(app.cursor, 0);
         assert!(!app.backspace(), "nothing before the start");
-        app.cursor = app.input.len();
+        app.cursor = app.items.len();
         app.move_cursor(true);
-        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(app.cursor, app.items.len());
     }
 
-    /// Multi-byte characters must not be split by a cursor move.
+    /// Multi-byte characters are one item each, so nothing can split them.
     #[test]
     fn the_cursor_steps_over_whole_characters() {
-        let mut app = App::new("t".into());
-        for c in "éàü".chars() {
-            app.insert(c);
-        }
-        assert_eq!(app.cursor, 6, "three two-byte characters");
+        let mut app = typed("éàü");
+        assert_eq!(app.cursor, 3, "three characters, not six bytes");
         app.move_cursor(false);
-        assert_eq!(app.cursor, 4);
+        assert_eq!(app.cursor, 2);
         app.insert('x');
-        assert_eq!(app.input, "éàxü");
+        assert_eq!(app.input_display(), "éàxü");
         assert!(app.backspace());
-        assert_eq!(app.input, "éàü");
+        assert_eq!(app.input_display(), "éàü");
+        // Columns, not items: the cursor is drawn where the characters are.
+        app.cursor = 2;
+        assert_eq!(app.cursor_column(), 2);
     }
 
     /// What the box shows is the file's name; what Enter sends is its path.
     #[test]
     fn an_attachment_shows_as_a_name_and_submits_as_a_command() {
-        let mut app = App::new("t".into());
-        app.attached.push(PathBuf::from("/tmp/mes docs/image.png"));
-        for c in "tiens".chars() {
-            app.insert(c);
-        }
+        let mut app = typed("tiens");
+        app.attach(PathBuf::from("/tmp/mes docs/image.png"));
 
-        // The chip goes after the text, because dropping it is what just
-        // happened — `[image.png] tiens` read backwards.
+        // A space is inserted before the chip so the two do not run together.
         assert_eq!(app.input_display(), "tiens [image.png]");
         assert_eq!(
             app.submit(),
             vec!["/send /tmp/mes docs/image.png".to_owned(), "tiens".to_owned()]
         );
-        // Submitting empties both, so the next line starts clean.
-        assert!(app.attached.is_empty());
-        assert!(app.input.is_empty());
+        // Submitting empties the line, so the next one starts clean.
+        assert!(app.items.is_empty());
+        assert_eq!(app.cursor, 0);
         assert!(app.submit().is_empty(), "nothing to send is nothing sent");
+    }
+
+    /// The whole point of the item model: a file sits where it was dropped, the
+    /// cursor steps over it in one move, and Backspace takes it whole.
+    #[test]
+    fn a_file_is_one_item_the_cursor_can_cross_and_delete() {
+        let mut app = typed("voici merci");
+        // Back up to just after "voici", and drop a file there.
+        for _ in 0..6 {
+            app.move_cursor(false);
+        }
+        app.attach(PathBuf::from("/tmp/a.pdf"));
+        assert_eq!(app.input_display(), "voici [a.pdf] merci");
+
+        // One press crosses the whole chip, however long the name is.
+        let before = app.cursor;
+        app.move_cursor(false);
+        assert_eq!(app.cursor, before - 1, "a file is one step, not seven");
+        // ...and the cursor is still drawn in the right column.
+        assert_eq!(app.cursor_column(), "voici ".len());
+
+        // Typing past the chip is now possible, which is what it is all for.
+        app.cursor = app.items.len();
+        for c in " !".chars() {
+            app.insert(c);
+        }
+        assert_eq!(app.input_display(), "voici [a.pdf] merci !");
+
+        // Backspace over the chip removes the file, not one bracket.
+        app.cursor = 7; // "voici " is 6 items, then the file
+        assert!(app.backspace());
+        assert_eq!(app.input_display(), "voici  merci !");
+        assert!(
+            app.submit().iter().all(|l| !l.starts_with("/send")),
+            "the file is gone, so nothing may be offered"
+        );
     }
 
     /// Typing `/send` and then dropping a file must not leave the bare verb
     /// behind, which would only produce a usage error after the file went.
     #[test]
     fn a_dropped_file_absorbs_a_typed_send() {
-        let mut app = App::new("t".into());
-        for c in "/send".chars() {
-            app.insert(c);
-        }
-        app.attached.push(PathBuf::from("/tmp/image.JPG"));
+        let mut app = typed("/send");
+        app.attach(PathBuf::from("/tmp/image.JPG"));
 
         assert_eq!(app.input_display(), "/send [image.JPG]");
         assert_eq!(app.submit(), vec!["/send /tmp/image.JPG".to_owned()]);
@@ -1297,8 +1372,11 @@ mod tests {
     fn a_multi_line_paste_stays_one_line() {
         let mut app = App::new("t".into());
         app.paste("deux\nlignes\r\ncollees");
-        assert_eq!(app.input, "deux lignes  collees");
-        assert!(app.attached.is_empty());
+        assert_eq!(app.input_display(), "deux lignes  collees");
+        assert!(
+            app.items.iter().all(|i| matches!(i, Item::Char(_))),
+            "a paste is text, never an attachment"
+        );
     }
 
     #[test]
