@@ -151,17 +151,44 @@ struct Outgoing {
     route: Route,
 }
 
+/// Which offered file a verb is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Which {
+    /// No argument: the oldest, which is what "the one I just saw" means.
+    Oldest,
+    /// A number as shown on screen, counting from 1.
+    Numbered(usize),
+    /// Every one of them.
+    ///
+    /// Transfers still run one at a time — the wire carries one file at a time
+    /// whatever the operator asked — so this is a standing instruction rather
+    /// than a batch: finishing one starts the next.
+    All,
+}
+
+impl Which {
+    fn parse(rest: &str) -> Self {
+        match rest.trim() {
+            "all" | "tout" | "tous" => Which::All,
+            other => match other.parse() {
+                Ok(n) => Which::Numbered(n),
+                Err(_) => Which::Oldest,
+            },
+        }
+    }
+}
+
 /// Take one offer out of the queue: the numbered one, or the oldest.
 ///
 /// Numbers are what the operator sees on screen, so they start at 1.
-fn take_pending(pending: &mut Vec<Offered>, which: Option<usize>) -> Result<Offered> {
+fn take_pending(pending: &mut Vec<Offered>, which: Which) -> Result<Offered> {
     if pending.is_empty() {
         bail!("nothing to answer");
     }
     let index = match which {
-        None => 0,
-        Some(n) if n >= 1 && n <= pending.len() => n - 1,
-        Some(n) => bail!("there is no file {n}; there are {}", pending.len()),
+        Which::Oldest | Which::All => 0,
+        Which::Numbered(n) if n >= 1 && n <= pending.len() => n - 1,
+        Which::Numbered(n) => bail!("there is no file {n}; there are {}", pending.len()),
     };
     Ok(pending.remove(index))
 }
@@ -225,6 +252,10 @@ where
     // Files we put in a message and have not been answered about yet. Keyed by
     // hash because that is what a `FileAccept` names.
     let mut offered: Vec<Outgoing> = Vec::new();
+    // Set by `/accept all`. The wire carries one file at a time whatever the
+    // operator asked, so taking them all is a standing instruction: each
+    // transfer that finishes starts the next one still queued.
+    let mut take_everything = false;
     // Set once the operator has asked to leave but a transfer is still running.
     // Ending the call there would truncate a file mid-flight, and the recipient
     // would have no way to tell that from a network drop.
@@ -307,6 +338,7 @@ where
                         }
                     }
                     Typed::Accept(which) => {
+                        take_everything = which == Which::All;
                         if let Err(e) = accept(
                             incoming_dir,
                             &mut pending,
@@ -320,6 +352,22 @@ where
                         .await
                         {
                             screen.error(format!("{e:#}"));
+                        }
+                    }
+                    Typed::Refuse(Which::All) => {
+                        take_everything = false;
+                        if pending.is_empty() {
+                            screen.error("nothing to refuse");
+                        }
+                        for o in std::mem::take(&mut pending) {
+                            screen.system(format!("refused {:?}", o.offer.name));
+                            if outbox
+                                .send(Message::FileReject { hash: o.offer.hash })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     }
                     Typed::Refuse(which) => match take_pending(&mut pending, which) {
@@ -429,6 +477,33 @@ where
                     }
                 }
             }
+        }
+
+        // `/accept all` is a standing instruction, so a transfer that just
+        // finished is what starts the next one. Done here rather than inside
+        // the completion handlers, because there are three of them — a Tor
+        // FileDone, a direct one, and a direct failure — and all three mean the
+        // same thing to the queue.
+        if take_everything
+            && !busy(&sending, &receiving, &direct_task)
+            && !pending.is_empty()
+            && let Err(e) = accept(
+                incoming_dir,
+                &mut pending,
+                Which::Oldest,
+                &mut receiving,
+                &mut direct_task,
+                &direct_done_tx,
+                &outbox,
+                screen,
+            )
+            .await
+        {
+            screen.error(format!("{e:#}"));
+            take_everything = false;
+        }
+        if pending.is_empty() {
+            take_everything = false;
         }
 
         // The transfer that was holding the call open has finished.
@@ -930,7 +1005,7 @@ async fn pull_direct(
 async fn accept(
     incoming_dir: &Path,
     pending: &mut Vec<Offered>,
-    which: Option<usize>,
+    which: Which,
     receiving: &mut Option<Receiving>,
     direct_task: &mut Option<tokio::task::JoinHandle<()>>,
     direct_done: &mpsc::Sender<DirectDone>,
@@ -1069,10 +1144,10 @@ enum Typed {
     HangUp(Ended),
     /// `/send <path>`, or `/send --direct <path>`.
     Send(PathBuf, Route),
-    /// `/accept`, optionally naming which file of the message.
-    Accept(Option<usize>),
+    /// `/accept`, and which file: the oldest, a numbered one, or every one.
+    Accept(Which),
     /// `/refuse`, likewise.
-    Refuse(Option<usize>),
+    Refuse(Which),
     /// Any other `/word`. Held back rather than sent.
     UnknownCommand(String),
     /// Something to say, with any `//` escape already unwrapped.
@@ -1106,10 +1181,10 @@ fn classify(line: &str) -> Typed {
         // Typing `/quit` mid-call used to be refused, which meant `/bye` then
         // `/quit`: two commands for one intention nobody splits in their head.
         "/quit" => Typed::HangUp(Ended::Quit),
-        // A message can carry several files, so the verbs take a number. No
-        // number means the oldest, which is what "the one I just saw" means.
-        "/accept" => Typed::Accept(rest.parse().ok()),
-        "/refuse" => Typed::Refuse(rest.parse().ok()),
+        // A message can carry several files, so the verbs take an argument. No
+        // argument means the oldest, which is what "the one I just saw" means.
+        "/accept" => Typed::Accept(Which::parse(rest)),
+        "/refuse" => Typed::Refuse(Which::parse(rest)),
         // The whole remainder, not the first word: paths have spaces in them,
         // and quoting rules would be one more thing to explain.
         // The whole remainder is the path, so `--direct` is only a flag when it
@@ -1173,8 +1248,14 @@ mod tests {
 
     #[test]
     fn the_file_verbs_are_recognised() {
-        assert_eq!(classify("/accept"), Typed::Accept(None));
-        assert_eq!(classify("/refuse"), Typed::Refuse(None));
+        assert_eq!(classify("/accept"), Typed::Accept(Which::Oldest));
+        assert_eq!(classify("/accept 2"), Typed::Accept(Which::Numbered(2)));
+        assert_eq!(classify("/accept all"), Typed::Accept(Which::All));
+        assert_eq!(classify("/refuse all"), Typed::Refuse(Which::All));
+        // Anything that is not a number and not "all" falls back to the oldest
+        // rather than erroring: the operator meant `/accept`.
+        assert_eq!(classify("/accept please"), Typed::Accept(Which::Oldest));
+        assert_eq!(classify("/refuse"), Typed::Refuse(Which::Oldest));
         assert_eq!(
             classify("/send /tmp/rapport.pdf"),
             Typed::Send(PathBuf::from("/tmp/rapport.pdf"), Route::Tor)
@@ -1511,6 +1592,67 @@ mod tests {
                 }
             }
         }
+    }
+
+
+    /// `/accept all` is a standing instruction, not a batch: the wire still
+    /// carries one file at a time, so finishing one has to start the next.
+    #[test]
+    fn accept_all_takes_every_file_in_turn() {
+        let dir = scratch("acceptall");
+        let (from, to) = (dir.join("out"), dir.join("in"));
+        std::fs::create_dir_all(&from).unwrap();
+        let one = from.join("un.bin");
+        let two = from.join("deux.bin");
+        let three = from.join("trois.bin");
+        std::fs::write(&one, vec![1u8; 4000]).unwrap();
+        std::fs::write(&two, vec![2u8; 6000]).unwrap();
+        std::fs::write(&three, vec![3u8; 8000]).unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (a, b) = tokio::io::duplex(256 * 1024);
+            let (ar, aw) = tokio::io::split(a);
+            let (br, bw) = tokio::io::split(b);
+            let (a_tx, mut a_rx) = mpsc::channel::<crate::ui::Typed>(8);
+            let (b_tx, mut b_rx) = mpsc::channel::<crate::ui::Typed>(8);
+            let (a_screen, a_updates) = crate::ui::channel();
+            let (b_screen, b_updates) = crate::ui::channel();
+
+            a_tx.send(crate::ui::Typed::Post {
+                parts: vec![
+                    crate::ui::Part::Text("tout d'un coup".into()),
+                    crate::ui::Part::File(one),
+                    crate::ui::Part::File(two),
+                    crate::ui::Part::File(three),
+                ],
+                direct: false,
+            })
+            .await
+            .unwrap();
+
+            let watch_a = tokio::spawn(react_n(a_updates, a_tx, "-- sent ", 3, "/bye".to_owned()));
+            // One command for three files.
+            let watch_b = tokio::spawn(react(b_updates, b_tx, &["[3]"], "/accept all".to_owned()));
+
+            let to_b = to.clone();
+            let bob = tokio::spawn(async move {
+                run(br.compat(), bw.compat_write(), "alice", &to_b, &mut b_rx, &b_screen).await
+            });
+            let unused = dir.join("unused");
+            let alice = tokio::spawn(async move {
+                run(ar.compat(), aw.compat_write(), "bob", &unused, &mut a_rx, &a_screen).await
+            });
+            alice.await.unwrap().unwrap();
+            bob.await.unwrap().unwrap();
+            watch_a.abort();
+            watch_b.abort();
+        });
+
+        assert_eq!(std::fs::read(to.join("un.bin")).unwrap(), vec![1u8; 4000]);
+        assert_eq!(std::fs::read(to.join("deux.bin")).unwrap(), vec![2u8; 6000]);
+        assert_eq!(std::fs::read(to.join("trois.bin")).unwrap(), vec![3u8; 8000]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A refused offer leaves nothing behind.
