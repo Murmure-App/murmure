@@ -28,17 +28,24 @@
 //!
 //! # What it does not do
 //!
-//! No NAT traversal, and — as built — **no way to be reached from outside the
-//! local network at all**. [`candidates`] advertises only what this machine can
-//! see about itself, which is a private address and loopback; discovering the
-//! public one needs STUN or another third party, and there is none. The port is
-//! ephemeral too, so there is nothing fixed for an operator to forward even if
-//! they wanted to.
+//! No NAT traversal, and none is attempted. What decides whether this works is
+//! which address the peer can be reached at:
 //!
-//! So this reaches a peer on the same network, and otherwise fails and falls
-//! back to Tor. Making a forwarded port usable would take two things that are
-//! not here: a fixed port, and a way for the operator to declare their public
-//! address. Hole punching is a later step again, and a much harder one; see
+//! - **A global IPv6 address works between any two networks.** There is no NAT
+//!   in the way, and — the part that matters — a machine *knows* its own global
+//!   IPv6 address, because it is simply assigned to the interface. The reason
+//!   IPv4 needs STUN is that a machine behind a NAT cannot learn its public
+//!   address without asking someone; in IPv6 there is nothing to learn. What
+//!   remains is the router's inbound firewall, which is a rule rather than a
+//!   translation, and is often a single setting.
+//! - **A private IPv4 address only works on the same network.** It is
+//!   advertised anyway, because that case is common and costs one dial.
+//!
+//! There is deliberately no attempt to discover a public IPv4 address: that
+//! needs STUN or some other third party, and this program has none. A peer
+//! reachable at neither falls back to Tor, which always works.
+//!
+//! Hole punching is a later step again, and a much harder one; see
 //! `aidd_docs/INSTALL.md`.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -98,10 +105,15 @@ pub fn listen() -> Result<Listener> {
         .expect("freshly built, so not yet shared")
         .max_concurrent_uni_streams(1u8.into());
 
-    // Any interface: which one the peer can actually reach is what the
-    // candidate list is for.
-    let endpoint = Endpoint::server(server, "0.0.0.0:0".parse().expect("literal"))
-        .context("binding the QUIC endpoint")?;
+    // `[::]` rather than `0.0.0.0`, because that is what listens on **both**
+    // families: an IPv4-only socket cannot be reached at an IPv6 address, and
+    // IPv6 is the only candidate that works between two different networks.
+    // Falls back to IPv4 on a machine with the v6 stack switched off.
+    let endpoint = match Endpoint::server(server.clone(), "[::]:0".parse().expect("literal")) {
+        Ok(e) => e,
+        Err(_) => Endpoint::server(server, "0.0.0.0:0".parse().expect("literal"))
+            .context("binding the QUIC endpoint")?,
+    };
     let port = endpoint
         .local_addr()
         .context("reading the bound port")?
@@ -168,8 +180,13 @@ impl Listener {
 /// a connection whose certificate does not hash to it is refused during the
 /// handshake, before a byte of the file moves.
 pub async fn dial(candidates: &[SocketAddr], fingerprint: [u8; 32]) -> Result<Link<SendStream>> {
-    let mut endpoint =
-        Endpoint::client("0.0.0.0:0".parse().expect("literal")).context("binding a QUIC client")?;
+    // Dual-stack for the same reason as the listener: a v4-only client cannot
+    // dial the one candidate that crosses networks.
+    let mut endpoint = match Endpoint::client("[::]:0".parse().expect("literal")) {
+        Ok(e) => e,
+        Err(_) => Endpoint::client("0.0.0.0:0".parse().expect("literal"))
+            .context("binding a QUIC client")?,
+    };
     endpoint.set_default_client_config(client_config(fingerprint)?);
 
     let mut last: Option<anyhow::Error> = None;
@@ -223,18 +240,46 @@ fn self_signed() -> Result<(Vec<u8>, Vec<u8>)> {
 /// each other, which is what the tests do.
 fn candidates(port: u16) -> Vec<SocketAddr> {
     let mut found = Vec::new();
-    if let Some(ip) = default_route_address() {
+
+    // IPv6 first, and not for tidiness: a global IPv6 address is reachable
+    // from anywhere without NAT, so it is the only candidate that can work
+    // between two different networks. IPv4 behind a NAT never can.
+    if let Some(ip) = source_address_for("[2001:db8::1]:9")
+        && is_global_v6(&ip)
+    {
+        found.push(SocketAddr::new(ip, port));
+    }
+    if let Some(ip) = source_address_for("192.0.2.1:9") {
         found.push(SocketAddr::new(ip, port));
     }
     found.push(SocketAddr::new(IpAddr::from([127, 0, 0, 1]), port));
     found
 }
 
-fn default_route_address() -> Option<IpAddr> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    // TEST-NET-1: reserved for documentation, so it is never actually routed.
-    socket.connect("192.0.2.1:9").ok()?;
+/// The address this machine would use as the source when talking to `target`.
+///
+/// `target` is never contacted: `connect` on a UDP socket only fixes the
+/// default destination, which is enough to make the operating system pick a
+/// route and therefore a source address. Both arguments here are documentation
+/// ranges, reserved precisely so that they are never routed anywhere.
+fn source_address_for(target: &str) -> Option<IpAddr> {
+    let bind = if target.starts_with('[') { "[::]:0" } else { "0.0.0.0:0" };
+    let socket = UdpSocket::bind(bind).ok()?;
+    socket.connect(target).ok()?;
     socket.local_addr().ok().map(|a| a.ip())
+}
+
+/// Is this an IPv6 address the rest of the internet can reach?
+///
+/// Written out rather than taken from `Ipv6Addr::is_global`, which is still
+/// unstable. Only the global unicast block 2000::/3 is routable; link-local,
+/// unique-local and loopback are all as useless to a distant peer as a private
+/// IPv4 address.
+fn is_global_v6(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xe000) == 0x2000,
+        IpAddr::V4(_) => false,
+    }
 }
 
 /// A client config that trusts exactly one certificate: the one whose BLAKE3
@@ -409,6 +454,48 @@ mod tests {
             "gave up after {:?}",
             started.elapsed()
         );
+    }
+
+    /// The listener has to accept on IPv6, not just offer an IPv6 address —
+    /// a socket bound to `0.0.0.0` advertises one and then refuses every
+    /// connection to it, which looks exactly like a firewall.
+    #[tokio::test]
+    async fn a_file_crosses_an_ipv6_link() {
+        let listener = listen().expect("bind");
+        let port = listener.candidates[0].port();
+        let v6: SocketAddr = format!("[::1]:{port}").parse().unwrap();
+        let fingerprint = listener.fingerprint;
+
+        let receiving = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept over IPv6");
+            stream.read_to_end(1024 * 1024).await.expect("read")
+        });
+
+        let one = [v6];
+        let mut out = dial(&one, fingerprint).await.expect("dial over IPv6");
+        out.write_all(b"par IPv6").await.expect("write");
+        out.finish().expect("finish");
+        out.stopped().await.ok();
+
+        assert_eq!(receiving.await.unwrap(), b"par IPv6");
+    }
+
+    /// An address that is offered costs the peer a dial with a timeout, so
+    /// anything unreachable from elsewhere must not be in the list.
+    #[test]
+    fn only_globally_routable_ipv6_is_offered() {
+        for address in candidates(4242) {
+            if address.is_ipv6() {
+                assert!(
+                    is_global_v6(&address.ip()),
+                    "{address} cannot be reached from another network"
+                );
+            }
+        }
+        // Link-local and unique-local are the two that would otherwise slip in.
+        assert!(!is_global_v6(&"fe80::1".parse::<IpAddr>().unwrap()));
+        assert!(!is_global_v6(&"fd00::1".parse::<IpAddr>().unwrap()));
+        assert!(is_global_v6(&"2a01:cb11::1".parse::<IpAddr>().unwrap()));
     }
 
     #[test]

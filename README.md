@@ -153,13 +153,20 @@ A recipient who wants the file but not the exposure can still take it over Tor.
 If the link cannot be established, both sides are told and it falls back to Tor
 rather than failing.
 
-**In practice this means the same local network, and nothing else yet.** You do
-not have to open anything on your router for that — the traffic never leaves the
-LAN. But a peer somewhere else is not reachable either, whatever you forward:
-murmure binds a fresh ephemeral port each time, so there is no fixed port to
-forward, and it only ever advertises private addresses, because discovering your
-public one needs STUN or some other third party and this program has none. A
-remote `--direct` therefore falls back to Tor, every time.
+**Whether it connects depends on IPv6.** Nothing has to be opened on your router
+for two machines on the same network. Between two *different* networks, it comes
+down to which address the other side can be reached at:
+
+- **With IPv6 on both sides, it works.** There is no NAT, and a machine knows its
+  own global IPv6 address because it is simply assigned to the interface. The
+  reason IPv4 needs a STUN server is that a machine behind a NAT cannot learn its
+  public address without asking someone; in IPv6 there is nothing to ask. What is
+  left is your router's inbound firewall, which is usually one setting.
+- **With IPv4 only, it does not.** murmure advertises no public IPv4 address,
+  because discovering one needs a third party and this program has none.
+
+Either way a link that cannot be established falls back to Tor and says so, so
+`--direct` never costs you a transfer.
 
 One more limit: a resumed transfer always uses Tor — the direct stream carries no
 offsets, so the two sides would have to agree on one out of band.
