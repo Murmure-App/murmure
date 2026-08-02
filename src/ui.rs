@@ -15,7 +15,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use crossterm::event::{
@@ -46,6 +46,10 @@ const PAGE: usize = 10;
 
 /// Rows one notch of the mouse wheel moves.
 const WHEEL_STEP: usize = 3;
+
+/// How long a header note stays up. Long enough to catch out of the corner of
+/// an eye, short enough not to be mistaken for state.
+const FLASH_FOR: Duration = Duration::from_secs(2);
 
 /// What kind of line this is, which decides how it is coloured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +272,14 @@ struct App {
     /// crossterm can deliver a stray `Drag` without a matching `Down` on some
     /// terminals, and this is what tells that apart from a real one.
     dragging: bool,
+    /// A short note in the header, and when it stops being shown.
+    ///
+    /// Exists because OSC 52 is fire-and-forget: the terminal never replies, so
+    /// a copy that silently did nothing looks exactly like one that worked.
+    /// Saying how many characters went out is the only confirmation available,
+    /// and it doubles as a check that the selection was what the operator
+    /// thought it was.
+    flash: Option<(String, Instant)>,
     /// Whether typed lines are accepted at all. False until Tor is up.
     accepting: bool,
 }
@@ -287,8 +299,14 @@ impl App {
             rows: Vec::new(),
             selection: None,
             dragging: false,
+            flash: None,
             accepting: false,
         }
+    }
+
+    /// Show a note in the header for [`FLASH_FOR`].
+    fn flash(&mut self, text: impl Into<String>) {
+        self.flash = Some((text.into(), Instant::now() + FLASH_FOR));
     }
 
     /// Every row the history occupies at the current width.
@@ -475,6 +493,18 @@ pub async fn run(
     result
 }
 
+/// Wait until `deadline`, or forever when there is nothing to wait for.
+///
+/// `pending()` rather than a long sleep: a select branch that never completes
+/// costs nothing, while a poll every so often would wake the interface up for
+/// no reason on a machine that is meant to sit idle for hours.
+async fn expire_at(deadline: Option<Instant>) {
+    match deadline {
+        Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     updates: &mut mpsc::UnboundedReceiver<Update>,
@@ -487,13 +517,26 @@ async fn event_loop(
     terminal.draw(|frame| draw(frame, &mut app)).context("drawing")?;
 
     loop {
+        // Read before the select: the branch below cannot borrow `app` while
+        // the other branches hold it mutably.
+        let flash_until = app.flash.as_ref().map(|(_, until)| *until);
+
         tokio::select! {
+            // Armed only while a header note is up, so it never fires
+            // otherwise. Without it the note would stay on screen until the
+            // next keypress — the loop has no periodic tick, and a copy is
+            // precisely the moment when the operator touches nothing.
+            () = expire_at(flash_until) => {}
+
             update = updates.recv() => {
                 match update {
                     Some(Update::Line(entry)) => app.push(entry),
                     Some(Update::Status(status)) => app.status = status,
                     Some(Update::Accepting(yes)) => app.accepting = yes,
-                    Some(Update::Clipboard(text)) => copy_to_clipboard(&text),
+                    Some(Update::Clipboard(text)) => {
+                        copy_to_clipboard(&text);
+                        app.flash(format!("copied {} chars", text.chars().count()));
+                    }
                     // The program is shutting down.
                     None => return Ok(()),
                 }
@@ -504,7 +547,10 @@ async fn event_loop(
                         Update::Line(entry) => app.push(entry),
                         Update::Status(status) => app.status = status,
                         Update::Accepting(yes) => app.accepting = yes,
-                        Update::Clipboard(text) => copy_to_clipboard(&text),
+                        Update::Clipboard(text) => {
+                            copy_to_clipboard(&text);
+                            app.flash(format!("copied {} chars", text.chars().count()));
+                        }
                     }
                 }
             }
@@ -631,22 +677,31 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
     // ---- header ----
     let follow = if app.scroll_back == 0 { "" } else { "  [scrolled]" };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" murmure  {} ", app.title),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {}{follow}", app.status),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])),
-        header,
-    );
+    // Expired notes are dropped here rather than in the event loop, so a frame
+    // drawn for any other reason also clears a stale one.
+    if app.flash.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
+        app.flash = None;
+    }
+    let mut spans = vec![
+        Span::styled(
+            format!(" murmure  {} ", app.title),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {}{follow}", app.status),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if let Some((note, _)) = &app.flash {
+        spans.push(Span::styled(
+            format!("  {note}"),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), header);
 
     // ---- history ----
     //
@@ -789,6 +844,12 @@ fn copy_to_clipboard(text: &str) {
     use std::io::Write as _;
 
     let encoded = data_encoding::BASE64.encode(text.as_bytes());
+    // Under test the encoding still runs, but the sequence stays off stdout:
+    // `cargo test` would otherwise overwrite the clipboard of whoever ran it,
+    // and scatter escape sequences through the test output.
+    if cfg!(test) {
+        return;
+    }
     let mut out = std::io::stdout();
     // `c` is the selection: the clipboard proper, not the X11 primary selection.
     let _ = write!(out, "\x1b]52;c;{encoded}\x07");
@@ -1048,6 +1109,8 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
                 Some(sel) => {
                     if let Some(text) = selected_text(&app.history, sel) {
                         copy_to_clipboard(&text);
+                        let n = text.chars().count();
+                        app.flash(format!("copied {n} char{}", if n == 1 { "" } else { "s" }));
                     }
                 }
                 None => {}
@@ -1267,6 +1330,76 @@ mod tests {
 
         // A zero width must not divide by zero or loop forever either.
         assert_eq!(visible_rows(&one, 0, 5, 0).len(), "hello".len());
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        handle_mouse(
+            MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            app,
+        );
+    }
+    fn press(app: &mut App, c: u16, r: u16) {
+        mouse(app, MouseEventKind::Down(MouseButton::Left), c, r);
+    }
+    fn drag(app: &mut App, c: u16, r: u16) {
+        mouse(app, MouseEventKind::Drag(MouseButton::Left), c, r);
+    }
+    fn release(app: &mut App, c: u16, r: u16) {
+        mouse(app, MouseEventKind::Up(MouseButton::Left), c, r);
+    }
+
+    /// A copy that produced no confirmation is indistinguishable from a copy
+    /// the terminal refused, which is the whole reason the note exists.
+    #[test]
+    fn copying_a_selection_says_how_much_went_out() {
+        let mut app = App::new("t".into());
+        app.body_origin = (0, 0);
+        app.viewport = (40, 4);
+        app.push(entry("hello"));
+        app.rows = visible_rows(&app.history, 40, 4, 0);
+
+        // Press at the start, drag to the end, release: the copy path.
+        press(&mut app, 0, 0);
+        drag(&mut app, 5, 0);
+        release(&mut app, 5, 0);
+
+        let (note, until) = app.flash.as_ref().expect("a copy must say so");
+        assert_eq!(note, "copied 5 chars");
+        assert!(*until > Instant::now(), "the note must not arrive expired");
+
+        // A plain click copies nothing, so it must not claim to have.
+        app.flash = None;
+        press(&mut app, 2, 0);
+        release(&mut app, 2, 0);
+        assert!(app.flash.is_none(), "a click is not a copy");
+    }
+
+    /// One character is not "1 chars".
+    #[test]
+    fn the_note_counts_in_characters_not_bytes() {
+        let mut app = App::new("t".into());
+        app.body_origin = (0, 0);
+        app.viewport = (40, 4);
+        // Three characters, six bytes of UTF-8: the count must follow the
+        // characters, or a selection of accented text reports twice its size.
+        app.push(entry("éàê"));
+        app.rows = visible_rows(&app.history, 40, 4, 0);
+
+        press(&mut app, 0, 0);
+        drag(&mut app, 3, 0);
+        release(&mut app, 3, 0);
+        assert_eq!(app.flash.as_ref().unwrap().0, "copied 3 chars");
+
+        app.flash = None;
+        press(&mut app, 0, 0);
+        drag(&mut app, 1, 0);
+        release(&mut app, 1, 0);
+        assert_eq!(app.flash.as_ref().unwrap().0, "copied 1 char");
     }
 
     #[test]
