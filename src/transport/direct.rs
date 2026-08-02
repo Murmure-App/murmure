@@ -28,10 +28,17 @@
 //!
 //! # What it does not do
 //!
-//! No NAT traversal. Candidates are the addresses this machine can see about
-//! itself, so this reaches a peer on the same network, behind a full-cone NAT,
-//! or with a forwarded port — and fails otherwise, at which point the caller
-//! falls back to Tor. Hole punching is a later step and a much harder one; see
+//! No NAT traversal, and — as built — **no way to be reached from outside the
+//! local network at all**. [`candidates`] advertises only what this machine can
+//! see about itself, which is a private address and loopback; discovering the
+//! public one needs STUN or another third party, and there is none. The port is
+//! ephemeral too, so there is nothing fixed for an operator to forward even if
+//! they wanted to.
+//!
+//! So this reaches a peer on the same network, and otherwise fails and falls
+//! back to Tor. Making a forwarded port usable would take two things that are
+//! not here: a fixed port, and a way for the operator to declare their public
+//! address. Hole punching is a later step again, and a much harder one; see
 //! `aidd_docs/INSTALL.md`.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};

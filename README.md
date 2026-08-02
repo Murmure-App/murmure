@@ -153,9 +153,15 @@ A recipient who wants the file but not the exposure can still take it over Tor.
 If the link cannot be established, both sides are told and it falls back to Tor
 rather than failing.
 
-Two honest limits: there is no NAT traversal, so this reaches a peer on your
-network, behind a full-cone NAT or with a forwarded port, and falls back
-otherwise. And a resumed transfer always uses Tor — the direct stream carries no
+**In practice this means the same local network, and nothing else yet.** You do
+not have to open anything on your router for that — the traffic never leaves the
+LAN. But a peer somewhere else is not reachable either, whatever you forward:
+murmure binds a fresh ephemeral port each time, so there is no fixed port to
+forward, and it only ever advertises private addresses, because discovering your
+public one needs STUN or some other third party and this program has none. A
+remote `--direct` therefore falls back to Tor, every time.
+
+One more limit: a resumed transfer always uses Tor — the direct stream carries no
 offsets, so the two sides would have to agree on one out of band.
 
 ## Files on disk
