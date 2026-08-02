@@ -84,6 +84,23 @@ safelog = "0.9"
 # build recipe that works on all three platforms.
 data-encoding = "2"
 
+# The v2 data plane: a direct QUIC link for file transfer, used only when the
+# operator asks for it by name (`/send --direct`). Tor stays the default and
+# carries everything else — see aidd_docs/INSTALL.md.
+#
+# `ring` rather than `aws-lc-rs` on both of these, for the same reason as
+# rustls above: aws-lc-rs wants cmake and NASM on Windows. Both resolve against
+# the rustls 0.23 arti already pulls, so there is no second TLS stack.
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+] }
+# A self-signed certificate per connection. There is no CA and there is nothing
+# for one to attest: the peer is authenticated by a fingerprint handed over the
+# already-authenticated Tor channel, so the certificate is only a carrier for a
+# public key.
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 rand = "0.8"

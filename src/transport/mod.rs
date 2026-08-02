@@ -6,4 +6,5 @@
 //! it. At this milestone there is one concrete transport and nothing to
 //! abstract over.
 
+pub mod direct;
 pub mod tor;
