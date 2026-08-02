@@ -86,6 +86,30 @@ impl Ended {
     }
 }
 
+/// Which way a file should travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Through the conversation's onion circuit, like everything else. Slow,
+    /// and reveals nothing.
+    Tor,
+    /// Straight to the peer, outside Tor. Fast, and tells them our address —
+    /// so it is only ever reached by asking for it by name.
+    Direct,
+}
+
+/// How a transfer that ran outside Tor ended.
+///
+/// Carried back from the task that owned it, because that task holds the file
+/// and the socket and the loop holds everything else.
+enum DirectDone {
+    /// The bytes went out.
+    Sent(String),
+    /// The bytes came in and are on disk; the loop verifies and renames.
+    Received(Box<Offer>),
+    /// It did not work. The message says why, for the operator.
+    Failed(String),
+}
+
 /// A file going out, and how far it has got.
 struct Sending {
     file: std::fs::File,
@@ -100,6 +124,11 @@ struct Sending {
     size: u64,
     /// Next progress report, in bytes sent.
     next_report: u64,
+    /// Where this file lives, kept so a direct transfer can reopen it in its
+    /// own task rather than moving the handle out from under the chunk pump.
+    path: PathBuf,
+    /// Whether the offer asked for a direct link. The recipient still decides.
+    route: Route,
 }
 
 /// A file coming in, and how far it has got.
@@ -161,6 +190,17 @@ where
     let mut leaving: Option<Ended> = None;
     // False once the keyboard channel has closed for good.
     let mut keyboard_open = true;
+    // True once the reader task has ended and we chose to stay for a direct
+    // transfer. Guards the branch, since polling a finished handle panics.
+    let mut peer_gone = false;
+    // Whether the offer waiting for an answer asked to go outside Tor. Kept
+    // beside `pending` rather than inside `Offer`, because it is a property of
+    // how this one transfer was proposed, not of the file.
+    let mut pending_direct = false;
+    // A transfer running outside Tor lives in its own task: it owns the file
+    // and the socket, and reports back through the channel.
+    let mut direct_task: Option<tokio::task::JoinHandle<()>> = None;
+    let (direct_done_tx, mut direct_done) = mpsc::channel::<DirectDone>(1);
 
     let ended = loop {
         tokio::select! {
@@ -185,7 +225,7 @@ where
             typed = lines.recv(), if keyboard_open => {
                 let Some(line) = typed else {
                     keyboard_open = false;
-                    if !busy(&sending, &receiving) { break Ended::InputClosed }
+                    if !busy(&sending, &receiving, &direct_task) { break Ended::InputClosed }
                     leaving = Some(Ended::InputClosed);
                     continue;
                 };
@@ -195,7 +235,7 @@ where
                     // Both wait for a file rather than truncating it, and both
                     // give up waiting if asked twice.
                     Typed::HangUp(how) => {
-                        if !busy(&sending, &receiving) || leaving.is_some() {
+                        if !busy(&sending, &receiving, &direct_task) || leaving.is_some() {
                             break how;
                         }
                         screen.system(
@@ -210,17 +250,30 @@ where
                         "{verb} is not available during a call — /bye first. \
                          (start a line with // to send a literal slash)"
                     )),
-                    Typed::Send(path) => {
-                        if let Err(e) = start_sending(&path, &mut sending, &outbox, screen).await {
+                    Typed::Send(path, route) => {
+                        if let Err(e) =
+                            start_sending(&path, route, &mut sending, &outbox, screen).await
+                        {
                             screen.error(format!("{e:#}"));
                         }
                     }
                     Typed::Accept => {
-                        if let Err(e) =
-                            accept(incoming_dir, &mut pending, &mut receiving, &outbox, screen).await
+                        let wanted = pending_direct;
+                        if let Err(e) = accept(
+                            incoming_dir,
+                            &mut pending,
+                            &mut receiving,
+                            &mut direct_task,
+                            &direct_done_tx,
+                            wanted,
+                            &outbox,
+                            screen,
+                        )
+                        .await
                         {
                             screen.error(format!("{e:#}"));
                         }
+                        pending_direct = false;
                     }
                     Typed::Refuse => match pending.take() {
                         Some(offer) => {
@@ -250,10 +303,33 @@ where
                 }
             }
 
+            // A transfer that ran outside Tor has finished, one way or another.
+            // Before the inbox, so a peer hanging up straight after cannot take
+            // the outcome down with it.
+            Some(done) = direct_done.recv() => {
+                direct_task = None;
+                match done {
+                    DirectDone::Sent(name) => screen.system(format!("-- sent {name} directly --")),
+                    DirectDone::Received(offer) => {
+                        match files::finish(incoming_dir, &offer) {
+                            Ok(path) => screen.system(format!("-- received {} --", path.display())),
+                            Err(e) => screen.error(format!("{e:#}")),
+                        }
+                    }
+                    // The partial stays on disk, so offering the same file
+                    // again over Tor picks up where this stopped.
+                    DirectDone::Failed(why) => {
+                        screen.error(format!("-- the direct link failed: {why} --"));
+                        screen.system("   the part already received is kept; offer it again to resume over Tor");
+                    }
+                }
+            }
+
             Some(msg) = inbox.recv() => {
                 let outcome = handle(
                     msg, peer, incoming_dir,
-                    &mut pending, &mut receiving, &mut sending,
+                    &mut pending, &mut pending_direct, &mut receiving, &mut sending,
+                    &mut direct_task, &direct_done_tx,
                     &outbox, screen,
                 ).await;
                 match outcome {
@@ -271,9 +347,22 @@ where
 
             // The peer's side of the conversation ended, cleanly or not. Only
             // reached once the inbox above has been drained.
-            outcome = &mut reading => {
+            //
+            // Guarded, because it can now be taken without leaving the loop: a
+            // completed `JoinHandle` polled twice panics.
+            outcome = &mut reading, if !peer_gone => {
                 outcome.map_err(|e| anyhow::anyhow!("the reader task panicked: {e}"))??;
-                break Ended::PeerHungUp;
+                // A direct transfer runs on its own socket, so the peer closing
+                // the *Tor* stream says nothing about it — and the sending side
+                // hangs up as soon as its own half is done, which is normal.
+                // Leaving here would drop the file on the floor with every byte
+                // already on disk.
+                if direct_task.as_ref().is_some_and(|t| !t.is_finished()) {
+                    peer_gone = true;
+                    leaving.get_or_insert(Ended::PeerHungUp);
+                } else {
+                    break Ended::PeerHungUp;
+                }
             }
 
             // Last, and only while a file is going out. `reserve` is ready when
@@ -293,7 +382,7 @@ where
 
         // The transfer that was holding the call open has finished.
         if let Some(end) = leaving
-            && !busy(&sending, &receiving)
+            && !busy(&sending, &receiving, &direct_task)
         {
             break end;
         }
@@ -329,8 +418,16 @@ where
 /// type `/send` then `/bye` is "here, take this, I'm off" — leaving instantly
 /// would cancel the very thing that was just offered. A peer who never answers
 /// would hold the call open, so a second `/bye` leaves regardless.
-fn busy(sending: &Option<Sending>, receiving: &Option<Receiving>) -> bool {
-    sending.is_some() || receiving.is_some()
+fn busy(
+    sending: &Option<Sending>,
+    receiving: &Option<Receiving>,
+    direct_task: &Option<tokio::task::JoinHandle<()>>,
+) -> bool {
+    sending.is_some()
+        || receiving.is_some()
+        // A direct transfer holds no `Sending`/`Receiving` — the task owns the
+        // file — so without this a `/bye` mid-transfer would cut it.
+        || direct_task.as_ref().is_some_and(|t| !t.is_finished())
 }
 
 /// Act on one frame from the peer. `false` means the conversation is over.
@@ -340,8 +437,11 @@ async fn handle(
     peer: &str,
     incoming_dir: &Path,
     pending: &mut Option<Offer>,
+    pending_direct: &mut bool,
     receiving: &mut Option<Receiving>,
     sending: &mut Option<Sending>,
+    direct_task: &mut Option<tokio::task::JoinHandle<()>>,
+    direct_done: &mpsc::Sender<DirectDone>,
     outbox: &mpsc::Sender<Message>,
     screen: &Screen,
 ) -> Result<bool> {
@@ -400,6 +500,7 @@ async fn handle(
             }
             screen.system("   /accept to take it, /refuse to decline");
             *pending = Some(offer);
+            *pending_direct = direct;
         }
 
         Message::FileAccept { offset, direct } => {
@@ -409,13 +510,42 @@ async fn handle(
             if offset > s.size {
                 bail!("{peer} asked to resume past the end of the file");
             }
-            if direct.is_some() {
-                // We never ask for one yet — `start_sending` always offers over
-                // Tor — so a peer answering with addresses is ahead of us.
-                // Ignoring it is safe: the transfer falls through to ordinary
-                // chunks below, which is what they will be reading anyway.
-                screen.system(format!("-- {peer} offered a direct link; not used yet --"));
+            if let Some(d) = direct {
+                if s.route != Route::Direct {
+                    bail!("{peer} answered with a direct link we never asked for");
+                }
+                screen.system(format!("-- {peer} agreed to a direct link; connecting --"));
+                match crate::transport::direct::dial(&d.candidates, d.fingerprint).await {
+                    Ok(stream) => {
+                        // The task takes over the file from here. `sending` is
+                        // cleared so the chunk pump stays out of it — two
+                        // writers on one transfer would interleave.
+                        let s = sending.take().expect("checked just above");
+                        let done = direct_done.clone();
+                        *direct_task = Some(tokio::spawn(async move {
+                            let outcome = match push_direct(s.path, offset, stream).await {
+                                Ok(()) => DirectDone::Sent(s.name),
+                                Err(e) => DirectDone::Failed(format!("{e:#}")),
+                            };
+                            let _ = done.send(outcome).await;
+                        }));
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        // They are sitting on a listening socket waiting for a
+                        // connection that is not coming, and cannot tell that
+                        // from us being slow. Say so, then fall through to the
+                        // ordinary chunk path below.
+                        screen.system(format!("-- could not reach them directly ({e:#}); using Tor --"));
+                        if outbox.send(Message::DirectFailed).await.is_err() {
+                            return Ok(false);
+                        }
+                    }
+                }
             }
+            let Some(s) = sending.as_mut() else {
+                bail!("the transfer went away while answering {peer}");
+            };
             std::io::Seek::seek(&mut s.file, std::io::SeekFrom::Start(offset))
                 .context("seeking to the resume point")?;
             s.accepted = true;
@@ -435,10 +565,12 @@ async fn handle(
         }
 
         Message::DirectFailed => {
-            // Nothing is waiting on a direct link yet — the receiving side is
-            // wired in the next step. Until then this can only arrive from a
-            // peer that is ahead of us, and dropping it is right: the file
-            // follows as ordinary chunks either way.
+            // We are sitting on a listening socket for a connection that is not
+            // coming. Stop waiting, and reopen the partial for chunks — the
+            // file the task would have written is exactly the one we resume.
+            if let Some(task) = direct_task.take() {
+                task.abort();
+            }
             screen.system(format!("-- {peer} could not reach us directly; using Tor --"));
         }
 
@@ -483,6 +615,7 @@ async fn handle(
 /// Offer a file, after checking we can actually read it.
 async fn start_sending(
     path: &Path,
+    route: Route,
     sending: &mut Option<Sending>,
     outbox: &mpsc::Sender<Message>,
     screen: &Screen,
@@ -499,6 +632,12 @@ async fn start_sending(
         offer.name,
         files::human(offer.size)
     ));
+    if route == Route::Direct {
+        // Said on our side too, not just theirs: asking for a direct link
+        // exposes them, and the person doing the asking should see that
+        // spelled out rather than only the person answering.
+        screen.system("   asked for a direct link — they decide, and it shows them your IP");
+    }
     // Held back until the peer accepts: `sent` stays at zero and the pump reads
     // nothing until a FileAccept sets the offset.
     *sending = Some(Sending {
@@ -508,23 +647,113 @@ async fn start_sending(
         sent: 0,
         size: offer.size,
         next_report: PROGRESS_EVERY,
+        path: path.to_path_buf(),
+        route,
     });
     outbox
         .send(Message::FileOffer {
             name: offer.name,
             size: offer.size,
             hash: offer.hash,
-            direct: false,
+            direct: route == Route::Direct,
         })
         .await
         .map_err(|_| anyhow::anyhow!("the conversation ended"))
 }
 
+/// Send a whole file over an open direct stream, from `offset`.
+///
+/// Runs in its own task: it owns the file and the socket for as long as the
+/// transfer lasts, so the conversation loop keeps answering the keyboard at
+/// full speed underneath.
+async fn push_direct(
+    path: PathBuf,
+    offset: u64,
+    mut stream: crate::transport::direct::Link<quinn::SendStream>,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .with_context(|| format!("reopening {}", path.display()))?;
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .context("seeking to the resume point")?;
+
+    let mut buf = vec![0u8; MAX_CHUNK];
+    loop {
+        let n = file.read(&mut buf).await.context("reading the file")?;
+        if n == 0 {
+            break;
+        }
+        stream
+            .write_all(&buf[..n])
+            .await
+            .context("writing to the direct link")?;
+    }
+    // Closes the stream cleanly, which is what tells the far side it has it all.
+    stream.finish().context("closing the direct link")?;
+    // The peer needs the connection to stay up long enough to read what is
+    // still in flight; dropping the endpoint here would reset it.
+    stream.stopped().await.ok();
+    Ok(())
+}
+
+/// Read a whole file off a direct stream into its partial, then hand it back
+/// for verification.
+async fn pull_direct(
+    listener: crate::transport::direct::Listener,
+    incoming_dir: PathBuf,
+    offer: Offer,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut stream = listener.accept().await?;
+    let partial = files::partial_path(&incoming_dir, &offer.hash);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&partial)
+        .await
+        .with_context(|| format!("opening {}", partial.display()))?;
+
+    let mut written = 0u64;
+    let mut buf = vec![0u8; MAX_CHUNK];
+    loop {
+        let n = stream
+            .read(&mut buf)
+            .await
+            .context("reading the direct link")?
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        written += n as u64;
+        if written > offer.size {
+            bail!("the peer sent more than the {} offered", files::human(offer.size));
+        }
+        file.write_all(&buf[..n])
+            .await
+            .context("writing to the partial file")?;
+    }
+    file.flush().await.context("flushing the partial file")?;
+    Ok(())
+}
+
 /// Take the pending offer: open the partial, and tell the peer where to start.
+///
+/// `wanted_direct` is what the offer asked for. Agreeing means opening a port
+/// and naming our addresses, so this is the one place where the recipient's
+/// `/accept` turns into an exposure — and the only place it can, because the
+/// sender has no way to reach us otherwise.
+#[allow(clippy::too_many_arguments)]
 async fn accept(
     incoming_dir: &Path,
     pending: &mut Option<Offer>,
     receiving: &mut Option<Receiving>,
+    direct_task: &mut Option<tokio::task::JoinHandle<()>>,
+    direct_done: &mpsc::Sender<DirectDone>,
+    wanted_direct: bool,
     outbox: &mpsc::Sender<Message>,
     screen: &Screen,
 ) -> Result<()> {
@@ -535,6 +764,48 @@ async fn accept(
         .with_context(|| format!("creating {}", incoming_dir.display()))?;
 
     let offset = files::resume_offset(incoming_dir, &offer.hash, offer.size);
+
+    if wanted_direct {
+        // A resumed direct transfer would have to tell the sender where to
+        // start *and* stream from there; the stream carries no offsets, so the
+        // two would have to agree out of band. Refusing the route rather than
+        // the file keeps that out of the protocol: the partial is still there,
+        // and Tor picks it up where it stopped.
+        if offset > 0 {
+            screen.system("-- resuming, so this one goes over Tor --");
+        } else {
+            match crate::transport::direct::listen() {
+                Ok(listener) => {
+                    let direct = proto::Direct {
+                        candidates: listener.candidates.clone(),
+                        fingerprint: listener.fingerprint,
+                    };
+                    screen.system(format!("-- taking {:?} over a direct link --", offer.name));
+                    let done = direct_done.clone();
+                    let dir = incoming_dir.to_path_buf();
+                    let mine = offer.clone();
+                    *direct_task = Some(tokio::spawn(async move {
+                        let outcome = match pull_direct(listener, dir, mine.clone()).await {
+                            Ok(()) => DirectDone::Received(Box::new(mine)),
+                            Err(e) => DirectDone::Failed(format!("{e:#}")),
+                        };
+                        let _ = done.send(outcome).await;
+                    }));
+                    return outbox
+                        .send(Message::FileAccept {
+                            offset,
+                            direct: Some(direct),
+                        })
+                        .await
+                        .map_err(|_| anyhow::anyhow!("the conversation ended"));
+                }
+                // Not fatal: Tor is underneath, and saying why beats a silent
+                // downgrade on the one path whose whole point is being chosen.
+                Err(e) => screen.system(format!("-- no direct link ({e:#}); using Tor --")),
+            }
+        }
+    }
+
     let partial = files::partial_path(incoming_dir, &offer.hash);
     // Append rather than truncate: `offset` is exactly what is already there,
     // so the peer's first chunk continues the file.
@@ -612,8 +883,8 @@ enum Typed {
     Nothing,
     /// `/bye` or `/quit`, carrying which one it was.
     HangUp(Ended),
-    /// `/send <path>`.
-    Send(PathBuf),
+    /// `/send <path>`, or `/send --direct <path>`.
+    Send(PathBuf, Route),
     /// `/accept`.
     Accept,
     /// `/refuse`.
@@ -655,7 +926,14 @@ fn classify(line: &str) -> Typed {
         "/refuse" => Typed::Refuse,
         // The whole remainder, not the first word: paths have spaces in them,
         // and quoting rules would be one more thing to explain.
-        "/send" if !rest.is_empty() => Typed::Send(PathBuf::from(expand_home(rest))),
+        // The whole remainder is the path, so `--direct` is only a flag when it
+        // is the first word — a file actually called `--direct` still sends.
+        "/send" if !rest.is_empty() => match rest.strip_prefix("--direct") {
+            Some(path) if path.starts_with(char::is_whitespace) => {
+                Typed::Send(PathBuf::from(expand_home(path.trim())), Route::Direct)
+            }
+            _ => Typed::Send(PathBuf::from(expand_home(rest)), Route::Tor),
+        },
         _ => Typed::UnknownCommand(verb.to_owned()),
     }
 }
@@ -708,12 +986,36 @@ mod tests {
         assert_eq!(classify("/refuse"), Typed::Refuse);
         assert_eq!(
             classify("/send /tmp/rapport.pdf"),
-            Typed::Send(PathBuf::from("/tmp/rapport.pdf"))
+            Typed::Send(PathBuf::from("/tmp/rapport.pdf"), Route::Tor)
         );
         // A path with spaces survives, without quoting rules to learn.
         assert_eq!(
             classify("/send /tmp/mes documents/le rapport.pdf"),
-            Typed::Send(PathBuf::from("/tmp/mes documents/le rapport.pdf"))
+            Typed::Send(PathBuf::from("/tmp/mes documents/le rapport.pdf"), Route::Tor)
+        );
+    }
+
+    /// Leaving Tor is never the default, so it takes a word to ask for.
+    #[test]
+    fn only_an_explicit_flag_leaves_tor() {
+        assert_eq!(
+            classify("/send --direct /tmp/gros.pdf"),
+            Typed::Send(PathBuf::from("/tmp/gros.pdf"), Route::Direct)
+        );
+        // The flag is only a flag as the first word: everything after `/send`
+        // is a path, so a file that happens to be named this still sends.
+        assert_eq!(
+            classify("/send /tmp/--direct"),
+            Typed::Send(PathBuf::from("/tmp/--direct"), Route::Tor)
+        );
+        assert_eq!(
+            classify("/send --directory/rapport.pdf"),
+            Typed::Send(PathBuf::from("--directory/rapport.pdf"), Route::Tor)
+        );
+        // A flag with nothing after it is not a transfer.
+        assert_eq!(
+            classify("/send --direct"),
+            Typed::Send(PathBuf::from("--direct"), Route::Tor)
         );
     }
 
@@ -784,7 +1086,13 @@ mod tests {
     /// `already_here` pre-places that many bytes of the payload as a partial,
     /// which is what an interrupted transfer leaves behind and what the resume
     /// path picks up.
-    fn transfer(tag: &str, payload: &[u8], answer: &str, already_here: usize) -> (PathBuf, PathBuf) {
+    fn transfer(
+        tag: &str,
+        payload: &[u8],
+        answer: &str,
+        already_here: usize,
+        route: Route,
+    ) -> (PathBuf, PathBuf) {
         let dir = scratch(tag);
         let (from, to) = (dir.join("out"), dir.join("in"));
         std::fs::create_dir_all(&from).unwrap();
@@ -810,7 +1118,11 @@ mod tests {
             let (a_screen, a_updates) = crate::ui::channel();
             let (b_screen, b_updates) = crate::ui::channel();
 
-            a_tx.send(format!("/send {}", source.display()))
+            let flag = match route {
+                Route::Direct => "--direct ",
+                Route::Tor => "",
+            };
+            a_tx.send(format!("/send {flag}{}", source.display()))
                 .await
                 .unwrap();
 
@@ -863,9 +1175,46 @@ mod tests {
     #[test]
     fn a_file_offered_and_accepted_arrives_intact() {
         let payload: Vec<u8> = (0..MAX_CHUNK * 2 + 777).map(|i| (i % 251) as u8).collect();
-        let (dir, landed) = transfer("transfer", &payload, "/accept", 0);
+        let (dir, landed) = transfer("transfer", &payload, "/accept", 0, Route::Tor);
 
         assert!(landed.exists(), "the file must be in the incoming directory");
+        assert_eq!(std::fs::read(&landed).unwrap(), payload);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole v2 path, on two real conversations: `--direct` is asked for,
+    /// the recipient agrees and opens a port, the bytes cross a QUIC link that
+    /// never touches the Tor stream, and the hash still has to match at the end.
+    #[test]
+    fn a_direct_transfer_arrives_intact() {
+        // Larger than anything the chunk pump would send in one frame, so a
+        // file that arrived over Tor by mistake would not look the same.
+        let payload: Vec<u8> = (0..MAX_CHUNK * 3 + 1234).map(|i| (i % 251) as u8).collect();
+        let (dir, landed) = transfer("direct", &payload, "/accept", 0, Route::Direct);
+
+        assert!(landed.exists(), "the file must land after a direct transfer");
+        assert_eq!(std::fs::read(&landed).unwrap(), payload);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Refusing works the same whichever route was asked for — declining the
+    /// file must not be harder because the sender wanted to go fast.
+    #[test]
+    fn a_direct_offer_can_still_be_refused() {
+        let (dir, landed) = transfer("direct-refuse", b"jamais envoye", "/refuse", 0, Route::Direct);
+        assert!(!landed.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resumed transfer falls back to Tor: the direct stream carries no
+    /// offsets, so the two sides would have to agree on one out of band.
+    #[test]
+    fn a_direct_offer_with_a_partial_on_disk_uses_tor() {
+        let payload: Vec<u8> = (0..MAX_CHUNK + 500).map(|i| (i % 251) as u8).collect();
+        let cut = payload.len() / 2;
+        let (dir, landed) = transfer("direct-resume", &payload, "/accept", cut, Route::Direct);
+
+        assert!(landed.exists(), "the resumed file must still land");
         assert_eq!(std::fs::read(&landed).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -873,7 +1222,7 @@ mod tests {
     /// A refused offer leaves nothing behind.
     #[test]
     fn a_refused_file_is_never_written() {
-        let (dir, landed) = transfer("refuse", b"bonjour tout le monde", "/refuse", 0);
+        let (dir, landed) = transfer("refuse", b"bonjour tout le monde", "/refuse", 0, Route::Tor);
         assert!(!landed.exists());
         assert!(
             std::fs::read_dir(dir.join("in")).is_err(),
@@ -888,7 +1237,7 @@ mod tests {
     fn a_half_received_file_resumes_from_disk() {
         let payload: Vec<u8> = (0..MAX_CHUNK + 500).map(|i| (i % 251) as u8).collect();
         let cut = payload.len() / 2;
-        let (dir, landed) = transfer("resume", &payload, "/accept", cut);
+        let (dir, landed) = transfer("resume", &payload, "/accept", cut, Route::Tor);
 
         assert!(landed.exists(), "the resumed file must land");
         assert_eq!(

@@ -34,11 +34,6 @@
 //! falls back to Tor. Hole punching is a later step and a much harder one; see
 //! `aidd_docs/INSTALL.md`.
 
-// Nothing outside the tests calls this yet: the protocol messages and the
-// consent flow are the next step, and `chat` is what wires it in. This
-// attribute goes away with that, exactly as it did for `proto`.
-#![allow(dead_code)]
-
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 
@@ -112,19 +107,51 @@ pub fn listen() -> Result<Listener> {
     })
 }
 
+/// An open direct link, and everything that has to stay alive for it to work.
+///
+/// quinn closes a connection as soon as its `Connection` is dropped, and tears
+/// the whole thing down when the last `Endpoint` goes — so handing back a bare
+/// stream would give the caller something that dies the moment this function
+/// returns. Small payloads survive that by winning the race against the close;
+/// large ones do not, which is a bug that only shows up on real files.
+pub struct Link<S> {
+    _endpoint: Option<Endpoint>,
+    _connection: quinn::Connection,
+    stream: S,
+}
+
+impl<S> std::ops::Deref for Link<S> {
+    type Target = S;
+    fn deref(&self) -> &S {
+        &self.stream
+    }
+}
+
+impl<S> std::ops::DerefMut for Link<S> {
+    fn deref_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+}
+
 impl Listener {
     /// Wait for the peer, and hand back the stream they open.
-    pub async fn accept(&self) -> Result<RecvStream> {
+    pub async fn accept(&self) -> Result<Link<RecvStream>> {
         let incoming = self
             .endpoint
             .accept()
             .await
             .ok_or_else(|| anyhow!("the QUIC endpoint closed before anyone connected"))?;
         let connection = incoming.await.context("completing the QUIC handshake")?;
-        connection
+        let stream = connection
             .accept_uni()
             .await
-            .context("accepting the file stream")
+            .context("accepting the file stream")?;
+        Ok(Link {
+            // Ours is owned by the `Listener`, which the caller keeps.
+            _endpoint: None,
+            _connection: connection,
+            stream,
+        })
     }
 }
 
@@ -133,7 +160,7 @@ impl Listener {
 /// `fingerprint` is what makes this safe: it arrived over the Tor channel, and
 /// a connection whose certificate does not hash to it is refused during the
 /// handshake, before a byte of the file moves.
-pub async fn dial(candidates: &[SocketAddr], fingerprint: [u8; 32]) -> Result<SendStream> {
+pub async fn dial(candidates: &[SocketAddr], fingerprint: [u8; 32]) -> Result<Link<SendStream>> {
     let mut endpoint =
         Endpoint::client("0.0.0.0:0".parse().expect("literal")).context("binding a QUIC client")?;
     endpoint.set_default_client_config(client_config(fingerprint)?);
@@ -147,10 +174,15 @@ pub async fn dial(candidates: &[SocketAddr], fingerprint: [u8; 32]) -> Result<Se
             let connection = connecting
                 .await
                 .with_context(|| format!("connecting to {address}"))?;
-            connection
+            let stream = connection
                 .open_uni()
                 .await
-                .context("opening the file stream")
+                .context("opening the file stream")?;
+            Ok::<_, anyhow::Error>(Link {
+                _endpoint: Some(endpoint.clone()),
+                _connection: connection,
+                stream,
+            })
         };
         match tokio::time::timeout(DIAL_TIMEOUT, attempt).await {
             Ok(Ok(stream)) => return Ok(stream),
@@ -312,14 +344,19 @@ mod tests {
 
         let receiving = tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("accept");
-            stream.read_to_end(64 * 1024).await.expect("read")
+            stream.read_to_end(1024 * 1024).await.expect("read")
         });
 
+        // Big enough to lose the race against a connection closing early.
+        // With a few bytes this test passed even while `dial` dropped the
+        // connection on the way out, which is the bug it now catches.
+        let payload: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
         let mut out = dial(&candidates, fingerprint).await.expect("dial");
-        out.write_all(b"le contenu du fichier").await.expect("write");
+        out.write_all(&payload).await.expect("write");
         out.finish().expect("finish");
+        out.stopped().await.ok();
 
-        assert_eq!(receiving.await.unwrap(), b"le contenu du fichier");
+        assert_eq!(receiving.await.unwrap(), payload);
     }
 
     /// The fingerprint is the only thing standing between a direct link and
@@ -342,7 +379,10 @@ mod tests {
         let one = [only];
         let (_, dialled) = tokio::join!(listener.accept(), dial(&one, [0u8; 32]));
 
-        let text = format!("{:#}", dialled.expect_err("a wrong fingerprint must not connect"));
+        let text = match dialled {
+            Ok(_) => panic!("a wrong fingerprint must not connect"),
+            Err(e) => format!("{e:#}"),
+        };
         assert!(
             text.contains("fingerprint") || text.contains("crypto") || text.contains("certificate"),
             "expected a certificate refusal, got: {text}"

@@ -134,6 +134,30 @@ again, accept again.
 `/bye` during a transfer waits for the file to finish rather than truncating it.
 A second `/bye` leaves immediately.
 
+### Going faster, on purpose
+
+Over Tor a file crosses six relays, which measures at 0.1–0.25 MB/s: a 2 MB PDF
+takes about half a minute. `/send --direct <path>` asks to send it outside Tor
+instead — on a local network that is roughly a thousand times faster.
+
+**It is never automatic, and never silent.** A direct link tells the other peer
+your IP address, and shows both ISPs that these two addresses are exchanging
+data at this moment — the metadata this whole program exists to hide. So:
+
+- the sender asks for it by name, per file;
+- the recipient sees that the offer is direct, and what agreeing exposes;
+- agreeing is what opens the port — `/accept` over a direct offer is the only
+  place murmure ever reveals an address.
+
+A recipient who wants the file but not the exposure can still take it over Tor.
+If the link cannot be established, both sides are told and it falls back to Tor
+rather than failing.
+
+Two honest limits: there is no NAT traversal, so this reaches a peer on your
+network, behind a full-cone NAT or with a forwarded port, and falls back
+otherwise. And a resumed transfer always uses Tor — the direct stream carries no
+offsets, so the two sides would have to agree on one out of band.
+
 ## Files on disk
 
 Everything lives in `.murmure/` next to where you ran it: the identity seed, the

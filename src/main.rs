@@ -587,6 +587,8 @@ fn help(screen: &Screen) {
         "  /quit                         leave",
         "during a call:",
         "  /send <path>                  offer them a file (or drop one on the window)",
+        "  /send --direct <path>         offer it outside Tor: much faster, but it",
+        "                                shows them your IP. They decide.",
         "  /accept  /refuse              answer an offer of theirs",
         "  /bye                          hang up",
         "keys:",
