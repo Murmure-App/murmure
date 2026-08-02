@@ -600,8 +600,14 @@ async fn handle(
         Message::Post { pieces, direct } => {
             // Rebuilt into one line so the sentence and its files read as what
             // they are — one message — instead of arriving as unrelated events.
-            let mut shown = String::new();
+            let lead = format!("{peer}> ");
+            let mut shown = lead.clone();
             let mut files = Vec::new();
+            let mut chips = Vec::new();
+            // Numbered from where the queue already stands: an earlier message
+            // may still have files waiting, and the numbers on screen are the
+            // ones `/accept N` uses.
+            let mut number = pending.len();
             for piece in pieces {
                 match piece {
                     proto::Piece::Text(t) => {
@@ -611,24 +617,30 @@ async fn handle(
                     }
                     proto::Piece::File(f) => {
                         let name = files::safe_name(&f.name)?;
-                        if !shown.is_empty() && !shown.ends_with(' ') {
+                        if !shown.ends_with(' ') && shown.len() > lead.len() {
                             shown.push(' ');
                         }
+                        number += 1;
+                        // Char offsets, because that is what a mouse click
+                        // resolves to — bytes would land mid-character on any
+                        // accented name.
+                        let start = shown.chars().count();
                         shown.push_str(&format!("[{name}]"));
+                        chips.push((start, shown.chars().count(), number));
                         files.push(proto::FileRef { name, ..f });
                     }
                 }
             }
-            screen.say(Kind::Theirs, format!("{peer}> {}", shown.trim()));
+            screen.say_with_files(Kind::Theirs, shown.trim_end().to_owned(), chips);
 
             for f in files {
                 take_offer(f, direct, peer, incoming_dir, pending, screen)?;
             }
             if !pending.is_empty() {
                 screen.system(format!(
-                    "   /accept to take {}, /refuse to decline{}",
-                    if pending.len() == 1 { "it" } else { "them one by one" },
-                    if pending.len() == 1 { "" } else { " — or /accept 2 for a particular one" },
+                    "   click a file to take it — or /accept to take {}, /refuse to decline{}",
+                    if pending.len() == 1 { "it" } else { "them" },
+                    if pending.len() == 1 { "" } else { ", /accept all for every one" },
                 ));
             }
         }

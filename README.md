@@ -117,7 +117,7 @@ the holiday photos: [beach.jpg] [sunset.jpg] — the second one is better
 ```
 
 Enter sends the sentence and the files as one thing. The other side sees your
-message with the chips in place, and answers file by file: `/accept` takes the
+message with the chips in place and **clicks the one they want**. By keyboard: `/accept` takes the
 first, `/accept 2` picks one, **`/accept all` takes every one**, `/refuse`
 declines. `all` is a standing instruction rather than a batch — the wire carries
 one file at a time regardless, so each one that finishes starts the next. `/send <path>` still offers a

@@ -608,6 +608,7 @@ fn help(screen: &Screen) {
         "  Ctrl-V                        paste (no Shift needed)",
         "  Ctrl-U                        clear the input   Ctrl-C  leave",
         "mouse:",
+        "  click a file in a message     take it, same as /accept <its number>",
         "  drag over the history         select it; releasing copies it",
         "  wheel                         scroll",
         "  Shift-drag                    your terminal's own selection instead",

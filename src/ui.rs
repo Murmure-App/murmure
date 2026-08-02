@@ -72,6 +72,23 @@ pub enum Kind {
 pub struct Entry {
     kind: Kind,
     text: String,
+    /// Where the file chips sit inside [`Self::text`], if any.
+    ///
+    /// Recorded rather than re-parsed: looking for `[...]` in the text would
+    /// find brackets somebody typed, and clicking them would accept a file that
+    /// is not there. The ranges come from whoever built the line and knows.
+    chips: Vec<Chip>,
+}
+
+/// One clickable file inside a history line.
+#[derive(Debug, Clone, Copy)]
+pub struct Chip {
+    /// Char offsets into the entry's text, half-open.
+    start: usize,
+    end: usize,
+    /// Which offer it is, as the operator sees it numbered — so a click can say
+    /// `/accept 2` and mean exactly what typing it would mean.
+    number: usize,
 }
 
 impl Entry {
@@ -118,6 +135,28 @@ impl Screen {
         let _ = self.0.send(Update::Line(Entry {
             kind,
             text: text.into(),
+            chips: Vec::new(),
+        }));
+    }
+
+    /// Put a line on screen whose `[name]` runs are clickable files.
+    ///
+    /// `chips` is `(start, end, number)` in characters. The caller supplies it
+    /// because the caller is the one that built the text and knows which run is
+    /// a file and which is a bracket somebody typed.
+    pub fn say_with_files(
+        &self,
+        kind: Kind,
+        text: impl Into<String>,
+        chips: Vec<(usize, usize, usize)>,
+    ) {
+        let _ = self.0.send(Update::Line(Entry {
+            kind,
+            text: text.into(),
+            chips: chips
+                .into_iter()
+                .map(|(start, end, number)| Chip { start, end, number })
+                .collect(),
         }));
     }
 
@@ -676,7 +715,16 @@ async fn event_loop(
                         }
                     }
                     Some(Ok(Event::Paste(text))) => app.paste(&text),
-                    Some(Ok(Event::Mouse(m))) => handle_mouse(m, &mut app),
+                    Some(Ok(Event::Mouse(m))) => {
+                        // A click on a file becomes the command the operator
+                        // would have typed. The interface's only output stays a
+                        // line, so nothing downstream has to know about mice.
+                        if let Some(command) = handle_mouse(m, &mut app)
+                            && typed.send(Typed::Line(command)).await.is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
                     // A resize just needs a redraw.
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e).context("reading a terminal event"),
@@ -1187,7 +1235,24 @@ fn selected_text(history: &VecDeque<Entry>, sel: Selection) -> Option<String> {
 }
 
 /// React to one mouse event over the history box.
-fn handle_mouse(m: MouseEvent, app: &mut App) {
+/// The file a click landed on, if it landed on one.
+///
+/// Reads the ranges the line was built with rather than looking for brackets in
+/// the text: somebody who types `[non]` in a message must not have it act like
+/// a file.
+fn chip_at(app: &App, column: u16, row: u16) -> Option<usize> {
+    let a = anchor_at(app, column, row)?;
+    let entry = app.history.get(a.entry)?;
+    entry
+        .chips
+        .iter()
+        .find(|c| a.offset >= c.start && a.offset < c.end)
+        .map(|c| c.number)
+}
+
+/// React to one mouse event. Returns a command to run, when the click was on
+/// something that acts.
+fn handle_mouse(m: MouseEvent, app: &mut App) -> Option<String> {
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             app.dragging = false;
@@ -1197,9 +1262,7 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
             });
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            let Some(anchor) = anchor_at(app, m.column, m.row) else {
-                return;
-            };
+            let anchor = anchor_at(app, m.column, m.row)?;
             match app.selection.as_mut() {
                 Some(sel) => sel.current = anchor,
                 // A `Down` was missed (some terminals send a bare `Drag` for
@@ -1209,6 +1272,16 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
             app.dragging = true;
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            // A click on a file takes it. Checked before the selection is
+            // cleared, and only for a click — dragging *across* a chip is
+            // somebody selecting text that happens to contain one.
+            if !app.dragging
+                && let Some(number) = chip_at(app, m.column, m.row)
+            {
+                app.selection = None;
+                app.dragging = false;
+                return Some(format!("/accept {number}"));
+            }
             match app.selection {
                 // Pressed and released with no movement: a plain click,
                 // clearing whatever was highlighted before rather than leaving
@@ -1231,6 +1304,7 @@ fn handle_mouse(m: MouseEvent, app: &mut App) {
         MouseEventKind::ScrollDown => app.scroll(-(WHEEL_STEP as isize)),
         _ => {}
     }
+    None
 }
 
 fn style_for(kind: Kind) -> Style {
@@ -1250,6 +1324,7 @@ mod tests {
         Entry {
             kind: Kind::System,
             text: text.to_owned(),
+            chips: Vec::new(),
         }
     }
 
@@ -1536,7 +1611,7 @@ mod tests {
     }
 
     fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
-        handle_mouse(
+        let _ = handle_mouse(
             MouseEvent {
                 kind,
                 column,
@@ -1554,6 +1629,90 @@ mod tests {
     }
     fn release(app: &mut App, c: u16, r: u16) {
         mouse(app, MouseEventKind::Up(MouseButton::Left), c, r);
+    }
+    /// Like `release`, but keeps what the click asked for.
+    fn mouse_up(app: &mut App, c: u16, r: u16) -> Option<String> {
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: c,
+                row: r,
+                modifiers: KeyModifiers::NONE,
+            },
+            app,
+        )
+    }
+
+
+    /// A click on a file chip becomes exactly the command typing it would.
+    #[test]
+    fn clicking_a_file_accepts_that_one() {
+        let mut app = App::new("t".into());
+        app.body_origin = (0, 0);
+        app.viewport = (60, 6);
+        // "alice> voici [a.png] et [b.png]" with the two ranges recorded.
+        //        0123456789...
+        let text = "alice> voici [a.png] et [b.png]".to_owned();
+        let a = text.find("[a.png]").unwrap();
+        let b = text.find("[b.png]").unwrap();
+        app.push(Entry {
+            kind: Kind::Theirs,
+            text,
+            chips: vec![
+                Chip { start: a, end: a + 7, number: 1 },
+                Chip { start: b, end: b + 7, number: 2 },
+            ],
+        });
+        app.rows = visible_rows(&app.history, 60, 6, 0);
+
+        // On the first chip.
+        assert_eq!(chip_at(&app, a as u16 + 1, 0), Some(1));
+        // On the second.
+        assert_eq!(chip_at(&app, b as u16 + 2, 0), Some(2));
+        // On the words between them, and on the name at the start.
+        assert_eq!(chip_at(&app, (a + 8) as u16, 0), None);
+        assert_eq!(chip_at(&app, 2, 0), None);
+
+        // A press and release on a chip yields the command, and leaves no
+        // selection behind.
+        press(&mut app, a as u16 + 1, 0);
+        let acted = mouse_up(&mut app, a as u16 + 1, 0);
+        assert_eq!(acted.as_deref(), Some("/accept 1"));
+        assert!(app.selection.is_none());
+    }
+
+    /// Dragging across a chip is somebody selecting text, not clicking a file.
+    #[test]
+    fn dragging_over_a_file_selects_instead_of_taking_it() {
+        let mut app = App::new("t".into());
+        app.body_origin = (0, 0);
+        app.viewport = (60, 6);
+        let text = "voici [a.png] la".to_owned();
+        app.push(Entry {
+            kind: Kind::Theirs,
+            text,
+            chips: vec![Chip { start: 6, end: 13, number: 1 }],
+        });
+        app.rows = visible_rows(&app.history, 60, 6, 0);
+
+        press(&mut app, 0, 0);
+        drag(&mut app, 16, 0);
+        let acted = mouse_up(&mut app, 16, 0);
+        assert_eq!(acted, None, "a drag must not take a file");
+        assert!(app.flash.is_some(), "it copies, like any other selection");
+    }
+
+    /// Brackets somebody typed are not files.
+    #[test]
+    fn typed_brackets_are_not_clickable() {
+        let mut app = App::new("t".into());
+        app.body_origin = (0, 0);
+        app.viewport = (60, 6);
+        app.push(entry("regarde [ce truc] la"));
+        app.rows = visible_rows(&app.history, 60, 6, 0);
+        for column in 0..20u16 {
+            assert_eq!(chip_at(&app, column, 0), None, "column {column}");
+        }
     }
 
     /// A copy that produced no confirmation is indistinguishable from a copy
