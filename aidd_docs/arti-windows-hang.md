@@ -117,6 +117,17 @@ source ("We expect to be providing official binaries soon"), this is the first
 wall a Windows newcomer hits. Enabling `static-sqlite` by default on
 `cfg(windows)` would remove it.
 
+## Searched for duplicates first
+
+Checked on 2026-08-02 against all issues, open and closed. Nothing matches. The
+three nearest, and why they are not this:
+
+| Issue | Why it is different |
+| --- | --- |
+| #2091 *Unable to bootstrap with cleared state and cache* | Linux, and it produces a real error (`Partial response`); the client retries and gets there. Here there is no error at all — the client goes silent mid-download and stays that way. |
+| #1171 *100% consumption of ALL cores* | All cores. Here it is exactly one, which is what points at a single task looping rather than at load. |
+| #482 *spent 100 iterations in the same state* | Ends in a panic, so it says something. This never does. |
+
 ## Note on platform support
 
 Windows appears to be treated as supported: `crates/arti/README.md` documents a
@@ -124,6 +135,11 @@ Windows configuration path alongside Unix and macOS, and the troubleshooting
 guide names `schannel` as the Windows TLS backend. We could not find a support
 tier or a published CI platform matrix, so if Windows is in fact best-effort,
 saying so in the README would save people time.
+
+This may be the reason a bootstrap that never completes could go unnoticed:
+**#450, *Test Windows behavior on CI, maybe with Wine*, has been open since
+April 2022** (Priority::Medium). If nothing runs on Windows in CI, nothing
+would catch this.
 
 ## Not yet investigated
 
