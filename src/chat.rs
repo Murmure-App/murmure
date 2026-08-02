@@ -981,8 +981,9 @@ async fn post(
     screen.say(Kind::Mine, format!("you> {}", shown.trim()));
     if !fresh.is_empty() {
         screen.system(format!(
-            "-- offered {} file(s); waiting for them to accept --",
-            fresh.len()
+            "-- offered {} file{}; waiting for them to accept --",
+            fresh.len(),
+            if fresh.len() == 1 { "" } else { "s" }
         ));
     }
     offered.extend(fresh);

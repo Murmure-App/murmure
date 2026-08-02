@@ -151,14 +151,21 @@ async fn run(run_dir: &Path) -> Result<()> {
     ));
 
     screen.system(format!(
-        "identity {}, {} contact(s)",
+        "identity {}, {} contact{}",
         if existed { "loaded" } else { "generated" },
-        book.len()
+        book.len(),
+        if book.len() == 1 { "" } else { "s" }
     ));
     screen.system(format!("your address: {my_address}"));
     screen.system(format!("your key:     {}", identity.discovery_key()));
     screen.system("give a friend both lines, and compare the fingerprint out loud.");
-    help(&screen);
+    // The full list is forty lines. Worth it once, when there is nothing else
+    // to go on; noise every morning after that.
+    if existed {
+        screen.system("/help lists the commands.");
+    } else {
+        help(&screen);
+    }
 
     // ---- publish ---------------------------------------------------------
     //
@@ -243,7 +250,11 @@ async fn serve(
         stage(
             screen,
             started,
-            &format!("restricted to {} authorised contact(s)", clients.len()),
+            &format!(
+                "only your {} contact{} can see you are running",
+                clients.len(),
+                if clients.len() == 1 { "" } else { "s" }
+            ),
         );
     }
 
@@ -255,7 +266,12 @@ async fn serve(
     if published != expected {
         bail!(identity_mismatch(run_dir, seed_path, &published, &expected));
     }
-    stage(screen, started, "published under our own key");
+    // Not on screen: the operator cannot act on it, and it only ever says the
+    // same thing — the alternative is a hard failure a few lines above.
+    tracing::info!(
+        "[{:.1}s] published under our own key",
+        started.elapsed().as_secs_f32()
+    );
 
     screen.status("publishing to the directory");
     if tor::wait_until_reachable(&service, REACHABLE_TIMEOUT)
@@ -263,11 +279,7 @@ async fn serve(
         .is_err()
     {
         // Under-reports; an incoming connection is the real test.
-        stage(
-            screen,
-            started,
-            "reachability unconfirmed (arti under-reports); listening anyway",
-        );
+        stage(screen, started, "listening (Tor never confirmed it, which is normal)");
     }
 
     screen.status("listening");
@@ -545,7 +557,20 @@ async fn call(
     // the peer as messages the moment the call connects — which is how a
     // `/add <name> <address>` ends up sent to whoever answered.
     let dialling = tor::dial_retrying(live.client, hs_id, DIAL_TIMEOUT, |attempt, err| {
-        stage(screen, started, &format!("attempt {attempt} failed: {err}"))
+        {
+            // arti's chain is four nested sentences that repeat themselves and
+            // name a truncated address. All of it means one thing, and the log
+            // keeps the original for the day it means something else.
+            tracing::info!("dial attempt {attempt} failed: {err}");
+            let why = if err.contains("descriptor") {
+                "they are not published yet"
+            } else if err.contains("timed out") || err.contains("Timeout") {
+                "no answer yet"
+            } else {
+                "did not connect"
+            };
+            stage(screen, started, &format!("attempt {attempt}: {why}, retrying"));
+        }
     });
     futures::pin_mut!(dialling);
 
@@ -648,6 +673,12 @@ fn run_dir() -> PathBuf {
 }
 
 /// A timestamped stage marker, so a 90-second wait never looks frozen.
+/// Say a startup stage on screen, and keep the stopwatch for the log.
+///
+/// The timing is instrumentation: it is what tells *me* whether a bootstrap was
+/// slow, and it tells the operator nothing they can act on. It goes to
+/// `murmure.log`, where looking for it is a deliberate act.
 fn stage(screen: &Screen, started: Instant, what: &str) {
-    screen.system(format!("[{:>5.1}s] {what}", started.elapsed().as_secs_f32()));
+    tracing::info!("[{:.1}s] {what}", started.elapsed().as_secs_f32());
+    screen.system(what);
 }
