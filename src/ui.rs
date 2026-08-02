@@ -258,6 +258,38 @@ impl Selection {
     }
 }
 
+
+/// Strip a leading route request off a run of typed text.
+///
+/// Returns what is left, and whether the direct link was asked for. Only the
+/// *first* run counts, so `/direct` in the middle of a sentence stays a word.
+///
+/// `//` escapes it, the same convention a command line already uses: `//direct`
+/// sends the literal text.
+fn route_prefix(text: &str, first_run: bool) -> (&str, bool) {
+    if !first_run {
+        return (text, false);
+    }
+    if text.starts_with("//") {
+        // One slash is consumed, not both: `//direct` means the literal
+        // `/direct`. Slicing at 1 is safe — `/` is one ASCII byte.
+        return (&text[1..], false);
+    }
+    for verb in ["/direct", "/send --direct"] {
+        if let Some(rest) = text.strip_prefix(verb)
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            return (rest.trim(), true);
+        }
+    }
+    // The bare verb means nothing now that a file rides the message; dropping
+    // it keeps "/send" out of what the other person reads.
+    if text == "/send" {
+        return ("", false);
+    }
+    (text, false)
+}
+
 /// What the interface hands to the rest of the program when Enter is pressed.
 ///
 /// Not a bare `String` any more, and that is the whole point of files living
@@ -558,9 +590,11 @@ impl App {
         // one `Text` piece; a file ends the run it was dropped into.
         let mut parts: Vec<Part> = Vec::new();
         let mut run = String::new();
-        // `/send --direct` typed before dropping is how the route is asked for;
-        // the verb itself means nothing now that the file rides the message.
+        // How the route is asked for. Per message, never sticky: a mode that
+        // stays on is a mode somebody forgets is on, and this one exposes an IP
+        // address. Typing it every time is the point.
         let mut direct = false;
+        let mut first_run = true;
         for item in &items {
             match item {
                 Item::Char(c) => run.push(*c),
@@ -569,10 +603,10 @@ impl App {
                     // this, and it now means nothing — the file rides the
                     // message. Dropping the verb here keeps it out of the text
                     // rather than sending "\send" to the other person.
-                    let kept = run.trim();
-                    if kept == "/send --direct" {
-                        direct = true;
-                    } else if !kept.is_empty() && kept != "/send" {
+                    let (kept, asked) = route_prefix(run.trim(), first_run);
+                    direct |= asked;
+                    first_run = false;
+                    if !kept.is_empty() {
                         parts.push(Part::Text(kept.to_owned()));
                     }
                     run.clear();
@@ -580,10 +614,9 @@ impl App {
                 }
             }
         }
-        let tail = run.trim();
-        if tail == "/send --direct" {
-            direct = true;
-        } else if !tail.is_empty() && tail != "/send" {
+        let (tail, asked) = route_prefix(run.trim(), first_run);
+        direct |= asked;
+        if !tail.is_empty() {
             parts.push(Part::Text(tail.to_owned()));
         }
         vec![Typed::Post { parts, direct }]
@@ -1544,6 +1577,62 @@ mod tests {
                 direct: true,
             }],
             "the route asked for must survive"
+        );
+    }
+
+
+    /// The gap this closes: asking for a direct link *and* writing a message.
+    /// Before, `--direct` was only recognised as a bare `/send --direct`, so
+    /// the two were mutually exclusive.
+    #[test]
+    fn a_message_can_ask_for_the_direct_route() {
+        let mut app = typed("/direct tiens les photos :");
+        app.attach(PathBuf::from("/tmp/a.jpg"));
+        app.attach(PathBuf::from("/tmp/b.jpg"));
+
+        assert_eq!(
+            app.submit(),
+            vec![Typed::Post {
+                parts: vec![
+                    Part::Text("tiens les photos :".into()),
+                    Part::File(PathBuf::from("/tmp/a.jpg")),
+                    Part::File(PathBuf::from("/tmp/b.jpg")),
+                ],
+                direct: true,
+            }],
+            "the sentence survives and the route is asked for"
+        );
+    }
+
+    /// The word only counts at the very start, and `//` escapes it — the same
+    /// convention the command line already uses.
+    #[test]
+    fn the_route_word_is_only_a_verb_at_the_start() {
+        let mut app = typed("va voir /direct dans le manuel");
+        app.attach(PathBuf::from("/tmp/a.jpg"));
+        assert_eq!(
+            app.submit(),
+            vec![Typed::Post {
+                parts: vec![
+                    Part::Text("va voir /direct dans le manuel".into()),
+                    Part::File(PathBuf::from("/tmp/a.jpg")),
+                ],
+                direct: false,
+            }]
+        );
+
+        let mut app = typed("//direct est la commande");
+        app.attach(PathBuf::from("/tmp/a.jpg"));
+        assert_eq!(
+            app.submit(),
+            vec![Typed::Post {
+                parts: vec![
+                    Part::Text("/direct est la commande".into()),
+                    Part::File(PathBuf::from("/tmp/a.jpg")),
+                ],
+                direct: false,
+            }],
+            "// sends the literal word"
         );
     }
 

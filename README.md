@@ -146,14 +146,15 @@ A second `/bye` leaves immediately.
 ### Going faster, on purpose
 
 Over Tor a file crosses six relays, which measures at 0.1–0.25 MB/s: a 2 MB PDF
-takes about half a minute. `/send --direct <path>` asks to send it outside Tor
-instead — on a local network that is roughly a thousand times faster.
+takes about half a minute. Starting a line with **`/direct`** asks to send that
+message's files outside Tor instead — on a local network that is roughly a thousand times faster.
 
 **It is never automatic, and never silent.** A direct link tells the other peer
 your IP address, and shows both ISPs that these two addresses are exchanging
 data at this moment — the metadata this whole program exists to hide. So:
 
-- the sender asks for it by name, per file;
+- the sender asks for it by name, per message — `/direct here they are: [a.jpg]`
+  — and never through a mode that stays on and gets forgotten;
 - the recipient sees that the offer is direct, and what agreeing exposes;
 - agreeing is what opens the port — `/accept` over a direct offer is the only
   place murmure ever reveals an address.
