@@ -132,7 +132,18 @@ struct Sending {
 }
 
 /// A file a peer put in a message, waiting for our answer.
+#[derive(Debug)]
 struct Offered {
+    /// The number shown on screen. Assigned when the offer arrives and never
+    /// reused, so `/accept 3` always means the thing that was drawn as `[3]`.
+    ///
+    /// Not a position in this list: taking one shifts every position after it,
+    /// which made `/accept 3` say "there is no file 3" once `/accept 2` had
+    /// been used — while `[3]` was still on screen.
+    number: usize,
+    /// Which message it arrived in. `/accept` with no number takes from the
+    /// newest, because that is the one the operator has just read.
+    batch: usize,
     offer: Offer,
     /// Whether the sender asked for it to travel outside Tor. A property of how
     /// this transfer was proposed, not of the file.
@@ -178,17 +189,38 @@ impl Which {
     }
 }
 
-/// Take one offer out of the queue: the numbered one, or the oldest.
+/// Take one offer out of the queue.
 ///
-/// Numbers are what the operator sees on screen, so they start at 1.
+/// A bare `/accept` takes from the **newest** message, earliest file first.
+/// Taking the globally oldest is what a queue does, and it surprised everyone:
+/// you type `/accept` right after reading a message, and you mean the thing you
+/// just read — not something you left unanswered ten minutes ago.
 fn take_pending(pending: &mut Vec<Offered>, which: Which) -> Result<Offered> {
     if pending.is_empty() {
         bail!("nothing to answer");
     }
     let index = match which {
-        Which::Oldest | Which::All => 0,
-        Which::Numbered(n) if n >= 1 && n <= pending.len() => n - 1,
-        Which::Numbered(n) => bail!("there is no file {n}; there are {}", pending.len()),
+        Which::Oldest | Which::All => {
+            let newest = pending.iter().map(|o| o.batch).max().expect("not empty");
+            pending
+                .iter()
+                .position(|o| o.batch == newest)
+                .expect("the max came from this list")
+        }
+        Which::Numbered(n) => pending
+            .iter()
+            .position(|o| o.number == n)
+            .ok_or_else(|| match pending.len() {
+                1 => anyhow::anyhow!("there is no file {n}; only [{}] is waiting", pending[0].number),
+                _ => anyhow::anyhow!(
+                    "there is no file {n}; waiting: {}",
+                    pending
+                        .iter()
+                        .map(|o| format!("[{}]", o.number))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            })?,
     };
     Ok(pending.remove(index))
 }
@@ -256,6 +288,10 @@ where
     // operator asked, so taking them all is a standing instruction: each
     // transfer that finishes starts the next one still queued.
     let mut take_everything = false;
+    // Numbers shown on screen, and which message a file arrived in. Both only
+    // ever go up: a number that is reused is a number that means two things.
+    let mut next_number = 0usize;
+    let mut next_batch = 0usize;
     // Set once the operator has asked to leave but a transfer is still running.
     // Ending the call there would truncate a file mid-flight, and the recipient
     // would have no way to tell that from a network drop.
@@ -427,7 +463,8 @@ where
             Some(msg) = inbox.recv() => {
                 let outcome = handle(
                     msg, peer, incoming_dir,
-                    &mut pending, &mut receiving, &mut sending, &mut offered,
+                    &mut pending, &mut next_number, &mut next_batch,
+                    &mut receiving, &mut sending, &mut offered,
                     &mut direct_task, &direct_done_tx,
                     &outbox, screen,
                 ).await;
@@ -563,6 +600,8 @@ async fn handle(
     peer: &str,
     incoming_dir: &Path,
     pending: &mut Vec<Offered>,
+    next_number: &mut usize,
+    next_batch: &mut usize,
     receiving: &mut Option<Receiving>,
     sending: &mut Option<Sending>,
     offered: &mut Vec<Outgoing>,
@@ -591,9 +630,11 @@ async fn handle(
         // carrying exactly one file and no text.
         Message::FileOffer { name, size, hash, direct } => {
             screen.system(format!("-- {peer} offers a file --"));
+            *next_batch += 1;
+            *next_number += 1;
             take_offer(
                 proto::FileRef { name, size, hash },
-                direct, peer, incoming_dir, pending, screen,
+                direct, *next_number, *next_batch, peer, incoming_dir, pending, screen,
             )?;
         }
 
@@ -604,10 +645,7 @@ async fn handle(
             let mut shown = lead.clone();
             let mut files = Vec::new();
             let mut chips = Vec::new();
-            // Numbered from where the queue already stands: an earlier message
-            // may still have files waiting, and the numbers on screen are the
-            // ones `/accept N` uses.
-            let mut number = pending.len();
+            *next_batch += 1;
             for piece in pieces {
                 match piece {
                     proto::Piece::Text(t) => {
@@ -620,21 +658,21 @@ async fn handle(
                         if !shown.ends_with(' ') && shown.len() > lead.len() {
                             shown.push(' ');
                         }
-                        number += 1;
+                        *next_number += 1;
                         // Char offsets, because that is what a mouse click
                         // resolves to — bytes would land mid-character on any
                         // accented name.
                         let start = shown.chars().count();
                         shown.push_str(&format!("[{name}]"));
-                        chips.push((start, shown.chars().count(), number));
-                        files.push(proto::FileRef { name, ..f });
+                        chips.push((start, shown.chars().count(), *next_number));
+                        files.push((*next_number, proto::FileRef { name, ..f }));
                     }
                 }
             }
             screen.say_with_files(Kind::Theirs, shown.trim_end().to_owned(), chips);
 
-            for f in files {
-                take_offer(f, direct, peer, incoming_dir, pending, screen)?;
+            for (number, f) in files {
+                take_offer(f, direct, number, *next_batch, peer, incoming_dir, pending, screen)?;
             }
             if !pending.is_empty() {
                 screen.system(format!(
@@ -784,9 +822,12 @@ async fn handle(
 
 
 /// Queue one offered file, after checking it is one we would take.
+#[allow(clippy::too_many_arguments)]
 fn take_offer(
     f: proto::FileRef,
     direct: bool,
+    number: usize,
+    batch: usize,
     peer: &str,
     incoming_dir: &Path,
     pending: &mut Vec<Offered>,
@@ -799,9 +840,8 @@ fn take_offer(
     let offer = Offer { name, size: f.size, hash: f.hash };
     let resume = files::resume_offset(incoming_dir, &offer.hash, offer.size);
 
-    let n = pending.len() + 1;
     screen.system(format!(
-        "   [{n}] {:?} ({}){}",
+        "   [{number}] {:?} ({}){}",
         offer.name,
         files::human(offer.size),
         match resume {
@@ -815,7 +855,7 @@ fn take_offer(
         // data. The number above is what turns that into a per-file choice.
         screen.system("       asked to go outside Tor — faster, shows them your IP");
     }
-    pending.push(Offered { offer, direct });
+    pending.push(Offered { number, batch, offer, direct });
     Ok(())
 }
 
@@ -1665,6 +1705,60 @@ mod tests {
         assert_eq!(std::fs::read(to.join("deux.bin")).unwrap(), vec![2u8; 6000]);
         assert_eq!(std::fs::read(to.join("trois.bin")).unwrap(), vec![3u8; 8000]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    fn offered_file(number: usize, batch: usize, name: &str) -> Offered {
+        Offered {
+            number,
+            batch,
+            offer: Offer { name: name.into(), size: 10, hash: [number as u8; 32] },
+            direct: false,
+        }
+    }
+
+    /// A bare `/accept` means the message you just read, not the one you left
+    /// unanswered ten minutes ago.
+    #[test]
+    fn a_bare_accept_takes_the_newest_message() {
+        let mut pending = vec![
+            offered_file(1, 1, "vieux.jpg"),
+            offered_file(2, 2, "recent_a.jpg"),
+            offered_file(3, 2, "recent_b.jpg"),
+        ];
+
+        // The newest message, and within it the first file.
+        assert_eq!(take_pending(&mut pending, Which::Oldest).unwrap().offer.name, "recent_a.jpg");
+        assert_eq!(take_pending(&mut pending, Which::Oldest).unwrap().offer.name, "recent_b.jpg");
+        // Only then the one left over from before.
+        assert_eq!(take_pending(&mut pending, Which::Oldest).unwrap().offer.name, "vieux.jpg");
+        assert!(take_pending(&mut pending, Which::Oldest).is_err());
+    }
+
+    /// The bug behind the visible one: numbers were positions, so taking one
+    /// renumbered the rest and `[3]` stopped meaning what was on screen.
+    #[test]
+    fn a_number_keeps_meaning_what_was_drawn() {
+        let mut pending = vec![
+            offered_file(1, 1, "a.jpg"),
+            offered_file(2, 1, "b.jpg"),
+            offered_file(3, 1, "c.jpg"),
+        ];
+
+        assert_eq!(take_pending(&mut pending, Which::Numbered(2)).unwrap().offer.name, "b.jpg");
+        // [3] is still on screen, so it must still be [3].
+        assert_eq!(take_pending(&mut pending, Which::Numbered(3)).unwrap().offer.name, "c.jpg");
+        assert_eq!(take_pending(&mut pending, Which::Numbered(1)).unwrap().offer.name, "a.jpg");
+    }
+
+    /// A number nobody is waiting on says which ones are.
+    #[test]
+    fn an_unknown_number_lists_what_is_waiting() {
+        let mut pending = vec![offered_file(4, 1, "a.jpg"), offered_file(7, 2, "b.jpg")];
+        let err = take_pending(&mut pending, Which::Numbered(2)).unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("[4]") && text.contains("[7]"), "{text}");
+        assert_eq!(pending.len(), 2, "a bad number takes nothing");
     }
 
     /// A refused offer leaves nothing behind.
