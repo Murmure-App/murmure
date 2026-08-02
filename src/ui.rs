@@ -455,10 +455,10 @@ impl App {
         let items = std::mem::take(&mut self.items);
         self.cursor = 0;
 
-        let mut lines: Vec<String> = items
+        let files: Vec<&PathBuf> = items
             .iter()
             .filter_map(|i| match i {
-                Item::File(p) => Some(format!("/send {}", p.display())),
+                Item::File(p) => Some(p),
                 Item::Char(_) => None,
             })
             .collect();
@@ -470,12 +470,30 @@ impl App {
                 Item::File(_) => None,
             })
             .collect();
+        let text = text.trim();
+
         // Typing `/send` and *then* dropping a file is the obvious way to try
-        // it. The chips already carry the whole command, so the bare verb left
-        // over would only produce "usage: /send <path>" after the file went.
-        let redundant = !lines.is_empty() && text.trim() == "/send";
-        if !text.trim().is_empty() && !redundant {
-            lines.push(text.trim().to_owned());
+        // it, and the chips already carry the path. What is left over must not
+        // be sent as a second command: on its own it would only produce a usage
+        // error, and with `--direct` it would arrive as a *second* transfer
+        // while the chip's is already running — "already sending a file".
+        //
+        // The flag has to be carried over rather than dropped, which is the
+        // part that was wrong: the file went out over Tor while the operator
+        // had asked for a direct link and been told nothing.
+        let carried = match text {
+            "/send" => Some(""),
+            "/send --direct" => Some("--direct "),
+            _ => None,
+        };
+        let route = carried.filter(|_| !files.is_empty());
+
+        let mut lines: Vec<String> = files
+            .iter()
+            .map(|p| format!("/send {}{}", route.unwrap_or(""), p.display()))
+            .collect();
+        if !text.is_empty() && route.is_none() {
+            lines.push(text.to_owned());
         }
         lines
     }
@@ -1365,6 +1383,39 @@ mod tests {
 
         assert_eq!(app.input_display(), "/send [image.JPG]");
         assert_eq!(app.submit(), vec!["/send /tmp/image.JPG".to_owned()]);
+    }
+
+    /// The bug this fixes: typing `/send --direct` and dropping a file sent the
+    /// file over Tor — the flag was dropped in silence — and then delivered the
+    /// leftover verb as a second command, which collided with the transfer the
+    /// chip had just started ("already sending a file; one at a time").
+    #[test]
+    fn a_dropped_file_keeps_the_direct_flag_that_was_typed() {
+        let mut app = typed("/send --direct");
+        app.attach(PathBuf::from("/tmp/gros.pdf"));
+
+        assert_eq!(app.input_display(), "/send --direct [gros.pdf]");
+        assert_eq!(
+            app.submit(),
+            vec!["/send --direct /tmp/gros.pdf".to_owned()],
+            "one command, and it must still be the direct one"
+        );
+    }
+
+    /// The flag is only carried when the typed text is *nothing but* the verb.
+    /// A real message that happens to mention it stays a message.
+    #[test]
+    fn a_message_is_not_mistaken_for_a_send_command() {
+        let mut app = typed("regarde /send --direct c'est pratique");
+        app.attach(PathBuf::from("/tmp/note.txt"));
+
+        assert_eq!(
+            app.submit(),
+            vec![
+                "/send /tmp/note.txt".to_owned(),
+                "regarde /send --direct c'est pratique".to_owned(),
+            ]
+        );
     }
 
     /// A pasted paragraph is one line, not several submissions.
