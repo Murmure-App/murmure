@@ -66,6 +66,26 @@ const ALPN: &[u8] = b"murmure-file/1";
 /// underneath, so giving up early costs a fallback, not a failure.
 pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Port the direct link listens on by default.
+///
+/// Fixed rather than ephemeral, and that is the whole point: a router's
+/// firewall allows a *named* port, so a port that changes every transfer is one
+/// nobody can ever allow through. UDP, because QUIC is UDP — a rule written for
+/// TCP will not match.
+///
+/// `MURMURE_DIRECT_PORT` overrides it. A port already taken falls back to an
+/// ephemeral one rather than failing: a second instance on one machine (see
+/// `MURMURE_DIR`) has to keep working, it just cannot also be the reachable one.
+pub const DEFAULT_PORT: u16 = 49777;
+
+/// The port to listen on, from the environment or [`DEFAULT_PORT`].
+fn wanted_port() -> u16 {
+    std::env::var("MURMURE_DIRECT_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
+
 /// A listener waiting for the peer to connect, and what the peer needs to
 /// reach it.
 pub struct Listener {
@@ -109,11 +129,24 @@ pub fn listen() -> Result<Listener> {
     // families: an IPv4-only socket cannot be reached at an IPv6 address, and
     // IPv6 is the only candidate that works between two different networks.
     // Falls back to IPv4 on a machine with the v6 stack switched off.
-    let endpoint = match Endpoint::server(server.clone(), "[::]:0".parse().expect("literal")) {
-        Ok(e) => e,
-        Err(_) => Endpoint::server(server, "0.0.0.0:0".parse().expect("literal"))
-            .context("binding the QUIC endpoint")?,
-    };
+    // Tried in order: the fixed port on both families, then an ephemeral one.
+    // The first is what a firewall rule can name; the last is what keeps a
+    // second instance on the same machine running.
+    let wanted = wanted_port();
+    let mut endpoint = None;
+    for address in [
+        format!("[::]:{wanted}"),
+        format!("0.0.0.0:{wanted}"),
+        "[::]:0".to_owned(),
+        "0.0.0.0:0".to_owned(),
+    ] {
+        let Ok(address) = address.parse() else { continue };
+        if let Ok(bound) = Endpoint::server(server.clone(), address) {
+            endpoint = Some(bound);
+            break;
+        }
+    }
+    let endpoint = endpoint.context("binding the QUIC endpoint")?;
     let port = endpoint
         .local_addr()
         .context("reading the bound port")?
@@ -480,6 +513,24 @@ mod tests {
         assert_eq!(receiving.await.unwrap(), b"par IPv6");
     }
 
+    /// A firewall rule names a port, so the port has to be nameable — and a
+    /// second instance on the same machine still has to start.
+    #[tokio::test]
+    async fn a_taken_port_falls_back_instead_of_failing() {
+        // Occupied here rather than by calling `listen` twice: the tests run in
+        // parallel, so whether *this* one gets the fixed port is not something
+        // it can assume.
+        let hog = UdpSocket::bind(format!("[::]:{DEFAULT_PORT}"))
+            .or_else(|_| UdpSocket::bind(format!("0.0.0.0:{DEFAULT_PORT}")));
+
+        let listener = listen().expect("a taken port must not be fatal");
+        let port = listener.candidates[0].port();
+        assert_ne!(port, 0, "an unbound port would be advertised to nobody");
+        if hog.is_ok() {
+            assert_ne!(port, DEFAULT_PORT, "that port was already taken");
+        }
+    }
+
     /// An address that is offered costs the peer a dial with a timeout, so
     /// anything unreachable from elsewhere must not be in the list.
     #[test]
@@ -508,3 +559,4 @@ mod tests {
         );
     }
 }
+
