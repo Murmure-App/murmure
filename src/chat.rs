@@ -360,7 +360,7 @@ async fn handle(
         }
         Message::Pong => {}
 
-        Message::FileOffer { name, size, hash } => {
+        Message::FileOffer { name, size, hash, direct } => {
             // The name is about to be shown to the operator, who decides on the
             // strength of it. Sanitise before it reaches the screen, not just
             // before it reaches the filesystem.
@@ -388,16 +388,33 @@ async fn handle(
                     files::human(resume)
                 ));
             }
+            if direct {
+                // Said plainly, because agreeing is what would expose them:
+                // a direct link hands the peer our IP address and shows both
+                // ISPs that these two addresses are exchanging data.
+                screen.system(format!(
+                    "   {peer} asked to send this outside Tor — faster, but it would \
+                     show them your IP address"
+                ));
+                screen.system("   /accept still takes it over Tor for now");
+            }
             screen.system("   /accept to take it, /refuse to decline");
             *pending = Some(offer);
         }
 
-        Message::FileAccept { offset } => {
+        Message::FileAccept { offset, direct } => {
             let Some(s) = sending.as_mut() else {
                 bail!("{peer} accepted a file we never offered");
             };
             if offset > s.size {
                 bail!("{peer} asked to resume past the end of the file");
+            }
+            if direct.is_some() {
+                // We never ask for one yet — `start_sending` always offers over
+                // Tor — so a peer answering with addresses is ahead of us.
+                // Ignoring it is safe: the transfer falls through to ordinary
+                // chunks below, which is what they will be reading anyway.
+                screen.system(format!("-- {peer} offered a direct link; not used yet --"));
             }
             std::io::Seek::seek(&mut s.file, std::io::SeekFrom::Start(offset))
                 .context("seeking to the resume point")?;
@@ -415,6 +432,14 @@ async fn handle(
                 Some(s) => screen.system(format!("-- {peer} declined {:?} --", s.name)),
                 None => screen.system(format!("-- {peer} declined a file --")),
             }
+        }
+
+        Message::DirectFailed => {
+            // Nothing is waiting on a direct link yet — the receiving side is
+            // wired in the next step. Until then this can only arrive from a
+            // peer that is ahead of us, and dropping it is right: the file
+            // follows as ordinary chunks either way.
+            screen.system(format!("-- {peer} could not reach us directly; using Tor --"));
         }
 
         Message::FileChunk(data) => {
@@ -489,6 +514,7 @@ async fn start_sending(
             name: offer.name,
             size: offer.size,
             hash: offer.hash,
+            direct: false,
         })
         .await
         .map_err(|_| anyhow::anyhow!("the conversation ended"))
@@ -526,7 +552,7 @@ async fn accept(
         next_report: offset + PROGRESS_EVERY,
     });
     outbox
-        .send(Message::FileAccept { offset })
+        .send(Message::FileAccept { offset, direct: None })
         .await
         .map_err(|_| anyhow::anyhow!("the conversation ended"))
 }

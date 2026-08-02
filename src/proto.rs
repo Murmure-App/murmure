@@ -54,6 +54,30 @@ pub const MAX_CHUNK: usize = 32 * 1024;
 /// keeps an absurd one off the wire in the first place.
 pub const MAX_NAME: usize = 255;
 
+/// Most addresses a peer may offer for a direct link.
+///
+/// A machine has a handful of interfaces. The cap is here because the list
+/// arrives from the network and every entry costs a dial attempt with a
+/// timeout — without it, a peer could make us spend minutes failing to connect
+/// to addresses of their choosing, which is a way of scanning our network from
+/// the outside as much as it is a way of wasting our time.
+pub const MAX_CANDIDATES: usize = 8;
+
+/// How to reach a peer's direct link, and which certificate to trust there.
+///
+/// Sent only inside [`Message::FileAccept`], and only when the recipient has
+/// agreed to a direct transfer: it names their addresses, which is exactly the
+/// thing Tor was hiding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Direct {
+    /// Addresses to try, in order.
+    pub candidates: Vec<std::net::SocketAddr>,
+    /// BLAKE3 of the certificate the listener will present. Travelling over the
+    /// already-authenticated onion circuit is what makes it trustworthy, and
+    /// what makes a certificate authority unnecessary.
+    pub fingerprint: [u8; 32],
+}
+
 /// One unit of conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
@@ -78,11 +102,30 @@ pub enum Message {
         name: String,
         size: u64,
         hash: [u8; 32],
+        /// The sender is asking to send this one outside Tor. It is a request,
+        /// not a decision: the recipient is the one who would expose an
+        /// address, so the recipient answers.
+        direct: bool,
     },
     /// "Send it, starting at this byte." Non-zero when resuming a partial.
-    FileAccept { offset: u64 },
+    ///
+    /// `direct` is the recipient's answer to a direct request: `Some` means
+    /// they agreed and are listening at these addresses, `None` means the
+    /// transfer goes over Tor as usual. A `None` against a direct offer is a
+    /// refusal of the *route*, not of the file.
+    FileAccept {
+        offset: u64,
+        direct: Option<Direct>,
+    },
     /// "No thanks." Also the answer to an offer that arrives mid-transfer.
     FileReject,
+    /// "I agreed to go direct, but I could not reach you — falling back."
+    ///
+    /// Needed because the recipient is sitting on a listening socket waiting
+    /// for a connection that is never coming, and has no other way to tell that
+    /// from a peer who is merely slow. After this, the file arrives as
+    /// ordinary [`Message::FileChunk`]s.
+    DirectFailed,
     /// File data, in order, starting from the accepted offset.
     FileChunk(Vec<u8>),
     /// No more data. The recipient verifies the hash before keeping anything.
@@ -111,6 +154,21 @@ impl Message {
             ),
             Message::FileChunk(data) if data.is_empty() => {
                 bail!("an empty file chunk says nothing; FileDone ends a transfer")
+            }
+            Message::FileAccept {
+                direct: Some(d), ..
+            } => {
+                if d.candidates.is_empty() {
+                    bail!("a direct link was agreed to but no address was given");
+                }
+                if d.candidates.len() > MAX_CANDIDATES {
+                    bail!(
+                        "the peer offered {} addresses for a direct link, over the \
+                         {MAX_CANDIDATES} limit",
+                        d.candidates.len()
+                    );
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -371,8 +429,12 @@ mod tests {
                 name: "rapport.pdf".into(),
                 size: 5,
                 hash: [7u8; 32],
+                direct: false,
             },
-            Message::FileAccept { offset: 2 },
+            Message::FileAccept {
+                offset: 2,
+                direct: None,
+            },
             Message::FileChunk(b"llo".to_vec()),
             Message::FileDone,
         ];
@@ -403,6 +465,7 @@ mod tests {
                 name: "n".repeat(MAX_NAME + 1),
                 size: 0,
                 hash: [0u8; 32],
+                direct: false,
             },
             // Nothing to write and not an ending: a peer looping on these would
             // keep the transfer open forever.
@@ -415,6 +478,88 @@ mod tests {
             );
             assert!(wire.is_empty());
         }
+    }
+
+    /// The direct-link negotiation, end to end on one stream.
+    #[test]
+    fn a_direct_negotiation_round_trips() {
+        let sent = vec![
+            Message::FileOffer {
+                name: "gros.pdf".into(),
+                size: 2_400_000,
+                hash: [3u8; 32],
+                direct: true,
+            },
+            Message::FileAccept {
+                offset: 0,
+                direct: Some(Direct {
+                    candidates: vec![
+                        "192.168.1.42:51820".parse().unwrap(),
+                        "[fe80::1]:51820".parse().unwrap(),
+                    ],
+                    fingerprint: [9u8; 32],
+                }),
+            },
+            Message::DirectFailed,
+        ];
+
+        let mut wire = Vec::new();
+        futures::executor::block_on(async {
+            for msg in &sent {
+                write_frame(&mut wire, msg).await.unwrap();
+            }
+        });
+
+        let mut read = wire.as_slice();
+        let mut got = Vec::new();
+        futures::executor::block_on(async {
+            while let Some(msg) = read_frame(&mut read).await.unwrap() {
+                got.push(msg);
+            }
+        });
+        assert_eq!(sent, got, "IPv4 and IPv6 addresses must both survive");
+    }
+
+    /// The candidate list comes from the network and every entry costs a dial
+    /// with a timeout, so its size is not the peer's to choose.
+    #[test]
+    fn a_direct_answer_must_offer_at_least_one_address_and_not_too_many() {
+        let one: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let empty = Message::FileAccept {
+            offset: 0,
+            direct: Some(Direct {
+                candidates: Vec::new(),
+                fingerprint: [0u8; 32],
+            }),
+        };
+        let flood = Message::FileAccept {
+            offset: 0,
+            direct: Some(Direct {
+                candidates: vec![one; MAX_CANDIDATES + 1],
+                fingerprint: [0u8; 32],
+            }),
+        };
+        for bad in [empty, flood] {
+            let mut wire = Vec::new();
+            assert!(
+                futures::executor::block_on(write_frame(&mut wire, &bad)).is_err(),
+                "{bad:?} must not reach the wire"
+            );
+            assert!(wire.is_empty());
+        }
+
+        // The plain Tor answer carries no addresses at all, and must stay legal.
+        let mut wire = Vec::new();
+        futures::executor::block_on(write_frame(
+            &mut wire,
+            &Message::FileAccept {
+                offset: 12,
+                direct: None,
+            },
+        ))
+        .expect("a Tor transfer names no address");
+        assert!(!wire.is_empty());
     }
 
     /// An over-long body is refused by the sender, not discovered by the peer.
