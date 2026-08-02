@@ -362,16 +362,40 @@ where
 /// (`tor-proto-0.44.0/src/client/stream/data.rs:503`). So a peer typing `/bye`
 /// arrives here as a failure rather than as end-of-stream.
 ///
-/// Matching on the message is unpleasant, and it is what the transport offers:
-/// the error is an `io::Error` whose kind is `Other`, so the kind carries
-/// nothing. The same string-matching approach is already used, for the same
-/// reason, in `transport::tor::is_key_already_exists`.
+/// # The two ways a peer leaves
+///
+/// `/bye` closes the stream and the circuit stays up long enough to carry the
+/// END cell, so the reader sees that. `/quit` ends the whole program: the Tor
+/// client is dropped, the circuit goes with it, and what arrives instead is
+/// **`NotConnected`** — the stream was pulled out from underneath. Both mean
+/// the same thing to the person still sitting there, and only the first used to
+/// be recognised, so quitting looked like a fault: "call dropped: reading from
+/// the stream: Stream not connected".
+///
+/// What this deliberately gives up: a circuit that dies on its own — a network
+/// drop — now reads as a hang-up too. That distinction is not worth keeping,
+/// because nothing on this side can act on it. The peer is gone either way, and
+/// calling it a fault when it is usually somebody typing `/quit` is the more
+/// misleading of the two.
+///
+/// Matching on the message is unpleasant, and it is most of what the transport
+/// offers: some of these arrive as `ErrorKind::Other` with the reason only in
+/// the text. The kind is checked first anyway, because when it *is* set it is
+/// the thing that cannot drift. The same string-matching approach is used, for
+/// the same reason, in `transport::tor::is_key_already_exists`.
 ///
 /// ponytail: if arti ever exposes a typed end-of-stream reason, replace this
 /// with it — the whole knowledge lives in this one function.
 fn is_hangup(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        err.kind(),
+        ErrorKind::NotConnected | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+    ) {
+        return true;
+    }
     let text = err.to_string();
-    text.contains("END cell") || text.contains("stream closed")
+    text.contains("END cell") || text.contains("stream closed") || text.contains("not connected")
 }
 
 #[cfg(test)]
@@ -467,6 +491,45 @@ mod tests {
 
         let got = futures::executor::block_on(read_frame(&mut HangsUp)).unwrap();
         assert!(got.is_none(), "a hang-up must be None, not an error");
+    }
+
+
+    /// `/quit` on the far side drops the whole Tor client, so the stream is
+    /// pulled away rather than closed. It has to read as a hang-up, not as a
+    /// fault — this is what put "call dropped: … Stream not connected" on
+    /// screen when somebody simply left.
+    #[test]
+    fn a_peer_quitting_reads_as_end_of_stream() {
+        use std::io::{Error, ErrorKind};
+
+        struct Gone(ErrorKind, &'static str);
+        impl AsyncRead for Gone {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(Error::new(self.0, self.1)))
+            }
+        }
+
+        // The kind, when the transport bothers to set it.
+        for kind in [
+            ErrorKind::NotConnected,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+        ] {
+            let got = futures::executor::block_on(read_frame(&mut Gone(kind, "gone")));
+            assert!(got.unwrap().is_none(), "{kind:?} must be a hang-up");
+        }
+
+        // And the text, when it does not — which is the case actually observed.
+        let mut opaque = Gone(ErrorKind::Other, "Stream not connected");
+        assert!(
+            futures::executor::block_on(read_frame(&mut opaque))
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A real read failure must still be a failure.
