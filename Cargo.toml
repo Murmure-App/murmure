@@ -2,6 +2,8 @@
 name = "murmure"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Peer-to-peer terminal messaging over Tor onion services"
 
 [dependencies]
 # Arti is pinned with "=" on purpose: 0.x crates, monthly releases, API breaks

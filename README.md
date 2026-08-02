@@ -7,6 +7,24 @@ now. The point is that **nobody can tell who you talk to**: no account, no
 directory, no server anyone operates. Both sides must be online at the same
 time. It is a phone call, not a text message.
 
+> ## Read this before trusting it
+>
+> **murmure has never been audited, by anyone.** It is one person's project,
+> a few weeks old. It has tests and its security decisions are argued for in
+> the code, and that is not the same thing as review.
+>
+> The properties below are what it *aims* for and what its design supports.
+> Whether the implementation actually delivers them is exactly the question an
+> audit would answer, and nobody has asked it.
+>
+> Use it because a P2P terminal messenger is a nice thing to have. **Do not use
+> it in a situation where being wrong about it would hurt you.** For that, use
+> something that has been examined — Briar, or Signal, depending on what you
+> need.
+>
+> Known limits are stated where they apply rather than collected here: search
+> the page for "limit". Windows does not work at all.
+
 ## Build
 
 Needs Rust ≥ 1.91.
@@ -206,3 +224,11 @@ Text, friends-only discovery and file transfer work, on macOS and Linux. Windows
 does not: arti hangs fetching its first consensus, on two independent machines
 and two networks — see `aidd_docs/arti-windows-hang.md`. Presence does not exist
 yet; see `aidd_docs/INSTALL.md` for the design and what is still open.
+
+## Licence
+
+GPL-3.0-or-later — see `LICENSE`.
+
+Chosen over a permissive licence on purpose: a program whose whole point is that
+nobody watches you should not be something a third party can take, add
+telemetry to, and ship closed.
