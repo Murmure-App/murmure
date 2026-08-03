@@ -131,3 +131,7 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 
 [dev-dependencies]
 tokio-util = { version = "0.7.19", features = ["compat"] }
+# `test-util` is what lets a test drive the clock instead of waiting on it, so
+# the handshake's 30-second timeout can be asserted in no time at all. Tests
+# only: nothing in the program reads a paused clock.
+tokio = { version = "1", features = ["test-util"] }

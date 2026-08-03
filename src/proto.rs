@@ -20,9 +20,86 @@
 // loop is what wires it in, and this attribute goes away with it.
 #![allow(dead_code)]
 
+use std::time::Duration;
+
 use anyhow::{Context as _, Result, bail};
 use futures::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use serde::{Deserialize, Serialize};
+
+/// What this build speaks.
+///
+/// Bump it whenever [`Message`] changes shape in a way an older build would
+/// misread — which postcard makes almost every change: the wire carries a
+/// variant's *position* in the enum, not its name, so inserting one anywhere
+/// but the end shifts everything after it.
+///
+/// There is no negotiation and no backward compatibility, on purpose. murmure
+/// is young enough that maintaining two wire formats would cost more than
+/// telling two people to run the same build, and a version that is refused
+/// loudly is worth more than one that half-works.
+pub const VERSION: u16 = 1;
+
+/// Sent before anything else, so that a stream carrying something other than
+/// murmure fails as itself rather than as a nonsensical version number.
+const MAGIC: &[u8; 7] = b"murmure";
+
+/// Longest a peer may take to say what it speaks.
+///
+/// The rendezvous is already paid for by the time this runs, so nine bytes are
+/// one round trip away — this is generous by an order of magnitude. What
+/// matters is that it is finite: a build with no handshake at all sends
+/// nothing, and waiting forever for it is exactly the silent failure the
+/// handshake exists to prevent.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Agree on a protocol version before a single frame is decoded, or fail
+/// saying which two versions disagreed.
+///
+/// # Why nine bytes written by hand
+///
+/// The obvious design is a `Message::Hello { version }` variant, and it does
+/// not work: postcard would encode it, so the mis-decoding this guards against
+/// would apply to the guard itself. A peer whose enum has a variant inserted
+/// above `Hello` would read our version as some other message entirely. A fixed
+/// header owes nothing to serde and cannot drift with the enum.
+///
+/// Both sides send first and read second. Nine bytes fit in any transport
+/// buffer, so nobody blocks waiting for the other to go first.
+pub async fn handshake<R, W>(r: &mut R, w: &mut W) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut ours = [0u8; 9];
+    ours[..7].copy_from_slice(MAGIC);
+    ours[7..].copy_from_slice(&VERSION.to_le_bytes());
+    w.write_all(&ours)
+        .await
+        .context("sending our protocol version")?;
+    w.flush().await.context("sending our protocol version")?;
+
+    let mut theirs = [0u8; 9];
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, r.read_exact(&mut theirs)).await {
+        Err(_) => bail!(
+            "the other side never said which version of murmure it speaks — \
+             it is probably an older build. Both sides must run the same one."
+        ),
+        Ok(read) => read.context("reading the other side's protocol version")?,
+    }
+
+    if &theirs[..7] != MAGIC {
+        bail!("whatever answered on that address, it does not speak murmure");
+    }
+    let theirs = u16::from_le_bytes([theirs[7], theirs[8]]);
+    if theirs != VERSION {
+        bail!(
+            "version mismatch: they speak murmure {theirs}, this is murmure {VERSION}. \
+             Both sides must run the same build — there is no compatibility between \
+             versions yet."
+        );
+    }
+    Ok(())
+}
 
 /// Largest frame accepted, in bytes.
 ///
@@ -400,7 +477,73 @@ fn is_hangup(err: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+
     use super::*;
+
+    /// The header a peer on `version` would send.
+    fn header(version: u16) -> Vec<u8> {
+        let mut out = MAGIC.to_vec();
+        out.extend_from_slice(&version.to_le_bytes());
+        out
+    }
+
+    /// Two builds that agree say so and get out of the way.
+    #[tokio::test]
+    async fn matching_versions_agree() {
+        let r = header(VERSION);
+        let mut sent = Vec::new();
+        handshake(&mut r.as_slice(), &mut sent).await.unwrap();
+        assert_eq!(sent, header(VERSION), "and we announced ourselves too");
+    }
+
+    /// The failure this whole handshake exists for: two people who cloned the
+    /// repository weeks apart. Without it, postcard decodes their frames
+    /// against our enum and the error arrives later wearing the wrong name.
+    #[tokio::test]
+    async fn a_different_version_is_refused_by_name() {
+        let r = header(VERSION + 1);
+        let e = handshake(&mut r.as_slice(), &mut Vec::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(&(VERSION + 1).to_string()), "names theirs: {e}");
+        assert!(e.contains(&VERSION.to_string()), "and ours: {e}");
+        assert!(e.contains("same build"), "and says what to do: {e}");
+    }
+
+    /// Anything else that connects to the onion port fails as itself.
+    #[tokio::test]
+    async fn something_that_is_not_murmure_is_told_apart_from_a_version() {
+        let r = b"GET / HTTP".to_vec();
+        let e = handshake(&mut r.as_slice(), &mut Vec::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not speak murmure"), "{e}");
+    }
+
+    /// A build with no handshake sends nothing at all. Waiting forever for it
+    /// is the silent failure this replaces, so the wait has to end.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_answers_gives_up() {
+        // Never ready, never closed: an older build sitting on an open stream
+        // with nothing to say.
+        let (mine, _theirs) = tokio::io::duplex(64);
+        let (r, w) = tokio::io::split(mine);
+        let e = handshake(&mut r.compat(), &mut w.compat_write())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("older build"), "{e}");
+    }
+
+    /// A peer that hangs up mid-header is a broken connection, not a version.
+    #[tokio::test]
+    async fn a_truncated_header_is_an_error() {
+        let mut r = &MAGIC[..4];
+        assert!(handshake(&mut r, &mut Vec::new()).await.is_err());
+    }
 
     /// Encode messages back-to-back the way a conversation does, then read them
     /// back: order, content and frame boundaries all have to survive.

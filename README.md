@@ -36,6 +36,13 @@ cargo build --release
 
 The first build compiles arti and takes several minutes. Later ones are quick.
 
+**Both sides must run the same build.** The wire format carries no field names,
+so a version that does not match cannot be interpreted — it can only be
+detected. It is, at the start of every call, and murmure says which two versions
+disagreed rather than failing later as something else. There is no
+compatibility between versions yet; when you update, tell the person you talk
+to.
+
 ## Run
 
 ```sh

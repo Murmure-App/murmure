@@ -313,10 +313,17 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    // First, and while both halves are still here to be handed to it: agree on
+    // a version. A peer running a different build would otherwise decode our
+    // frames as whatever its own enum says that byte means, and the failure
+    // would arrive later wearing the wrong name. See [`proto::handshake`].
+    let mut reader = reader;
+    let mut writer = writer;
+    proto::handshake(&mut reader, &mut writer).await?;
+
     let (outbox, mut queued) = mpsc::channel::<Message>(OUTBOX);
     let (inbox_tx, mut inbox) = mpsc::channel::<Message>(INBOX);
 
-    let mut writer = writer;
     let writing = tokio::spawn(async move {
         while let Some(msg) = queued.recv().await {
             proto::write_frame(&mut writer, &msg).await?;
@@ -326,7 +333,6 @@ where
 
     // Decides nothing: every frame goes to the loop, which owns the state that
     // says what a frame means.
-    let mut reader = reader;
     let reading = tokio::spawn(async move {
         while let Some(msg) = proto::read_frame(&mut reader).await? {
             if inbox_tx.send(msg).await.is_err() {
@@ -1450,7 +1456,7 @@ mod tests {
             let dir = scratch("typed");
             let (alice, bob) = tokio::io::duplex(4096);
             let (alice_r, alice_w) = tokio::io::split(alice);
-            let (bob_r, _bob_w) = tokio::io::split(bob);
+            let (bob_r, bob_w) = tokio::io::split(bob);
 
             let (tx, mut rx) = mpsc::channel::<crate::ui::Typed>(4);
             tx.send(line("bonjour")).await.unwrap();
@@ -1469,7 +1475,13 @@ mod tests {
                 .await
             });
 
+            // Bob is hand-rolled here rather than another `run`, so he has to
+            // answer the handshake himself — which also makes this the test
+            // that two matching versions agree at all.
             let mut bob_r = bob_r.compat();
+            let mut bob_w = bob_w.compat_write();
+            proto::handshake(&mut bob_r, &mut bob_w).await.unwrap();
+
             let got = proto::read_frame(&mut bob_r).await.unwrap();
             assert_eq!(got, Some(Message::Text("bonjour".into())));
 
