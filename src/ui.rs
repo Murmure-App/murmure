@@ -447,6 +447,15 @@ struct App {
     flash: Option<(String, Instant)>,
     /// Whether typed lines are accepted at all. False until Tor is up.
     accepting: bool,
+    /// Columns of the input line scrolled off to the left. See
+    /// [`App::input_window`], which is the only thing that moves it.
+    input_scroll: usize,
+    /// Lines that arrived below the view while it was scrolled back.
+    ///
+    /// The view now stays where it was put, which is what someone re-reading
+    /// an address wants — and which means an arriving message would otherwise
+    /// be completely silent. This is what the header counts.
+    unseen: usize,
     /// Who a typed line would reach, when there is a call. Drives the input
     /// box's title, so the question "where does Enter send this" is answered
     /// where the answer is needed, next to the cursor.
@@ -469,6 +478,8 @@ impl App {
             dragging: false,
             flash: None,
             accepting: false,
+            input_scroll: 0,
+            unseen: 0,
             peer: None,
         }
     }
@@ -501,6 +512,10 @@ impl App {
         let limit = self.total_rows().saturating_sub(self.viewport.1);
         let moved = self.scroll_back as isize + rows;
         self.scroll_back = moved.clamp(0, limit as isize) as usize;
+        // Back at the bottom is having seen everything, by definition.
+        if self.scroll_back == 0 {
+            self.unseen = 0;
+        }
     }
 
     /// Take a paste: an existing file becomes an attachment, anything else is
@@ -568,9 +583,55 @@ impl App {
         };
     }
 
-    /// What the input box shows.
+    /// What the input box shows, in full.
     fn input_display(&self) -> String {
         self.items.iter().map(Item::shown).collect()
+    }
+
+    /// The slice of the input line that fits in `width` columns, and which
+    /// column of it the cursor sits in.
+    ///
+    /// Without this the box drew the whole line into a fixed-width area and
+    /// the terminal clipped it, so past about eighty characters the operator
+    /// was typing blind with the cursor stuck against the right border — on a
+    /// messenger, where writing a paragraph is the ordinary case.
+    ///
+    /// The window slides by the least it can: only far enough to bring the
+    /// cursor back into view. Recomputing it from the cursor every frame would
+    /// be stateless and would also jump the text sideways under someone who
+    /// was reading it.
+    fn input_window(&mut self, width: usize) -> (String, usize) {
+        let width = width.max(1);
+        let shown: Vec<char> = self.input_display().chars().collect();
+        let cursor = self.cursor_column().min(shown.len());
+
+        // Two constraints, and the second wins where they disagree: the cursor
+        // must be at or right of the window's start, and inside its last
+        // column. Applied in this order they leave `input_scroll` satisfying
+        // both, and a line that just got shorter pulls the window back with it.
+        self.input_scroll = self
+            .input_scroll
+            .min(cursor)
+            .max((cursor + 1).saturating_sub(width));
+
+        let start = self.input_scroll;
+        let end = (start + width).min(shown.len());
+        let mut window = shown[start.min(shown.len())..end].to_vec();
+
+        // One character to say there is more off that edge — overwriting the
+        // character it covers rather than shifting the line, so the cursor
+        // column stays a plain index into this window. Never over the cursor
+        // itself: hiding the character being edited is worse than not knowing
+        // there is text ahead.
+        let last = window.len().saturating_sub(1);
+        if start > 0 && !window.is_empty() && cursor > start {
+            window[0] = '…';
+        }
+        if end < shown.len() && !window.is_empty() && cursor - start < last {
+            window[last] = '…';
+        }
+
+        (window.into_iter().collect(), cursor - start)
     }
 
     /// Which column the cursor is drawn in, counted over what is displayed —
@@ -650,17 +711,32 @@ impl App {
     }
 
     fn push(&mut self, entry: Entry) {
+        // Reading back through the history is not a request to be dragged
+        // forward. The offset is measured from the bottom, so a line arriving
+        // underneath moves the window unless the offset grows by exactly the
+        // rows it added — the same correction the scrollback trim makes at the
+        // other end, for the same reason.
+        if self.scroll_back > 0 {
+            self.scroll_back += rows_for(&entry.text, self.viewport.0);
+            self.unseen += 1;
+        }
+
         self.history.push_back(entry);
         while self.history.len() > SCROLLBACK {
-            let Some(dropped) = self.history.pop_front() else {
+            // Nothing to correct here, which is worth saying because the
+            // obvious move is to take the departing rows off the offset. The
+            // offset is measured from the bottom of the history, and rows
+            // leaving the *top* shorten it and shift every remaining row up by
+            // the same amount — the two cancel, and the distance from the
+            // bottom is what it was. Only the arrival above moves the view,
+            // and it is already paid for.
+            //
+            // What an eviction can do is leave the offset pointing past the
+            // oldest row that is left. `visible_rows` pins to the top rather
+            // than blanking the box, and the next `scroll` clamps it for good.
+            if self.history.pop_front().is_none() {
                 break;
-            };
-            // Keep the view anchored on the same text as lines fall off the
-            // top: the offset is measured from the bottom, so it has to lose
-            // exactly the rows that left.
-            self.scroll_back = self
-                .scroll_back
-                .saturating_sub(rows_for(&dropped.text, self.viewport.0));
+            }
         }
     }
 }
@@ -896,7 +972,14 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     .areas(frame.area());
 
     // ---- header ----
-    let follow = if app.scroll_back == 0 { "" } else { "  [scrolled]" };
+    // Scrolled back, the newest line is not the one on screen — and since the
+    // view no longer follows, nothing else would say that anything arrived.
+    let follow = match (app.scroll_back, app.unseen) {
+        (0, _) => String::new(),
+        (_, 0) => "  [scrolled]".to_owned(),
+        (_, 1) => "  [scrolled — 1 new below]".to_owned(),
+        (_, n) => format!("  [scrolled — {n} new below]"),
+    };
     // Expired notes are dropped here rather than in the event loop, so a frame
     // drawn for any other reason also clears a stale one.
     if app.flash.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
@@ -982,7 +1065,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         ),
     };
 
-    let shown = app.input_display();
+    // Only the part that fits, and the cursor's column within it — a long line
+    // scrolls sideways rather than being clipped where nobody can see it.
+    let (shown, column) = app.input_window(input.width.saturating_sub(2) as usize);
     frame.render_widget(
         Paragraph::new(shown.as_str()).style(body_style).block(
             Block::default()
@@ -995,12 +1080,10 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
     // Put the real cursor where the text is, so the terminal's own blink is the
     // cursor and there is nothing to draw. No cursor while input is refused.
+    // The column is counted in displayed columns, so a chip the cursor has
+    // stepped over moves it by the width of the name rather than by one.
     if app.accepting {
-        // Counted in displayed columns, so a chip the cursor has stepped over
-        // moves it by the width of the name rather than by one.
-        let before = app.cursor_column() as u16;
-        let cursor_x = input.x + 1 + before;
-        frame.set_cursor_position((cursor_x.min(input.right().saturating_sub(2)), input.y + 1));
+        frame.set_cursor_position((input.x + 1 + column as u16, input.y + 1));
     }
 }
 
@@ -1154,12 +1237,38 @@ fn wrap(text: &str, width: usize, indent: usize) -> Vec<(usize, &str)> {
     if text.is_empty() {
         return vec![(0, text)];
     }
+    // Byte offsets to slice with, characters to look through. Two passes over a
+    // line of text, which is what it costs to break on words without ever
+    // landing in the middle of a multi-byte character.
     let bounds: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let chars: Vec<char> = text.chars().collect();
+
     let mut rows = Vec::with_capacity(bounds.len().div_ceil(rest) + 1);
     let mut i = 0;
     let mut take = width;
     while i < bounds.len() {
-        let end_i = (i + take).min(bounds.len());
+        let hard = (i + take).min(bounds.len());
+        let end_i = if hard == bounds.len() {
+            // The rest fits; there is nothing to break.
+            hard
+        } else {
+            // Break after the last space in the window, so a word stays whole.
+            // The space stays on the row it ends — dropping it would leave a
+            // character of the entry belonging to no row at all, and a mouse
+            // click resolves to a position by counting along one.
+            //
+            // Two cases fall back to breaking mid-character, both on purpose.
+            // A word longer than the window has nowhere else to go, which is
+            // every .onion address on a narrow terminal. And a break that
+            // would leave less than half a row of text pushes a long word down
+            // to gain nothing: it will wrap on the next row regardless, and
+            // the row above it is spent.
+            chars[i..hard]
+                .iter()
+                .rposition(|c| *c == ' ')
+                .filter(|at| at + 1 >= take / 2)
+                .map_or(hard, |at| i + at + 1)
+        };
         let end_byte = bounds.get(end_i).copied().unwrap_or(text.len());
         rows.push((i, &text[bounds[i]..end_byte]));
         i = end_i;
@@ -2016,6 +2125,89 @@ mod tests {
         assert_eq!(indent_for("alice> hello", 10), 0, "no room for it");
     }
 
+    /// Past the width of the box the line used to be clipped in silence, with
+    /// the cursor pinned to the border: typing blind.
+    #[test]
+    fn a_long_line_scrolls_sideways_instead_of_vanishing() {
+        let mut app = App::new("t".into());
+        for c in "abcdefghijklmnopqrstuvwxyz".chars() {
+            app.items.push(Item::Char(c));
+        }
+        app.cursor = app.items.len();
+
+        // The cursor is at the end, so the window ends there too — nine
+        // characters of text and the tenth column for the cursor itself.
+        let (shown, column) = app.input_window(10);
+        assert_eq!(shown.chars().count(), 9);
+        assert!(shown.ends_with("stuvwxyz"), "the end is what is being typed: {shown}");
+        assert!(shown.starts_with('…'), "and it says there is more: {shown}");
+        assert_eq!(column, 9, "the cursor is inside the box");
+
+        // Home: the window comes back with it, and stops marking the left.
+        app.cursor = 0;
+        let (shown, column) = app.input_window(10);
+        assert_eq!(column, 0);
+        assert!(shown.starts_with("abcdefgh"), "{shown}");
+        assert!(shown.ends_with('…'), "now the far end is the hidden one: {shown}");
+
+        // A line that fits is shown whole, with no marks either side.
+        app.items.truncate(4);
+        app.cursor = 4;
+        assert_eq!(app.input_window(10), ("abcd".to_owned(), 4));
+    }
+
+    /// Whatever the cursor does, the column handed to the terminal has to land
+    /// inside the box — that is the whole contract of the window.
+    #[test]
+    fn the_cursor_column_always_fits_the_box() {
+        let mut app = App::new("t".into());
+        for c in "the quick brown fox jumps over the lazy dog".chars() {
+            app.items.push(Item::Char(c));
+        }
+        for width in [1usize, 2, 7, 20, 100] {
+            for cursor in 0..=app.items.len() {
+                app.cursor = cursor;
+                let (shown, column) = app.input_window(width);
+                assert!(column < width.max(1), "width {width}, cursor {cursor}");
+                assert!(shown.chars().count() <= width.max(1));
+            }
+        }
+    }
+
+    /// Wrapping used to cut every N characters, mid-word.
+    #[test]
+    fn wrapping_breaks_between_words() {
+        let rows: Vec<&str> = wrap("alice> the quick brown fox jumps", 20, 0)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(rows, ["alice> the quick ", "brown fox jumps"]);
+
+        // Offsets stay exact, and no character belongs to no row: the space a
+        // break happens on stays on the row it ended.
+        let rejoined: String = rows.concat();
+        assert_eq!(rejoined, "alice> the quick brown fox jumps");
+        assert_eq!(wrap("alice> the quick brown fox jumps", 20, 0)[1].0, 17);
+    }
+
+    /// A word with nowhere to go is broken rather than left hanging: this is
+    /// every .onion address on a narrow terminal.
+    #[test]
+    fn a_word_longer_than_the_box_is_broken_anyway() {
+        let long = "x".repeat(30);
+        let rows: Vec<&str> = wrap(&long, 10, 0).into_iter().map(|(_, s)| s).collect();
+        assert_eq!(rows, ["x".repeat(10), "x".repeat(10), "x".repeat(10)]);
+
+        // And a break that would leave almost nothing on the row does not
+        // happen either — the long word wraps below regardless, so moving it
+        // down only wastes the row above it.
+        let rows: Vec<&str> = wrap("hi ratherlongwordhere", 10, 0)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(rows, ["hi ratherl", "ongwordher", "e"]);
+    }
+
     /// A copy that produced no confirmation is indistinguishable from a copy
     /// the terminal refused, which is the whole reason the note exists.
     #[test]
@@ -2075,16 +2267,50 @@ mod tests {
         assert_eq!(app.history.front().unwrap().text, "10");
     }
 
-    /// Lines falling off the top must not shift what the operator is reading.
+    /// A line arriving at the bottom and an old one falling off the top must
+    /// both leave the reader looking at exactly the same text.
+    ///
+    /// Asserted on the rows rather than on the offset, because the offset is
+    /// the thing that was wrong: it used to be corrected for the eviction and
+    /// not for the arrival, which is the wrong one of the two, so a message
+    /// landing mid-scroll dragged the view forward.
     #[test]
-    fn the_view_stays_anchored_while_old_lines_fall_off() {
+    fn the_view_stays_anchored_while_the_history_moves_under_it() {
+        let texts = |rows: &[Row]| rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>();
+
         let mut app = App::new("t".into());
+        app.viewport = (20, 3);
         for i in 0..SCROLLBACK {
             app.push(entry(&i.to_string()));
         }
         app.scroll_back = 50;
+        let before = texts(&visible_rows(&app.history, 20, 3, app.scroll_back));
+
+        // The history is full, so this is one line in at the bottom and one
+        // off the top at once.
         app.push(entry("new"));
-        assert_eq!(app.scroll_back, 49);
+        let after = texts(&visible_rows(&app.history, 20, 3, app.scroll_back));
+
+        assert_eq!(before, after, "the reader was not moved");
+        assert_eq!(app.unseen, 1, "and the header says one arrived");
+    }
+
+    /// Coming back to the bottom is having seen everything.
+    #[test]
+    fn the_unseen_count_clears_on_the_way_back_down() {
+        let mut app = App::new("t".into());
+        app.viewport = (20, 3);
+        for i in 0..20 {
+            app.push(entry(&i.to_string()));
+        }
+        app.scroll(5);
+        app.push(entry("theirs"));
+        app.push(entry("more"));
+        assert_eq!(app.unseen, 2);
+
+        app.scroll(-99);
+        assert_eq!(app.scroll_back, 0);
+        assert_eq!(app.unseen, 0);
     }
 
     /// Holding a scroll key must never run past either end.
