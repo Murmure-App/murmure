@@ -995,7 +995,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         ),
         Span::styled(
             format!("  {}{follow}", app.status),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ),
     ];
     if let Some((note, _)) = &app.flash {
@@ -1050,8 +1050,8 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let (title, border, body_style) = match (app.accepting, &app.peer) {
         (false, _) => (
             format!(" {} — please wait ", app.status),
-            Style::default().fg(Color::DarkGray),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::Gray),
         ),
         (true, Some(peer)) => (
             format!(" to {peer} — Enter sends "),
@@ -1060,7 +1060,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         ),
         (true, None) => (
             " not in a call — /call <name>, or /help ".to_owned(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
             Style::default(),
         ),
     };
@@ -1556,7 +1556,14 @@ fn handle_mouse(m: MouseEvent, app: &mut App) -> Option<String> {
 
 fn style_for(kind: Kind) -> Style {
     match kind {
-        Kind::System => Style::default().fg(Color::DarkGray),
+        // `Gray`, not `DarkGray`, here and everywhere else in this module.
+        // crossterm maps `DarkGray` to ANSI bright black, which several common
+        // terminal themes render a shade or two off their own background — so
+        // the chatter that says what the program is doing, and the box that
+        // says why it is not ready yet, came out nearly invisible. `Gray` is
+        // ANSI white: quieter than the messages around it, and legible on any
+        // theme. Dimness is not worth having if it costs being read.
+        Kind::System => Style::default().fg(Color::Gray),
         Kind::Mine => Style::default().fg(Color::Cyan),
         Kind::Theirs => Style::default().fg(Color::Green),
         Kind::Error => Style::default().fg(Color::Red),
