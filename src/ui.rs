@@ -115,6 +115,8 @@ pub enum Update {
     Status(String),
     /// Start or stop accepting typed lines.
     Accepting(bool),
+    /// Who the typing goes to now, or nobody.
+    InCall(Option<String>),
     /// Put this on the system clipboard.
     Clipboard(String),
 }
@@ -184,6 +186,17 @@ impl Screen {
         let _ = self.0.send(Update::Accepting(yes));
     }
 
+    /// Say who a typed line would reach — a peer's name during a call, `None`
+    /// otherwise.
+    ///
+    /// Separate from [`Self::status`] on purpose, even though the status says
+    /// the same thing at the start of a call: a running transfer takes the
+    /// status line over for its progress bar, and the operator should not stop
+    /// being told where Enter sends just because a file is moving.
+    pub fn in_call(&self, peer: Option<&str>) {
+        let _ = self.0.send(Update::InCall(peer.map(str::to_owned)));
+    }
+
     /// Put text on the system clipboard.
     ///
     /// Best effort: it goes through the terminal (see [`copy_to_clipboard`]),
@@ -215,6 +228,15 @@ struct Row {
     entry: usize,
     /// Char offset within that entry's text where this row starts.
     offset: usize,
+    /// Columns of blank to the left of [`Self::text`], so a message that
+    /// wrapped lines up under its own first word rather than restarting where
+    /// a new speaker would. Zero on the first row of an entry, and on
+    /// everything that has no `name> ` prefix to line up with.
+    ///
+    /// Kept as a count rather than baked into `text` because a mouse click is
+    /// resolved against this row: the padding is not text, so [`anchor_at`]
+    /// has to take it off the column before the rest means anything.
+    indent: usize,
     kind: Kind,
     text: String,
 }
@@ -425,6 +447,10 @@ struct App {
     flash: Option<(String, Instant)>,
     /// Whether typed lines are accepted at all. False until Tor is up.
     accepting: bool,
+    /// Who a typed line would reach, when there is a call. Drives the input
+    /// box's title, so the question "where does Enter send this" is answered
+    /// where the answer is needed, next to the cursor.
+    peer: Option<String>,
 }
 
 impl App {
@@ -443,6 +469,7 @@ impl App {
             dragging: false,
             flash: None,
             accepting: false,
+            peer: None,
         }
     }
 
@@ -718,6 +745,7 @@ async fn event_loop(
                     Some(Update::Line(entry)) => app.push(entry),
                     Some(Update::Status(status)) => app.status = status,
                     Some(Update::Accepting(yes)) => app.accepting = yes,
+                    Some(Update::InCall(peer)) => app.peer = peer,
                     Some(Update::Clipboard(text)) => {
                         copy_to_clipboard(&text);
                         app.flash(format!("copied {} chars", text.chars().count()));
@@ -732,6 +760,7 @@ async fn event_loop(
                         Update::Line(entry) => app.push(entry),
                         Update::Status(status) => app.status = status,
                         Update::Accepting(yes) => app.accepting = yes,
+                        Update::InCall(peer) => app.peer = peer,
                         Update::Clipboard(text) => {
                             copy_to_clipboard(&text);
                             app.flash(format!("copied {} chars", text.chars().count()));
@@ -915,7 +944,10 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let lines: Vec<Line> = app
         .rows
         .iter()
-        .map(|row| build_line(row, &app.selection))
+        .map(|row| {
+            let chips = app.history.get(row.entry).map_or(&[][..], |e| &e.chips[..]);
+            build_line(row, chips, &app.selection)
+        })
         .collect();
 
     frame.render_widget(
@@ -927,18 +959,27 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     //
     // Visibly dead until Tor is up. The box says so, the border is dim, and
     // there is no cursor — three signals that typing now would go nowhere.
-    let (title, border, body_style) = if app.accepting {
-        (
-            " type, Enter to send ".to_owned(),
-            Style::default().fg(Color::Cyan),
-            Style::default(),
-        )
-    } else {
-        (
+    //
+    // Once it is alive the title answers the one question that matters at the
+    // cursor: where does this line go? "Enter to send" never said, and the
+    // difference between typing at a person and typing at nobody is the
+    // difference between a message and a command that does not exist.
+    let (title, border, body_style) = match (app.accepting, &app.peer) {
+        (false, _) => (
             format!(" {} — please wait ", app.status),
             Style::default().fg(Color::DarkGray),
             Style::default().fg(Color::DarkGray),
-        )
+        ),
+        (true, Some(peer)) => (
+            format!(" to {peer} — Enter sends "),
+            Style::default().fg(Color::Cyan),
+            Style::default(),
+        ),
+        (true, None) => (
+            " not in a call — /call <name>, or /help ".to_owned(),
+            Style::default().fg(Color::DarkGray),
+            Style::default(),
+        ),
     };
 
     let shown = app.input_display();
@@ -1105,26 +1146,53 @@ fn as_dropped_file(text: &str) -> Option<PathBuf> {
 ///
 /// Counts characters, not grapheme clusters or display width. Close enough for
 /// the accented Latin text this carries.
-fn wrap(text: &str, width: usize) -> Vec<(usize, &str)> {
+fn wrap(text: &str, width: usize, indent: usize) -> Vec<(usize, &str)> {
     let width = width.max(1);
+    // Continuation rows pay for their alignment: what the indent takes on the
+    // left is width they no longer have on the right.
+    let rest = width.saturating_sub(indent).max(1);
     if text.is_empty() {
         return vec![(0, text)];
     }
     let bounds: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
-    let mut rows = Vec::with_capacity(bounds.len().div_ceil(width));
+    let mut rows = Vec::with_capacity(bounds.len().div_ceil(rest) + 1);
     let mut i = 0;
+    let mut take = width;
     while i < bounds.len() {
-        let end_i = (i + width).min(bounds.len());
+        let end_i = (i + take).min(bounds.len());
         let end_byte = bounds.get(end_i).copied().unwrap_or(text.len());
         rows.push((i, &text[bounds[i]..end_byte]));
         i = end_i;
+        take = rest;
     }
     rows
 }
 
+/// How far the continuation rows of one entry are indented.
+///
+/// Read back off the `name> ` prefix the conversation loop writes, rather than
+/// carried on the [`Entry`]: carrying it would mean an extra argument on every
+/// `say` call in the program, for a number the text already contains. Only the
+/// head of the line is searched, so a `> ` in the middle of a sentence is
+/// punctuation and not a prefix.
+///
+/// Zero on a terminal too narrow to afford it — ragged beats two columns of
+/// text against eighteen of blank.
+fn indent_for(text: &str, width: usize) -> usize {
+    /// How far in a prefix can start before it is not one.
+    const HEAD: usize = 20;
+
+    let head: Vec<char> = text.chars().take(HEAD).collect();
+    let indent = head
+        .windows(2)
+        .position(|pair| matches!(pair, ['>', ' ']))
+        .map_or(0, |at| at + 2);
+    if indent * 2 >= width { 0 } else { indent }
+}
+
 /// How many rows one entry occupies once wrapped to `width`.
 fn rows_for(text: &str, width: usize) -> usize {
-    wrap(text, width).len()
+    wrap(text, width, indent_for(text, width)).len()
 }
 
 /// Every row a `height`-tall, `width`-wide box shows, anchored `scroll_back`
@@ -1152,12 +1220,17 @@ fn visible_rows(
     // entries, never the whole scrollback.
     let mut rows_rev: Vec<Row> = Vec::new();
     for (idx, entry) in history.iter().enumerate().rev() {
-        let mut this_entry: Vec<Row> = wrap(&entry.text, width)
+        let indent = indent_for(&entry.text, width);
+        let mut this_entry: Vec<Row> = wrap(&entry.text, width, indent)
             .into_iter()
+            .enumerate()
             .rev()
-            .map(|(offset, s)| Row {
+            .map(|(n, (offset, s))| Row {
                 entry: idx,
                 offset,
+                // The first row starts at the prefix and needs no help; only
+                // what wrapped off the end of it does.
+                indent: if n == 0 { 0 } else { indent },
                 kind: entry.kind,
                 text: s.to_owned(),
             })
@@ -1182,34 +1255,65 @@ fn visible_rows(
     rows_rev[start..end].to_vec()
 }
 
-/// A row as a [`Line`], with the part inside `selection` (if any of it falls
-/// on this row) drawn reversed.
-fn build_line(row: &Row, selection: &Option<Selection>) -> Line<'static> {
+/// A row as a [`Line`]: indented if it wrapped, with its file chips underlined
+/// and the part inside `selection` (if any of it falls here) drawn reversed.
+///
+/// `chips` are the whole *entry's* chips, in entry offsets — this row is a
+/// window onto that entry, so a chip can start before the row and end after it.
+///
+/// # Why a style per character
+///
+/// Two overlays land on the same row and can overlap by any amount: a chip and
+/// a selection dragged across half of it. Intersecting two range sets by hand
+/// is four cases and at least one of them would be wrong. Painting each
+/// character and then coalescing equal neighbours into spans is the same
+/// picture with no cases at all, for a vector as long as one screen row.
+fn build_line(row: &Row, chips: &[Chip], selection: &Option<Selection>) -> Line<'static> {
     let base = style_for(row.kind);
-    let whole = || Line::styled(row.text.clone(), base);
-
-    let Some(sel) = selection else { return whole() };
-    let (from, to) = sel.ordered();
-    if row.entry < from.entry || row.entry > to.entry {
-        return whole();
-    }
-
-    let len = row.text.chars().count();
-    let row_end = row.offset + len;
-    let sel_start = (if row.entry == from.entry { from.offset } else { 0 }).clamp(row.offset, row_end);
-    let sel_end = (if row.entry == to.entry { to.offset } else { row_end }).clamp(row.offset, row_end);
-    if sel_start >= sel_end {
-        return whole();
-    }
-
+    let pad = Span::raw(" ".repeat(row.indent));
     let chars: Vec<char> = row.text.chars().collect();
-    let (local_start, local_end) = (sel_start - row.offset, sel_end - row.offset);
-    let highlight = base.add_modifier(Modifier::REVERSED);
-    Line::from(vec![
-        Span::styled(chars[..local_start].iter().collect::<String>(), base),
-        Span::styled(chars[local_start..local_end].iter().collect::<String>(), highlight),
-        Span::styled(chars[local_end..].iter().collect::<String>(), base),
-    ])
+    if chars.is_empty() {
+        return Line::from(vec![pad]);
+    }
+    // Entry offset to an index into this row, clamped: a range that starts
+    // before the row begins at nought, one that ends after it stops at the end.
+    let local = |offset: usize| offset.saturating_sub(row.offset).min(chars.len());
+
+    let mut styles = vec![base; chars.len()];
+
+    // Underlined and bold, because that is what every terminal, browser and
+    // pager has meant by "you can click this" for thirty years. The colour
+    // stays whatever the line already was: a chip is part of what somebody
+    // said, not a separate kind of line.
+    for chip in chips {
+        for style in &mut styles[local(chip.start)..local(chip.end)] {
+            *style = style.add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
+        }
+    }
+
+    if let Some(sel) = selection {
+        let (from, to) = sel.ordered();
+        if row.entry >= from.entry && row.entry <= to.entry {
+            let start = if row.entry == from.entry { local(from.offset) } else { 0 };
+            let end = if row.entry == to.entry { local(to.offset) } else { chars.len() };
+            for style in &mut styles[start..end.max(start)] {
+                *style = style.add_modifier(Modifier::REVERSED);
+            }
+        }
+    }
+
+    let mut spans = vec![pad];
+    let mut run = String::new();
+    let mut current = styles[0];
+    for (c, style) in chars.iter().zip(&styles) {
+        if *style != current {
+            spans.push(Span::styled(std::mem::take(&mut run), current));
+            current = *style;
+        }
+        run.push(*c);
+    }
+    spans.push(Span::styled(run, current));
+    Line::from(spans)
 }
 
 /// Resolve a mouse position to the [`Row`] it lands on, if any, as an
@@ -1225,9 +1329,10 @@ fn anchor_at(app: &App, column: u16, row: u16) -> Option<Anchor> {
     }
     let (origin_x, origin_y) = app.body_origin;
     let r = (row.saturating_sub(origin_y) as usize).min(app.rows.len() - 1);
-    let c = column.saturating_sub(origin_x) as usize;
-
     let line = &app.rows[r];
+    // The indent is blank, not text. A click inside it is a click on the first
+    // character of the row, the same as a click left of the box.
+    let c = (column.saturating_sub(origin_x) as usize).saturating_sub(line.indent);
     let local = c.min(line.text.chars().count());
     Some(Anchor {
         entry: line.entry,
@@ -1802,6 +1907,113 @@ mod tests {
         for column in 0..20u16 {
             assert_eq!(chip_at(&app, column, 0), None, "column {column}");
         }
+    }
+
+    fn row(text: &str, chips: &[Chip]) -> (Row, Vec<Chip>) {
+        (
+            Row {
+                entry: 0,
+                offset: 0,
+                indent: 0,
+                kind: Kind::Theirs,
+                text: text.to_owned(),
+            },
+            chips.to_vec(),
+        )
+    }
+
+    fn marked(line: &Line<'_>, m: Modifier) -> String {
+        line.spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(m))
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    /// A chip is only clickable if it looks clickable. The ranges were being
+    /// recorded and used for hit-testing but never drawn, so a file offered in
+    /// a message was indistinguishable from brackets somebody typed.
+    #[test]
+    fn a_file_chip_is_drawn_as_a_link() {
+        let text = "alice> voici [a.png] la";
+        let at = text.find("[a.png]").unwrap();
+        let (row, chips) = row(text, &[Chip { start: at, end: at + 7, number: 1 }]);
+
+        let line = build_line(&row, &chips, &None);
+        assert_eq!(marked(&line, Modifier::UNDERLINED), "[a.png]");
+        assert_eq!(marked(&line, Modifier::BOLD), "[a.png]");
+        let whole: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(whole, text, "and nothing else about the line changed");
+    }
+
+    /// The two overlays are independent: dragging a selection across half a
+    /// chip must not choose between underlining it and highlighting it.
+    #[test]
+    fn a_selection_across_a_chip_keeps_both_marks() {
+        //           0123456789...
+        let text = "voici [a.png] la";
+        let (row, chips) = row(text, &[Chip { start: 6, end: 13, number: 1 }]);
+        let sel = Some(Selection {
+            anchor: Anchor { entry: 0, offset: 4 },
+            current: Anchor { entry: 0, offset: 11 },
+        });
+
+        let line = build_line(&row, &chips, &sel);
+        assert_eq!(marked(&line, Modifier::UNDERLINED), "[a.png]");
+        assert_eq!(marked(&line, Modifier::REVERSED), "i [a.pn");
+        assert_eq!(
+            marked(&line, Modifier::UNDERLINED | Modifier::REVERSED),
+            "[a.pn",
+            "the overlap is both at once"
+        );
+    }
+
+    /// A long message that wrapped used to restart at column zero, where a new
+    /// speaker starts — so the rest of a sentence read as a line from nobody.
+    #[test]
+    fn a_wrapped_message_lines_up_under_itself() {
+        let mut history = VecDeque::new();
+        history.push_back(Entry {
+            kind: Kind::Theirs,
+            text: "alice> abcdefghijklmnopqrstuvwxyz".to_owned(),
+            chips: Vec::new(),
+        });
+        let rows = visible_rows(&history, 20, 6, 0);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].indent, 0, "the first row already starts after the prefix");
+        assert_eq!(rows[0].text, "alice> abcdefghijklm");
+        assert_eq!(rows[1].indent, 7, "the rest lines up under the message");
+        assert_eq!(
+            rows[1].text, "nopqrstuvwxyz",
+            "and it wraps to the width the indent left it"
+        );
+
+        // The indent is blank, not text, so a click landing in it resolves to
+        // the row's first character rather than to seven characters in.
+        let mut app = App::new("t".into());
+        app.body_origin = (0, 0);
+        app.viewport = (20, 6);
+        app.history = history;
+        app.rows = rows;
+        assert_eq!(anchor_at(&app, 7, 1).unwrap().offset, 20);
+        assert_eq!(anchor_at(&app, 0, 1).unwrap().offset, 20);
+        assert_eq!(anchor_at(&app, 9, 1).unwrap().offset, 22);
+    }
+
+    /// System lines and anything else with no `name> ` prefix keep the full
+    /// width. A `> ` in the middle of a sentence is punctuation.
+    #[test]
+    fn only_a_real_prefix_indents() {
+        assert_eq!(indent_for("alice> hello", 40), 7);
+        assert_eq!(indent_for("you> hello", 40), 5);
+        assert_eq!(indent_for("-- incoming call --", 40), 0);
+        assert_eq!(
+            indent_for("a sentence that goes on and on> like this", 40),
+            0,
+            "too far in to be a name"
+        );
+        assert_eq!(indent_for("alice> hello", 10), 0, "no room for it");
     }
 
     /// A copy that produced no confirmation is indistinguishable from a copy

@@ -425,7 +425,14 @@ where
     R: futures::io::AsyncRead + Unpin + Send + 'static,
     W: futures::io::AsyncWrite + Unpin + Send + 'static,
 {
-    match chat::run(reader, writer, peer, incoming_dir, lines, screen).await {
+    // The one place both an outgoing and an incoming call pass through, so the
+    // input box learns who it is pointed at — and, whatever happens next,
+    // learns that it is pointed at nobody again.
+    screen.in_call(Some(peer));
+    let ended = chat::run(reader, writer, peer, incoming_dir, lines, screen).await;
+    screen.in_call(None);
+
+    match ended {
         Ok(ended) => {
             screen.system(format!("-- {} --", ended.describe(peer)));
             if ended.leaves() {
