@@ -223,8 +223,13 @@ struct Outgoing {
 /// Which offered file a verb is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Which {
-    /// No argument: the oldest, which is what "the one I just saw" means.
-    Oldest,
+    /// No argument: from the newest message that still has files waiting.
+    ///
+    /// "The one I just read", which is what somebody typing a bare `/accept`
+    /// means. It used to be the oldest still unanswered, and that is wrong in
+    /// the ordinary case: two messages arrive with files, you answer the second
+    /// one, and a file from the first turns up instead.
+    Newest,
     /// A number as shown on screen, counting from 1.
     Numbered(usize),
     /// Every one of them.
@@ -241,7 +246,7 @@ impl Which {
             "all" | "tout" | "tous" => Which::All,
             other => match other.parse() {
                 Ok(n) => Which::Numbered(n),
-                Err(_) => Which::Oldest,
+                Err(_) => Which::Newest,
             },
         }
     }
@@ -258,7 +263,7 @@ fn take_pending(pending: &mut Vec<Offered>, which: Which) -> Result<Offered> {
         bail!("nothing to answer");
     }
     let index = match which {
-        Which::Oldest | Which::All => {
+        Which::Newest | Which::All => {
             let newest = pending.iter().map(|o| o.batch).max().expect("not empty");
             pending
                 .iter()
@@ -588,7 +593,7 @@ where
             && let Err(e) = accept(
                 incoming_dir,
                 &mut pending,
-                Which::Oldest,
+                Which::Newest,
                 &mut receiving,
                 &mut direct_task,
                 &direct_done_tx,
@@ -1308,8 +1313,8 @@ fn classify(line: &str) -> Typed {
         // Typing `/quit` mid-call used to be refused, which meant `/bye` then
         // `/quit`: two commands for one intention nobody splits in their head.
         "/quit" => Typed::HangUp(Ended::Quit),
-        // A message can carry several files, so the verbs take an argument. No
-        // argument means the oldest, which is what "the one I just saw" means.
+        // A message can carry several files, so the verbs take an argument.
+        // See [`Which`] for what no argument means.
         "/accept" => Typed::Accept(Which::parse(rest)),
         "/refuse" => Typed::Refuse(Which::parse(rest)),
         // The whole remainder, not the first word: paths have spaces in them,
@@ -1375,14 +1380,14 @@ mod tests {
 
     #[test]
     fn the_file_verbs_are_recognised() {
-        assert_eq!(classify("/accept"), Typed::Accept(Which::Oldest));
+        assert_eq!(classify("/accept"), Typed::Accept(Which::Newest));
         assert_eq!(classify("/accept 2"), Typed::Accept(Which::Numbered(2)));
         assert_eq!(classify("/accept all"), Typed::Accept(Which::All));
         assert_eq!(classify("/refuse all"), Typed::Refuse(Which::All));
         // Anything that is not a number and not "all" falls back to the oldest
         // rather than erroring: the operator meant `/accept`.
-        assert_eq!(classify("/accept please"), Typed::Accept(Which::Oldest));
-        assert_eq!(classify("/refuse"), Typed::Refuse(Which::Oldest));
+        assert_eq!(classify("/accept please"), Typed::Accept(Which::Newest));
+        assert_eq!(classify("/refuse"), Typed::Refuse(Which::Newest));
         assert_eq!(
             classify("/send /tmp/rapport.pdf"),
             Typed::Send(PathBuf::from("/tmp/rapport.pdf"), Route::Tor)
@@ -1803,11 +1808,11 @@ mod tests {
         ];
 
         // The newest message, and within it the first file.
-        assert_eq!(take_pending(&mut pending, Which::Oldest).unwrap().offer.name, "recent_a.jpg");
-        assert_eq!(take_pending(&mut pending, Which::Oldest).unwrap().offer.name, "recent_b.jpg");
+        assert_eq!(take_pending(&mut pending, Which::Newest).unwrap().offer.name, "recent_a.jpg");
+        assert_eq!(take_pending(&mut pending, Which::Newest).unwrap().offer.name, "recent_b.jpg");
         // Only then the one left over from before.
-        assert_eq!(take_pending(&mut pending, Which::Oldest).unwrap().offer.name, "vieux.jpg");
-        assert!(take_pending(&mut pending, Which::Oldest).is_err());
+        assert_eq!(take_pending(&mut pending, Which::Newest).unwrap().offer.name, "vieux.jpg");
+        assert!(take_pending(&mut pending, Which::Newest).is_err());
     }
 
     /// The bug behind the visible one: numbers were positions, so taking one
