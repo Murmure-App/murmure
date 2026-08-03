@@ -189,11 +189,15 @@ rather than failing.
 for two machines on the same network. Between two *different* networks, it comes
 down to which address the other side can be reached at:
 
-- **With IPv6 on both sides, it works.** There is no NAT, and a machine knows its
+- **With IPv6 on both sides, it can.** There is no NAT, and a machine knows its
   own global IPv6 address because it is simply assigned to the interface. The
   reason IPv4 needs a STUN server is that a machine behind a NAT cannot learn its
-  public address without asking someone; in IPv6 there is nothing to ask. What is
-  left is your router's inbound firewall, which is usually one setting.
+  public address without asking someone; in IPv6 there is nothing to ask.
+  What is left is your router's inbound firewall, and that is the part nobody can
+  promise you. On the one router this was tried on — an Orange Livebox 7 — the
+  IPv6 pinhole page is read-only: one fixed TCP entry, no way to add a UDP one,
+  so QUIC never gets in. Assume it will not work across networks until you have
+  seen it work.
 - **With IPv4 only, it does not.** murmure advertises no public IPv4 address,
   because discovering one needs a third party and this program has none.
 
