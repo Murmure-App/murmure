@@ -9,3 +9,7 @@
 # macOS Finder metadata. Not a glob anchored to the root: Finder drops one of
 # these in every directory it has ever displayed.
 .DS_Store
+# Le guide du pote : francais, personnel, ecrit pour une personne qui va
+# installer murmure sur sa machine. Rien a faire dans un depot public, et il
+# est retire de tout l'historique — pas seulement de la tete.
+/POUR-TON-POTE.md
