@@ -25,9 +25,34 @@ time. It is a phone call, not a text message.
 > Known limits are stated where they apply rather than collected here: search
 > the page for "limit". Windows does not work at all.
 
+## Install
+
+Two archives per release, on the [releases
+page](https://github.com/Murmure-App/murmure/releases): `linux-x86_64` (glibc
+2.35 or newer, so Ubuntu 22.04 and up) and `macos-arm64`. There is no Windows
+binary because there is nothing to ship, and no Intel Mac binary because that
+machine can compile.
+
+A binary from an anonymous account is worth exactly the trust you place in that
+account, which should be none. `SHA256SUMS` only says the download arrived
+intact; what ties an archive to the source that produced it is its provenance
+attestation:
+
+```sh
+gh attestation verify murmure-*.tar.gz --repo Murmure-App/murmure
+```
+
+On macOS the binary is neither signed nor notarized, so Gatekeeper quarantines
+it. Clearing that is a decision, not a formality:
+
+```sh
+xattr -d com.apple.quarantine murmure
+```
+
 ## Build
 
-Needs Rust ≥ 1.91.
+Building it yourself is the recommended path, and the only one that asks you to
+trust nobody. Needs Rust ≥ 1.91.
 
 ```sh
 rustup toolchain install stable && rustup default stable
