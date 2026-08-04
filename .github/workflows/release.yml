@@ -1,0 +1,54 @@
+# Turn a pushed tag into a GitHub release.
+#
+# The point is not to save clicks. A release published from a browser carries
+# the name of whoever was logged in, and murmure is published under a pseudonym
+# on purpose. Here the release is created by `github-actions[bot]`, so there is
+# no human account attached to it at all — one less place for the author's
+# identity to leak into the repository.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+# The default token is read-only on repositories configured that way, and
+# creating a release is a write. Named here rather than in the repository
+# settings so the requirement travels with the file.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit rather than a tag: a tag is a movable pointer, and
+      # whoever controls it controls what runs here with a write token.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          # The tag object itself, not just the commit it points at — its
+          # message is the release notes.
+          fetch-depth: 0
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="$GITHUB_REF_NAME"
+
+          # The notes live in the annotated tag, which is signed. Keeping them
+          # there rather than in a file means the text that describes a version
+          # cannot drift from the version it describes.
+          git for-each-ref "refs/tags/$tag" --format='%(contents:body)' > notes.md
+
+          # Anything with a pre-release suffix — `-beta.1`, `-rc.2` — is not a
+          # stable release, per semver. Deciding it from the tag means there is
+          # no checkbox left to forget.
+          case "$tag" in
+            *-*) prerelease="--prerelease" ;;
+            *)   prerelease="" ;;
+          esac
+
+          gh release create "$tag" $prerelease \
+            --title "murmure ${tag#v}" \
+            --notes-file notes.md
