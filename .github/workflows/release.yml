@@ -1,33 +1,98 @@
-# Turn a pushed tag into a GitHub release.
+# Turn a pushed tag into a GitHub release, with binaries.
 #
 # The point is not to save clicks. A release published from a browser carries
 # the name of whoever was logged in, and murmure is published under a pseudonym
 # on purpose. Here the release is created by `github-actions[bot]`, so there is
 # no human account attached to it at all — one less place for the author's
 # identity to leak into the repository.
+#
+# Binaries are built before the release exists, and the release is created in
+# one shot with all of them. A build that fails therefore produces no release at
+# all, rather than a release missing half its downloads.
 name: release
 
 on:
   push:
     tags: ["v*"]
 
-# The default token is read-only on repositories configured that way, and
-# creating a release is a write. Named here rather than in the repository
-# settings so the requirement travels with the file.
-permissions:
-  contents: write
-
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    # Two targets, and the omissions are deliberate. Windows does not work at
+    # all (arti hangs on its first consensus), and an Intel Mac can build from
+    # source — Apple stopped selling them years ago, and a second macOS runner
+    # doubles the build time of a program that takes ten minutes to compile.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 rather than the latest: the binary is linked against that
+          # runner's glibc, and building on the oldest supported runner is what
+          # decides how old a distribution can still run it. Here, glibc 2.35.
+          - os: ubuntu-22.04
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+
+    runs-on: ${{ matrix.os }}
+    permissions:
+      # Both are for the provenance attestation below, and nothing else.
+      id-token: write
+      attestations: write
+      contents: read
+
     steps:
       # Pinned to a commit rather than a tag: a tag is a movable pointer, and
-      # whoever controls it controls what runs here with a write token.
+      # whoever controls it controls what runs here.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        id: package
+        run: |
+          set -eu
+          dir="murmure-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          mkdir "$dir"
+          cp target/release/murmure LICENSE README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+          echo "archive=$dir.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # What a downloader gets otherwise is a binary from an anonymous account,
+      # which is exactly as trustworthy as it sounds. This ties the archive to
+      # this workflow at this commit, so it can be checked without trusting
+      # whoever uploaded it:
+      #
+      #   gh attestation verify murmure-*.tar.gz --repo Murmure-App/murmure
+      - uses: actions/attest-build-provenance@78e6cbd37d0ac1a40113c04f2037dacf1ea3f12e # v4.0.0
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ steps.package.outputs.archive }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    # The default token is read-only on repositories configured that way, and
+    # creating a release is a write. Named here rather than in the repository
+    # settings so the requirement travels with the file.
+    permissions:
+      contents: write
+
+    steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
         with:
           # The tag object itself, not just the commit it points at — its
           # message is the release notes.
           fetch-depth: 0
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Publish the release
         env:
@@ -35,6 +100,10 @@ jobs:
         run: |
           set -eu
           tag="$GITHUB_REF_NAME"
+
+          # Sorted, so the file is byte-identical for the same set of archives
+          # whatever order the matrix jobs happened to finish in.
+          (cd dist && sha256sum *.tar.gz | sort -k2 > SHA256SUMS)
 
           # The notes live in the annotated tag, which is signed. Keeping them
           # there rather than in a file means the text that describes a version
@@ -49,6 +118,13 @@ jobs:
             *)   prerelease="" ;;
           esac
 
+          # Re-pushing a tag rebuilds it. Without this, the second attempt dies
+          # on "release already exists" after ten minutes of compiling, which is
+          # the least useful moment to find out. The tag survives — only the
+          # release object is replaced.
+          gh release delete "$tag" --yes 2>/dev/null || true
+
           gh release create "$tag" $prerelease \
             --title "murmure ${tag#v}" \
-            --notes-file notes.md
+            --notes-file notes.md \
+            dist/*.tar.gz dist/SHA256SUMS
