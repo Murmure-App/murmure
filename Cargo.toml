@@ -1,6 +1,10 @@
 [package]
 name = "murmure"
-version = "0.1.0"
+# Pre-release on purpose, and it stays that way until someone other than the
+# author has read the security-relevant code. `0.1.0` would say "small but
+# settled"; `-beta` says "the interfaces and the wire format can still move
+# under you". See the Status section of README.md.
+version = "0.1.0-beta.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Peer-to-peer terminal messaging over Tor onion services"

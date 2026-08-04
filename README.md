@@ -231,6 +231,15 @@ MURMURE_DIR=.murmure-b ./target/release/murmure
 
 ## Status
 
+**Beta — `0.1.0-beta.1`.** Not a first stable release, and the version will not
+lose its `-beta` because the code settles down. It loses it when someone other
+than the author has read the parts that matter, which has not happened. Until
+then the label is the honest one: usable, unverified.
+
+Concretely, beta means two things you can plan around. The wire format can
+change between releases and there is no compatibility across them, so both sides
+update together. And the command names are not promises yet.
+
 Text, friends-only discovery and file transfer work, on macOS and Linux. Windows
 does not: arti hangs fetching its first consensus, on two independent machines
 and two networks — see `aidd_docs/arti-windows-hang.md`. Presence does not exist
