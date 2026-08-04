@@ -27,11 +27,17 @@ time. It is a phone call, not a text message.
 
 ## Install
 
-Two archives per release, on the [releases
-page](https://github.com/Murmure-App/murmure/releases): `linux-x86_64` (glibc
-2.35 or newer, so Ubuntu 22.04 and up) and `macos-arm64`. There is no Windows
-binary because there is nothing to ship, and no Intel Mac binary because that
-machine can compile.
+Three archives per release, on the [releases
+page](https://github.com/Murmure-App/murmure/releases):
+
+| archive | runs on |
+|---|---|
+| `linux-x86_64` | glibc 2.35 or newer, so Ubuntu 22.04 and up |
+| `linux-aarch64` | the same, on ARM — a 64-bit Raspberry Pi, an ARM server |
+| `macos-universal` | any Mac, Apple Silicon or Intel |
+
+There is no Windows binary. That is not a packaging decision: arti hangs
+fetching its first consensus there, so there is nothing to ship. Use WSL2.
 
 A binary from an anonymous account is worth exactly the trust you place in that
 account, which should be none. `SHA256SUMS` only says the download arrived

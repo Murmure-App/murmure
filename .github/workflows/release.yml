@@ -17,10 +17,10 @@ on:
 
 jobs:
   build:
-    # Two targets, and the omissions are deliberate. Windows does not work at
-    # all (arti hangs on its first consensus), and an Intel Mac can build from
-    # source — Apple stopped selling them years ago, and a second macOS runner
-    # doubles the build time of a program that takes ten minutes to compile.
+    # Matrix legs run in parallel, so a target costs a runner, not a minute of
+    # anyone's wait. The only platform left out is Windows, and that is not a
+    # packaging decision: arti hangs fetching its first consensus, so there is
+    # no binary to ship.
     strategy:
       fail-fast: false
       matrix:
@@ -30,8 +30,20 @@ jobs:
           # decides how old a distribution can still run it. Here, glibc 2.35.
           - os: ubuntu-22.04
             name: linux-x86_64
+            targets: x86_64-unknown-linux-gnu
+          # A 64-bit Raspberry Pi is a plausible place to leave a Tor service
+          # running, and ARM servers are ordinary now.
+          - os: ubuntu-22.04-arm
+            name: linux-aarch64
+            targets: aarch64-unknown-linux-gnu
+          # Two targets on one runner, joined with `lipo`. A universal binary
+          # rather than two downloads: nobody has to know which Mac they own,
+          # and the extra weight is one copy of a program that is a few
+          # megabytes. It also sidesteps needing an Intel runner to exist —
+          # Apple's SDK cross-compiles from Apple Silicon without one.
           - os: macos-latest
-            name: macos-arm64
+            name: macos-universal
+            targets: aarch64-apple-darwin x86_64-apple-darwin
 
     runs-on: ${{ matrix.os }}
     permissions:
@@ -46,15 +58,32 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
 
       - name: Build
-        run: cargo build --release --locked
+        run: |
+          set -eu
+          for target in ${{ matrix.targets }}; do
+            rustup target add "$target"
+            cargo build --release --locked --target "$target"
+          done
 
       - name: Package
         id: package
         run: |
           set -eu
+          set -- ${{ matrix.targets }}
           dir="murmure-${GITHUB_REF_NAME}-${{ matrix.name }}"
           mkdir "$dir"
-          cp target/release/murmure LICENSE README.md "$dir/"
+
+          # One target is a copy; several is a universal binary. Which one it
+          # is falls out of the matrix entry rather than out of an `if` on the
+          # operating system, so adding an architecture stays a one-line change.
+          if [ $# -gt 1 ]; then
+            lipo -create -output "$dir/murmure" \
+              $(for target; do printf 'target/%s/release/murmure ' "$target"; done)
+          else
+            cp "target/$1/release/murmure" "$dir/murmure"
+          fi
+
+          cp LICENSE README.md "$dir/"
           tar czf "$dir.tar.gz" "$dir"
           echo "archive=$dir.tar.gz" >> "$GITHUB_OUTPUT"
 
