@@ -26,6 +26,9 @@ use anyhow::{Context as _, Result, bail};
 use futures::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tor_hscrypto::pk::HsId;
+
+use crate::identity::Identity;
 
 use crate::proto::{self, Message};
 
@@ -48,6 +51,12 @@ const INBOX: usize = 32;
 /// would ask the borrow checker to prove that two `&mut self` calls do not
 /// overlap, which they do.
 pub struct Link {
+    /// Who is on the other end, proved rather than claimed.
+    ///
+    /// The one fact a caller cannot work out for itself: an onion service is
+    /// told nothing about its client, so without the handshake's signature an
+    /// incoming connection would be from nobody in particular.
+    pub peer: HsId,
     /// Frames to send. Cloneable, so a transfer task can hold one.
     pub outbox: mpsc::Sender<Message>,
     /// Frames received, in order, ending with the reason the peer stopped.
@@ -59,19 +68,19 @@ pub struct Link {
 }
 
 impl Link {
-    /// Agree on a version, then start framing.
+    /// Agree on a version, find out who this is, then start framing.
     ///
     /// The handshake happens here rather than in the conversation loop because
     /// it belongs to the connection: it is asked once, when the connection is
     /// made, not once per call held over it.
-    pub async fn open<R, W>(reader: R, writer: W) -> Result<Self>
+    pub async fn open<R, W>(reader: R, writer: W, me: &Identity) -> Result<Self>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let mut reader = reader;
         let mut writer = writer;
-        proto::handshake(&mut reader, &mut writer).await?;
+        let peer = proto::handshake(&mut reader, &mut writer, me).await?;
 
         let (outbox, mut queued) = mpsc::channel::<Message>(OUTBOX);
         let (inbox_tx, inbox) = mpsc::channel::<Result<Message>>(INBOX);
@@ -107,6 +116,7 @@ impl Link {
         });
 
         Ok(Self {
+            peer,
             outbox,
             inbox,
             reading,
@@ -149,13 +159,78 @@ mod tests {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (ar, aw) = tokio::io::split(a);
         let (br, bw) = tokio::io::split(b);
+        // Two seeds, so the two sides are genuinely different people and the
+        // handshake has something to tell apart.
+        let alice = Identity::for_test([1u8; 32]);
+        let bob = Identity::for_test([2u8; 32]);
         // Both at once: the handshake writes before it reads, so opening them
         // one after the other would deadlock on a duplex with a small buffer.
         let (a, b) = tokio::join!(
-            Link::open(ar.compat(), aw.compat_write()),
-            Link::open(br.compat(), bw.compat_write())
+            Link::open(ar.compat(), aw.compat_write(), &alice),
+            Link::open(br.compat(), bw.compat_write(), &bob)
         );
         (a.unwrap(), b.unwrap())
+    }
+
+    /// Each side learns who the other is, and neither is told — both prove it.
+    ///
+    /// This is what an onion service cannot do on its own: the caller is
+    /// anonymous by construction, so before the handshake signed anything, an
+    /// incoming connection was from nobody in particular.
+    #[tokio::test]
+    async fn both_sides_come_away_knowing_who_they_are_talking_to() {
+        let (a, b) = pair().await;
+        assert_eq!(a.peer, Identity::for_test([2u8; 32]).onion_address());
+        assert_eq!(b.peer, Identity::for_test([1u8; 32]).onion_address());
+    }
+
+    /// Claiming an address is not owning it. Here the claim is a real murmure
+    /// identity's address, sent by someone who does not hold that seed — which
+    /// is exactly the impersonation the signature exists to refuse.
+    #[tokio::test]
+    async fn an_address_that_cannot_be_proved_is_refused() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+
+        let victim = Identity::for_test([1u8; 32]);
+        let liar = Identity::for_test([9u8; 32]);
+        let other = Identity::for_test([2u8; 32]);
+
+        // The liar opens the connection with the victim's address in the
+        // header and their own key underneath. The header is not the part that
+        // has to be right.
+        let forged = {
+            use futures::io::AsyncWriteExt as _;
+            let mut w = aw.compat_write();
+            let mut hello = [0u8; 7 + 2 + 32 + 32];
+            hello[..7].copy_from_slice(b"murmure");
+            hello[7..9].copy_from_slice(&crate::proto::VERSION.to_le_bytes());
+            hello[9..41].copy_from_slice(
+                &tor_hscrypto::pk::HsIdKey::try_from(victim.onion_address())
+                    .unwrap()
+                    .to_bytes(),
+            );
+            tokio::spawn(async move {
+                let _ = w.write_all(&hello).await;
+                let _ = w.flush().await;
+                // Whatever it signs next, it cannot sign with the victim's key.
+                let _ = w.write_all(&liar.sign(b"anything at all").to_bytes()).await;
+                let _ = w.flush().await;
+                // Hold the write half open so the far side fails on the proof
+                // rather than on a closed stream.
+                std::future::pending::<()>().await;
+            })
+        };
+
+        let opened = Link::open(br.compat(), bw.compat_write(), &other).await;
+        forged.abort();
+        let refused = opened.err().expect("a forged address must not open a link");
+        assert!(
+            refused.to_string().contains("cannot prove"),
+            "the refusal has to name the reason: {refused:#}"
+        );
+        drop(ar);
     }
 
     #[tokio::test]

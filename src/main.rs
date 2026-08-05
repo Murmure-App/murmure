@@ -303,14 +303,16 @@ async fn serve(
 
         match event {
             Event::Called(Some(stream)) => {
-                // An onion service does not tell us who the caller is: a client
-                // is anonymous by construction. Naming them is what restricted
-                // discovery (see INSTALL.md) will make possible.
+                // Still nothing here says who is calling: an onion service is
+                // told nothing about its client, and restricted discovery only
+                // decides *whether* one may read our descriptor. The name comes
+                // out of the handshake, one signature later, which is why the
+                // greeting below is the only anonymous line left.
                 screen.system("-- incoming call --");
                 screen.status("in a call");
                 let (reader, writer) = stream.split();
                 if let Flow::Quit =
-                    converse(reader, writer, "they", &incoming_dir, lines, screen).await
+                    converse(reader, writer, identity, book, None, &incoming_dir, lines, screen).await
                 {
                     break;
                 }
@@ -413,12 +415,19 @@ enum Flow {
 /// Hold one conversation and say whether the operator wants out of the program
 /// as well as out of the call.
 ///
+/// `expected` is the contact we meant to reach, on an outgoing call, and
+/// [`None`] when somebody dialled us. Either way the name shown comes from the
+/// address the peer *proved*, never from the one we hoped for.
+///
 /// Never propagates an error: a dropped call must not end the program, so a
 /// failure is shown and treated as an ordinary hang-up.
+#[allow(clippy::too_many_arguments)]
 async fn converse<R, W>(
     reader: R,
     writer: W,
-    peer: &str,
+    identity: &Identity,
+    book: &Contacts,
+    expected: Option<&str>,
     incoming_dir: &Path,
     lines: &mut mpsc::Receiver<ui::Typed>,
     screen: &Screen,
@@ -427,30 +436,56 @@ where
     R: futures::io::AsyncRead + Unpin + Send + 'static,
     W: futures::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // The one place both an outgoing and an incoming call pass through, so the
-    // input box learns who it is pointed at — and, whatever happens next,
-    // learns that it is pointed at nobody again.
-    screen.in_call(Some(peer));
     // The link is opened and closed around the conversation here, which is
     // exactly the pairing the connection pool will take over: a call will stop
     // being the reason a connection exists.
-    let ended = async {
-        let mut link = Link::open(reader, writer).await?;
-        let talked = chat::run(&mut link, peer, incoming_dir, lines, screen).await;
-        // Close either way, and let the conversation's own failure win — a
-        // writer complaining about a stream the peer already dropped explains
-        // less than whatever ended the call.
-        let closed = link
-            .close(matches!(talked, Ok(chat::Ended::PeerHungUp)))
-            .await;
-        talked.and_then(|ended| closed.map(|()| ended))
+    let mut link = match Link::open(reader, writer, identity).await {
+        Ok(link) => link,
+        Err(e) => {
+            screen.error(format!("-- call dropped: {e:#} --"));
+            return Flow::Continue;
+        }
+    };
+
+    // Who this actually is. The handshake proved the address; the book turns it
+    // into a name, and a stranger who got this far is one we used to know.
+    let address = link.peer.display_unredacted().to_string();
+    let peer = match book.name_of(&address) {
+        Some(name) => name.to_owned(),
+        None => format!("someone not in your book ({})", onion::fingerprint(&address)),
+    };
+
+    // An outgoing call that reaches the wrong key is not a call to answer. It
+    // cannot happen by accident — we dialled an address and the far side proved
+    // that same address — so if it ever does, something is wrong enough that
+    // continuing would be the mistake.
+    if let Some(meant) = expected
+        && meant != peer
+    {
+        screen.error(format!(
+            "-- refused: you called {meant}, but the far side proved it is {peer} --"
+        ));
+        let _ = link.close(false).await;
+        return Flow::Continue;
     }
-    .await;
+
+    // The one place both an outgoing and an incoming call pass through, so the
+    // input box learns who it is pointed at — and, whatever happens next,
+    // learns that it is pointed at nobody again.
+    screen.in_call(Some(&peer));
+    let talked = chat::run(&mut link, &peer, incoming_dir, lines, screen).await;
+    // Close either way, and let the conversation's own failure win — a writer
+    // complaining about a stream the peer already dropped explains less than
+    // whatever ended the call.
+    let closed = link
+        .close(matches!(talked, Ok(chat::Ended::PeerHungUp)))
+        .await;
+    let ended = talked.and_then(|ended| closed.map(|()| ended));
     screen.in_call(None);
 
     match ended {
         Ok(ended) => {
-            screen.system(format!("-- {} --", ended.describe(peer)));
+            screen.system(format!("-- {} --", ended.describe(&peer)));
             if ended.leaves() {
                 return Flow::Quit;
             }
@@ -529,7 +564,7 @@ async fn command(
                 .address_of(name)
                 .ok_or_else(|| anyhow::anyhow!("no contact called {name} — /add them first"))?
                 .to_owned();
-            return call(started, live, name, &address, lines, screen).await;
+            return call(started, live, book, name, &address, lines, screen).await;
         }
         "/copy" => {
             // Exactly what the other person has to type after `/add <name>`, in
@@ -559,6 +594,7 @@ async fn command(
 async fn call(
     started: Instant,
     live: &Live<'_>,
+    book: &Contacts,
     name: &str,
     address: &str,
     lines: &mut mpsc::Receiver<ui::Typed>,
@@ -623,7 +659,7 @@ async fn call(
     screen.system(format!("-- connected to {name} --"));
     screen.status(format!("in a call with {name}"));
     let (reader, writer) = stream.split();
-    let flow = converse(reader, writer, name, live.incoming_dir, lines, screen).await;
+    let flow = converse(reader, writer, live.identity, book, Some(name), live.incoming_dir, lines, screen).await;
     if let Flow::Continue = flow {
         screen.status("listening");
     }

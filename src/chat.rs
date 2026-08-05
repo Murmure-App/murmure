@@ -1324,6 +1324,7 @@ mod tests {
     async fn talk<R, W>(
         reader: R,
         writer: W,
+        seed: [u8; 32],
         peer: &str,
         incoming_dir: &Path,
         lines: &mut mpsc::Receiver<crate::ui::Typed>,
@@ -1333,7 +1334,10 @@ mod tests {
         R: futures::io::AsyncRead + Unpin + Send + 'static,
         W: futures::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let mut link = Link::open(reader, writer).await?;
+        // A distinct seed per side, so the handshake has two people to tell
+        // apart. Which one is which does not matter here — chat is given the
+        // peer's name by its caller.
+        let mut link = Link::open(reader, writer, &crate::identity::Identity::for_test(seed)).await?;
         let talked = run(&mut link, peer, incoming_dir, lines, screen).await;
         let closed = link.close(matches!(talked, Ok(Ended::PeerHungUp))).await;
         talked.and_then(|ended| closed.map(|()| ended))
@@ -1445,6 +1449,7 @@ mod tests {
                 talk(
                     alice_r.compat(),
                     alice_w.compat_write(),
+                    [1u8; 32],
                     "them",
                     &dir,
                     &mut rx,
@@ -1458,7 +1463,11 @@ mod tests {
             // that two matching versions agree at all.
             let mut bob_r = bob_r.compat();
             let mut bob_w = bob_w.compat_write();
-            proto::handshake(&mut bob_r, &mut bob_w).await.unwrap();
+            let bob = crate::identity::Identity::for_test([2u8; 32]);
+            let who = proto::handshake(&mut bob_r, &mut bob_w, &bob).await.unwrap();
+            // And the hand-rolled side learns who called, from the proof rather
+            // than from anything the transport said.
+            assert_eq!(who, crate::identity::Identity::for_test([1u8; 32]).onion_address());
 
             let got = proto::read_frame(&mut bob_r).await.unwrap();
             assert_eq!(got, Some(Message::Text("bonjour".into())));
@@ -1528,11 +1537,11 @@ mod tests {
 
             let to_b = to.clone();
             let bob = tokio::spawn(async move {
-                talk(br.compat(), bw.compat_write(), "alice", &to_b, &mut b_rx, &b_screen).await
+                talk(br.compat(), bw.compat_write(), [1u8; 32], "alice", &to_b, &mut b_rx, &b_screen).await
             });
             let unused = dir.join("unused");
             let alice = tokio::spawn(async move {
-                talk(ar.compat(), aw.compat_write(), "bob", &unused, &mut a_rx, &a_screen).await
+                talk(ar.compat(), aw.compat_write(), [2u8; 32], "bob", &unused, &mut a_rx, &a_screen).await
             });
 
             alice.await.unwrap().unwrap();
@@ -1661,11 +1670,11 @@ mod tests {
 
             let to_b = to.clone();
             let bob = tokio::spawn(async move {
-                talk(br.compat(), bw.compat_write(), "alice", &to_b, &mut b_rx, &b_screen).await
+                talk(br.compat(), bw.compat_write(), [1u8; 32], "alice", &to_b, &mut b_rx, &b_screen).await
             });
             let unused = dir.join("unused");
             let alice = tokio::spawn(async move {
-                talk(ar.compat(), aw.compat_write(), "bob", &unused, &mut a_rx, &a_screen).await
+                talk(ar.compat(), aw.compat_write(), [2u8; 32], "bob", &unused, &mut a_rx, &a_screen).await
             });
             alice.await.unwrap().unwrap();
             bob.await.unwrap().unwrap();
@@ -1759,11 +1768,11 @@ mod tests {
 
             let to_b = to.clone();
             let bob = tokio::spawn(async move {
-                talk(br.compat(), bw.compat_write(), "alice", &to_b, &mut b_rx, &b_screen).await
+                talk(br.compat(), bw.compat_write(), [1u8; 32], "alice", &to_b, &mut b_rx, &b_screen).await
             });
             let unused = dir.join("unused");
             let alice = tokio::spawn(async move {
-                talk(ar.compat(), aw.compat_write(), "bob", &unused, &mut a_rx, &a_screen).await
+                talk(ar.compat(), aw.compat_write(), [2u8; 32], "bob", &unused, &mut a_rx, &a_screen).await
             });
             alice.await.unwrap().unwrap();
             bob.await.unwrap().unwrap();

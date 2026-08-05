@@ -133,9 +133,26 @@ impl Contacts {
         self.entries.get(name.trim()).map(|c| c.address.as_str())
     }
 
-    // Still no reverse lookup. Restricted discovery decides *whether* a client
-    // may read our descriptor; it does not tell the service which one did. The
-    // rendezvous stays anonymous, so an incoming call is still "they".
+    /// The name filed for this address, if any.
+    ///
+    /// This used to be impossible, and the reason is worth keeping: restricted
+    /// discovery decides *whether* a client may read our descriptor, and never
+    /// tells the service which one did. The rendezvous is anonymous, so an
+    /// incoming call was "they" and could not be anything else.
+    ///
+    /// What changed is not the transport. The caller now proves an address in
+    /// [`crate::proto::handshake`] by signing a challenge with the key that
+    /// address is derived from, so there is finally something to look up here.
+    ///
+    /// A linear scan: a book that would notice the difference is a book far
+    /// past what this program is for.
+    pub fn name_of(&self, address: &str) -> Option<&str> {
+        let address = address.trim();
+        self.entries
+            .iter()
+            .find(|(_, c)| c.address == address)
+            .map(|(name, _)| name.as_str())
+    }
 
     /// Every contact, name first, in a stable order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Contact)> {

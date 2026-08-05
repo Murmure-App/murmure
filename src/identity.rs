@@ -163,6 +163,25 @@ impl Identity {
         HsIdKeypair::from(expanded)
     }
 
+    /// Sign a message with the key the `.onion` address is derived from.
+    ///
+    /// This is what lets a peer be *named*. An onion service authenticates the
+    /// server, never the client, so an incoming stream carries no identity at
+    /// all — the caller has to assert one and prove it. Proving it costs
+    /// nothing extra here: the address already is this public key, so the
+    /// signature checks against the address itself rather than against a
+    /// certificate somebody has to trust.
+    ///
+    /// Only [`crate::proto::handshake`] should call this, and only over the
+    /// challenge it builds. A signing oracle over arbitrary attacker-chosen
+    /// bytes is how signature schemes get turned against their owner; the
+    /// domain separator in that challenge is what keeps this key's signatures
+    /// from meaning anything anywhere else.
+    pub fn sign(&self, message: &[u8]) -> ed25519::Signature {
+        let keypair = ed25519::Keypair::from_bytes(&self.seed);
+        ed25519::ExpandedKeypair::from(&keypair).sign(message)
+    }
+
     /// Derive a 32-byte secret from the seed, for a named purpose.
     ///
     /// `context` separates purposes: the key sealing the contacts book and the
@@ -207,6 +226,19 @@ impl Identity {
     /// both read. This is what a friend authorises.
     pub fn discovery_key(&self) -> HsClientDescEncKey {
         HsClientDescEncKey::from(&self.discovery_secret())
+    }
+
+    /// An identity with no file behind it, for tests in other modules.
+    ///
+    /// Test-only because nothing in the program should hold a seed it did not
+    /// load from a checked file: `check_permissions` is the reason
+    /// `load_or_create` is the only public constructor.
+    #[cfg(test)]
+    pub fn for_test(seed: [u8; SEED_LEN]) -> Self {
+        Self {
+            seed: Zeroizing::new(seed),
+            path: PathBuf::from("/nonexistent"),
+        }
     }
 
     /// The `.onion` identity derived from the seed, computed locally.

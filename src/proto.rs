@@ -24,7 +24,12 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use futures::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
+use tor_hscrypto::pk::{HsId, HsIdKey};
+use tor_llcrypto::pk::ed25519;
+
+use crate::identity::Identity;
 
 /// What this build speaks.
 ///
@@ -37,7 +42,7 @@ use serde::{Deserialize, Serialize};
 /// is young enough that maintaining two wire formats would cost more than
 /// telling two people to run the same build, and a version that is refused
 /// loudly is worth more than one that half-works.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Sent before anything else, so that a stream carrying something other than
 /// murmure fails as itself rather than as a nonsensical version number.
@@ -52,53 +57,150 @@ const MAGIC: &[u8; 7] = b"murmure";
 /// handshake exists to prevent.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Agree on a protocol version before a single frame is decoded, or fail
-/// saying which two versions disagreed.
+/// Domain separator for the signed challenge. Frozen: changing it invalidates
+/// every signature both sides would compute, which is a version bump.
+const AUTH_CONTEXT: &[u8] = b"murmure-auth-v1";
+
+/// The opening bytes: magic, version, who we claim to be, and a challenge.
+const HELLO_LEN: usize = 7 + 2 + 32 + 32;
+
+/// Agree on a version, then prove to each other who is on the line.
 ///
-/// # Why nine bytes written by hand
+/// Returns the peer's `.onion` identity, **verified** — they signed our
+/// challenge with the key that address is derived from, so it is theirs or
+/// nobody's.
 ///
-/// The obvious design is a `Message::Hello { version }` variant, and it does
-/// not work: postcard would encode it, so the mis-decoding this guards against
-/// would apply to the guard itself. A peer whose enum has a variant inserted
-/// above `Hello` would read our version as some other message entirely. A fixed
+/// # Why identity has to be proved here
+///
+/// An onion service authenticates the server and not the client: a stream
+/// arriving at our service comes from someone who could read our descriptor,
+/// which restricted discovery narrows to our contacts, and no further. So
+/// before this, an incoming call was from "they" — murmure could not name the
+/// caller even among people it knows. Presence has nowhere to attach without a
+/// name, and neither does anything else that treats one contact differently
+/// from another.
+///
+/// The proof is cheap because the address already *is* an ed25519 public key.
+/// There is no certificate, no third party and no new key: each side signs
+/// `context || signer || verifier || the verifier's nonce` with the seed it
+/// already owns, and the address it claims is the key that check runs against.
+///
+/// The nonce is what stops a recording of yesterday's handshake from being
+/// replayed today. Naming both parties in a fixed order is what stops our own
+/// challenge being reflected back at us: the bytes we would have to verify are
+/// not the bytes we signed.
+///
+/// # Why the header is written by hand
+///
+/// The obvious design is a `Message::Hello` variant, and it does not work:
+/// postcard would encode it, so the mis-decoding this guards against would
+/// apply to the guard itself. A peer whose enum has a variant inserted above
+/// `Hello` would read our version as some other message entirely. A fixed
 /// header owes nothing to serde and cannot drift with the enum.
 ///
-/// Both sides send first and read second. Nine bytes fit in any transport
-/// buffer, so nobody blocks waiting for the other to go first.
-pub async fn handshake<R, W>(r: &mut R, w: &mut W) -> Result<()>
+/// Both sides send before they read, in both rounds, so nobody blocks waiting
+/// for the other to go first.
+pub async fn handshake<R, W>(r: &mut R, w: &mut W, me: &Identity) -> Result<HsId>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut ours = [0u8; 9];
-    ours[..7].copy_from_slice(MAGIC);
-    ours[7..].copy_from_slice(&VERSION.to_le_bytes());
-    w.write_all(&ours)
-        .await
-        .context("sending our protocol version")?;
-    w.flush().await.context("sending our protocol version")?;
+    let my_id = me.onion_address();
+    let mut my_nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut my_nonce);
 
-    let mut theirs = [0u8; 9];
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, r.read_exact(&mut theirs)).await {
+    let mut ours = [0u8; HELLO_LEN];
+    ours[..7].copy_from_slice(MAGIC);
+    ours[7..9].copy_from_slice(&VERSION.to_le_bytes());
+    ours[9..41].copy_from_slice(&id_bytes(&my_id)?);
+    ours[41..].copy_from_slice(&my_nonce);
+    w.write_all(&ours).await.context("saying who we are")?;
+    w.flush().await.context("saying who we are")?;
+
+    // Read in two bites, and the split is deliberate. Whatever else connects to
+    // this port — a scanner, a browser, an older murmure — nine bytes is enough
+    // to say what it is. Waiting for all seventy-three first would report a
+    // short HTTP probe as a truncated read instead of as something that does
+    // not speak murmure.
+    let mut head = [0u8; 9];
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, r.read_exact(&mut head)).await {
         Err(_) => bail!(
             "the other side never said which version of murmure it speaks — \
              it is probably an older build. Both sides must run the same one."
         ),
-        Ok(read) => read.context("reading the other side's protocol version")?,
+        Ok(read) => read.context("reading the other side's opening")?,
     }
 
-    if &theirs[..7] != MAGIC {
+    if &head[..7] != MAGIC {
         bail!("whatever answered on that address, it does not speak murmure");
     }
-    let theirs = u16::from_le_bytes([theirs[7], theirs[8]]);
-    if theirs != VERSION {
+    let their_version = u16::from_le_bytes([head[7], head[8]]);
+    if their_version != VERSION {
         bail!(
-            "version mismatch: they speak murmure {theirs}, this is murmure {VERSION}. \
+            "version mismatch: they speak murmure {their_version}, this is murmure {VERSION}. \
              Both sides must run the same build — there is no compatibility between \
              versions yet."
         );
     }
-    Ok(())
+
+    let mut theirs = [0u8; HELLO_LEN - 9];
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, r.read_exact(&mut theirs)).await {
+        Err(_) => bail!("the other side never said which address it claims"),
+        Ok(read) => read.context("reading the address the other side claims")?,
+    }
+    let their_id_bytes: [u8; 32] = theirs[..32].try_into().expect("fixed slice");
+    let their_key = ed25519::PublicKey::from_bytes(&their_id_bytes)
+        .map_err(|_| anyhow::anyhow!("the address the other side claims is not a valid key"))?;
+    let their_id = HsIdKey::from(their_key).id();
+    let their_nonce: [u8; 32] = theirs[32..].try_into().expect("fixed slice");
+
+    // We sign the challenge they sent; they sign the one we sent.
+    let signed = me.sign(&challenge(&id_bytes(&my_id)?, &their_id_bytes, &their_nonce));
+    w.write_all(&signed.to_bytes())
+        .await
+        .context("proving who we are")?;
+    w.flush().await.context("proving who we are")?;
+
+    let mut proof = [0u8; 64];
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, r.read_exact(&mut proof)).await {
+        Err(_) => bail!("the other side never proved the address it claims"),
+        Ok(read) => read.context("reading the other side's proof")?,
+    }
+    their_key
+        .verify(
+            &challenge(&their_id_bytes, &id_bytes(&my_id)?, &my_nonce),
+            &ed25519::Signature::from_bytes(&proof),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "the other side claims an address it cannot prove it owns — \
+                 refusing the connection"
+            )
+        })?;
+
+    Ok(their_id)
+}
+
+/// The bytes a signer commits to: who they are, who they are talking to, and
+/// the challenge that side chose.
+///
+/// Order is load-bearing. `signer` and `verifier` swap places between the two
+/// sides, so a signature made in one direction cannot be verified in the other
+/// — which is what a reflection attack would need.
+fn challenge(signer: &[u8; 32], verifier: &[u8; 32], nonce: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(AUTH_CONTEXT.len() + 96);
+    msg.extend_from_slice(AUTH_CONTEXT);
+    msg.extend_from_slice(signer);
+    msg.extend_from_slice(verifier);
+    msg.extend_from_slice(nonce);
+    msg
+}
+
+/// The 32 bytes of an `.onion` identity, which are its ed25519 public key.
+fn id_bytes(id: &HsId) -> Result<[u8; 32]> {
+    Ok(HsIdKey::try_from(*id)
+        .map_err(|_| anyhow::anyhow!("this identity is not a valid ed25519 key"))?
+        .to_bytes())
 }
 
 /// Largest frame accepted, in bytes.
@@ -481,29 +583,45 @@ mod tests {
 
     use super::*;
 
-    /// The header a peer on `version` would send.
-    fn header(version: u16) -> Vec<u8> {
+    /// Us, for tests that only need someone to be.
+    fn me() -> Identity {
+        Identity::for_test([1u8; 32])
+    }
+
+    /// The opening a peer on `version` with this identity would send. The
+    /// challenge is left zero: a test that never gets as far as the signature
+    /// does not care what it was.
+    fn hello(version: u16, who: &Identity) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
         out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&id_bytes(&who.onion_address()).unwrap());
+        out.extend_from_slice(&[0u8; 32]);
         out
     }
 
-    /// Two builds that agree say so and get out of the way.
+    /// Two builds that agree get past the version and on to the identities.
     #[tokio::test]
     async fn matching_versions_agree() {
-        let r = header(VERSION);
+        let them = Identity::for_test([2u8; 32]);
+        let r = hello(VERSION, &them);
         let mut sent = Vec::new();
-        handshake(&mut r.as_slice(), &mut sent).await.unwrap();
-        assert_eq!(sent, header(VERSION), "and we announced ourselves too");
+        // No proof follows, so this stops at the signature — which is far
+        // enough to prove the version and the identity were both accepted.
+        let _ = handshake(&mut r.as_slice(), &mut sent, &me()).await;
+        assert_eq!(
+            &sent[..hello(VERSION, &me()).len() - 32],
+            &hello(VERSION, &me())[..hello(VERSION, &me()).len() - 32],
+            "we announced our version and our address"
+        );
     }
 
-    /// The failure this whole handshake exists for: two people who cloned the
+    /// The failure the version half exists for: two people who cloned the
     /// repository weeks apart. Without it, postcard decodes their frames
     /// against our enum and the error arrives later wearing the wrong name.
     #[tokio::test]
     async fn a_different_version_is_refused_by_name() {
-        let r = header(VERSION + 1);
-        let e = handshake(&mut r.as_slice(), &mut Vec::new())
+        let r = hello(VERSION + 1, &Identity::for_test([2u8; 32]));
+        let e = handshake(&mut r.as_slice(), &mut Vec::new(), &me())
             .await
             .unwrap_err()
             .to_string();
@@ -516,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn something_that_is_not_murmure_is_told_apart_from_a_version() {
         let r = b"GET / HTTP".to_vec();
-        let e = handshake(&mut r.as_slice(), &mut Vec::new())
+        let e = handshake(&mut r.as_slice(), &mut Vec::new(), &me())
             .await
             .unwrap_err()
             .to_string();
@@ -529,20 +647,61 @@ mod tests {
     async fn a_peer_that_never_answers_gives_up() {
         // Never ready, never closed: an older build sitting on an open stream
         // with nothing to say.
-        let (mine, _theirs) = tokio::io::duplex(64);
+        let (mine, _theirs) = tokio::io::duplex(1024);
         let (r, w) = tokio::io::split(mine);
-        let e = handshake(&mut r.compat(), &mut w.compat_write())
+        let e = handshake(&mut r.compat(), &mut w.compat_write(), &me())
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("older build"), "{e}");
     }
 
+    /// A peer that says who it is and then goes quiet has still proved
+    /// nothing, and the wait for the proof must end too.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_proves_itself_gives_up() {
+        let (mine, theirs) = tokio::io::duplex(1024);
+        let (r, w) = tokio::io::split(mine);
+        let (_their_r, their_w) = tokio::io::split(theirs);
+        {
+            use tokio::io::AsyncWriteExt as _;
+            let mut their_w = their_w;
+            their_w
+                .write_all(&hello(VERSION, &Identity::for_test([2u8; 32])))
+                .await
+                .unwrap();
+            their_w.flush().await.unwrap();
+            std::mem::forget(their_w);
+        }
+        let e = handshake(&mut r.compat(), &mut w.compat_write(), &me())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("never proved"), "{e}");
+    }
+
     /// A peer that hangs up mid-header is a broken connection, not a version.
     #[tokio::test]
     async fn a_truncated_header_is_an_error() {
         let mut r = &MAGIC[..4];
-        assert!(handshake(&mut r, &mut Vec::new()).await.is_err());
+        assert!(handshake(&mut r, &mut Vec::new(), &me()).await.is_err());
+    }
+
+    /// The challenge is what makes a recording useless. Two handshakes from the
+    /// same identity commit to different bytes, so yesterday's signature proves
+    /// nothing today.
+    #[tokio::test]
+    async fn every_handshake_asks_a_different_question() {
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let r = hello(VERSION, &Identity::for_test([2u8; 32]));
+        let _ = handshake(&mut r.as_slice(), &mut first, &me()).await;
+        let _ = handshake(&mut r.as_slice(), &mut second, &me()).await;
+        assert_ne!(
+            first[41..HELLO_LEN],
+            second[41..HELLO_LEN],
+            "a fixed challenge would make every proof replayable"
+        );
     }
 
     /// Encode messages back-to-back the way a conversation does, then read them
