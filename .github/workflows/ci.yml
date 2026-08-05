@@ -1,0 +1,67 @@
+# Compile and test murmure on every push, on the platforms it claims to support.
+#
+# Before this existed, the only thing that ever built murmure in a clean
+# environment was the release workflow — which runs after a tag is pushed, when
+# finding out is least useful.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first one's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # Pinned to a commit rather than a tag: a tag is a movable pointer, and
+      # whoever controls it controls what runs here.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+
+      # arti is around ten minutes of compilation from cold, which is long
+      # enough that an uncached CI is one nobody waits for. The key is the
+      # lockfile: dependencies only rebuild when they actually change.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-
+
+      # No `cargo fmt --check`. Running it on this tree rewrites 450 lines
+      # across every file — rustfmt breaks method chains over 60 characters,
+      # and a good deal of this code reads better on one line than on four.
+      # Enforcing it would buy consistency nobody asked for at the price of a
+      # commit that makes `git blame` useless everywhere. Add it the day a
+      # second person writes code here.
+      #
+      # Lints run on one platform only. Clippy reads the source, not the
+      # machine, so a second run would say the same thing twice.
+      - name: Lints
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --all-targets -- -D warnings
+
+      # `--locked` so a dependency that resolves differently here than on the
+      # author's machine fails loudly instead of being silently tested.
+      #
+      # The ignored test dials the real Tor network. It belongs to a person
+      # debugging a bootstrap, not to CI, where it would fail on the network
+      # rather than on the code.
+      - name: Tests
+        run: cargo test --locked
