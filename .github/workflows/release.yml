@@ -137,7 +137,19 @@ jobs:
           # The notes live in the annotated tag, which is signed. Keeping them
           # there rather than in a file means the text that describes a version
           # cannot drift from the version it describes.
-          git for-each-ref "refs/tags/$tag" --format='%(contents:body)' > notes.md
+          #
+          # Checkout leaves a lightweight tag behind — the annotated object is
+          # not fetched — and every way of reading a tag message falls back to
+          # the message of the commit it points at when the tag is lightweight.
+          # That fallback is silent and the result looks like prose, so it
+          # shipped a commit message as release notes once. Hence both lines
+          # below: fetch the real object, then refuse to continue without it.
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          if [ "$(git cat-file -t "$tag")" != tag ]; then
+            echo "$tag is not an annotated tag — there are no notes to publish." >&2
+            exit 1
+          fi
+          git tag -l --format='%(contents:body)' "$tag" > notes.md
 
           # Anything with a pre-release suffix — `-beta.1`, `-rc.2` — is not a
           # stable release, per semver. Deciding it from the tag means there is
