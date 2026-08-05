@@ -10,12 +10,16 @@
 //!
 //! # Shape
 //!
-//! Two tasks and one loop. The **reader** task pulls frames off the wire and
-//! forwards them, deciding nothing; the **writer** task is the only thing that
-//! touches the write half. Everything in between — what to print, what to
-//! answer, where a transfer is up to — happens in the loop, which is therefore
-//! the single owner of every piece of state. No locks, and no state split
-//! across a task boundary.
+//! One loop, over a connection it does not own. [`crate::link::Link`] holds the
+//! stream, the version handshake and the two tasks that turn bytes into a queue
+//! of frames; this module borrows the two ends of that queue. Everything in
+//! between — what to print, what to answer, where a transfer is up to — happens
+//! in the loop, which is therefore the single owner of every piece of state. No
+//! locks, and no state split across a task boundary.
+//!
+//! The conversation borrowing rather than owning is what lets a call end
+//! without the connection ending. See [`crate::link`] for why that is worth a
+//! module.
 //!
 //! That matters most for files. A transfer's state is read by the keyboard
 //! branch (`/accept`), by the wire branch (a chunk arriving) and by the pump
@@ -33,27 +37,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use futures::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use crate::files::{self, Offer};
+use crate::link::Link;
 use crate::proto::{self, MAX_CHUNK, MAX_TEXT, Message};
 use crate::ui::{Kind, Screen};
-
-/// How many outbound frames may queue before the sender waits.
-///
-/// Small on purpose: a backlog here means the network is slower than the typing,
-/// and making the typist wait is more honest than growing a buffer. It is also
-/// what paces a file transfer — the chunk pump waits for room in this channel
-/// rather than for a timer.
-const OUTBOX: usize = 32;
-
-/// How many inbound frames may queue before the reader task waits.
-///
-/// Backpressure onto the peer's circuit is the right answer to a loop that is
-/// busy: the alternative is buffering a file in memory on the way to the disk.
-const INBOX: usize = 32;
-
 
 /// How often a running transfer refreshes the bar.
 ///
@@ -296,52 +285,23 @@ struct Receiving {
     progress: Progress,
 }
 
-/// Run a conversation over an open stream.
+/// Run a conversation over an open [`Link`].
 ///
-/// `lines` is borrowed rather than consumed: when the conversation ends, the
-/// caller goes back to reading commands from the same keyboard. `incoming_dir`
-/// is where accepted files land.
-pub async fn run<R, W>(
-    reader: R,
-    writer: W,
+/// Both the link and `lines` are borrowed rather than consumed: when the
+/// conversation ends, the caller goes back to reading commands from the same
+/// keyboard, and the connection is still there for the next call.
+/// `incoming_dir` is where accepted files land.
+pub async fn run(
+    link: &mut Link,
     peer: &str,
     incoming_dir: &Path,
     lines: &mut mpsc::Receiver<crate::ui::Typed>,
     screen: &Screen,
-) -> Result<Ended>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    // First, and while both halves are still here to be handed to it: agree on
-    // a version. A peer running a different build would otherwise decode our
-    // frames as whatever its own enum says that byte means, and the failure
-    // would arrive later wearing the wrong name. See [`proto::handshake`].
-    let mut reader = reader;
-    let mut writer = writer;
-    proto::handshake(&mut reader, &mut writer).await?;
-
-    let (outbox, mut queued) = mpsc::channel::<Message>(OUTBOX);
-    let (inbox_tx, mut inbox) = mpsc::channel::<Message>(INBOX);
-
-    let writing = tokio::spawn(async move {
-        while let Some(msg) = queued.recv().await {
-            proto::write_frame(&mut writer, &msg).await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    });
-
-    // Decides nothing: every frame goes to the loop, which owns the state that
-    // says what a frame means.
-    let reading = tokio::spawn(async move {
-        while let Some(msg) = proto::read_frame(&mut reader).await? {
-            if inbox_tx.send(msg).await.is_err() {
-                break;
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    });
-    futures::pin_mut!(reading);
+) -> Result<Ended> {
+    // Borrowed as separate fields, because the loop needs to send a reply while
+    // waiting on the next frame.
+    let outbox = &link.outbox;
+    let inbox = &mut link.inbox;
 
     // All conversation state, owned here and nowhere else.
     let mut sending: Option<Sending> = None;
@@ -385,13 +345,10 @@ where
             // The keyboard comes first so a `/bye` typed during a transfer is
             // seen at once rather than after the file.
             //
-            // The inbox comes before the reader task's completion, because a
-            // peer that hangs up immediately after the last frame makes both
-            // ready at the same moment. Taking the hang-up first would drop
-            // whatever is still queued — including the `FileDone` that turns a
-            // pile of chunks into a file. Draining first is correct: `recv`
-            // yields `None` once the queue is empty *and* the sender is gone, at
-            // which point this arm switches off and the hang-up is taken.
+            // A peer hanging up cannot overtake what they said: the reason the
+            // stream ended travels in the same queue as the frames, so `recv`
+            // hands over everything already read before it hands over the end.
+            // See [`crate::link`].
             //
             // The pump is last: it runs on whatever is left over.
             biased;
@@ -409,7 +366,7 @@ where
                 // it goes out as a Post, with the files where they were put.
                 let line = match line {
                     crate::ui::Typed::Post { parts, direct } => {
-                        match post(parts, direct, &mut offered, &outbox, screen).await {
+                        match post(parts, direct, &mut offered, outbox, screen).await {
                             Ok(()) => {}
                             Err(e) => screen.error(format!("{e:#}")),
                         }
@@ -440,7 +397,7 @@ where
                     )),
                     Typed::Send(path, route) => {
                         if let Err(e) =
-                            start_sending(&path, route, &mut offered, &outbox, screen).await
+                            start_sending(&path, route, &mut offered, outbox, screen).await
                         {
                             screen.error(format!("{e:#}"));
                         }
@@ -454,7 +411,7 @@ where
                             &mut receiving,
                             &mut direct_task,
                             &direct_done_tx,
-                            &outbox,
+                            outbox,
                             screen,
                         )
                         .await
@@ -532,13 +489,41 @@ where
                 }
             }
 
-            Some(msg) = inbox.recv() => {
+            // Everything the peer sent, then why they stopped, in that order.
+            //
+            // Guarded, because the end can be observed without leaving the loop
+            // — a direct transfer may still be running — and an exhausted
+            // channel returns `None` for ever, which would spin.
+            frame = inbox.recv(), if !peer_gone => {
+                let msg = match frame {
+                    Some(Ok(msg)) => msg,
+                    // The stream failed rather than closing. Nothing queued is
+                    // lost: it was all handed over above, before this.
+                    Some(Err(e)) => {
+                        screen.error(format!("{e:#}"));
+                        break Ended::PeerHungUp;
+                    }
+                    // A clean hang-up. A direct transfer runs on its own socket,
+                    // so the peer closing the *Tor* stream says nothing about it
+                    // — and the sending side closes as soon as its own half is
+                    // done, which is normal. Leaving here would drop the file on
+                    // the floor with every byte already on disk.
+                    None => {
+                        if direct_task.as_ref().is_some_and(|t| !t.is_finished()) {
+                            peer_gone = true;
+                            leaving.get_or_insert(Ended::PeerHungUp);
+                        } else {
+                            break Ended::PeerHungUp;
+                        }
+                        continue;
+                    }
+                };
                 let outcome = handle(
                     msg, peer, incoming_dir,
                     &mut pending, &mut next_number, &mut next_batch,
                     &mut receiving, &mut sending, &mut offered,
                     &mut direct_task, &direct_done_tx,
-                    &outbox, screen,
+                    outbox, screen,
                 ).await;
                 match outcome {
                     // A protocol fault ends the conversation rather than being
@@ -550,26 +535,6 @@ where
                     }
                     Ok(false) => break Ended::PeerHungUp,
                     Ok(true) => {}
-                }
-            }
-
-            // The peer's side of the conversation ended, cleanly or not. Only
-            // reached once the inbox above has been drained.
-            //
-            // Guarded, because it can now be taken without leaving the loop: a
-            // completed `JoinHandle` polled twice panics.
-            outcome = &mut reading, if !peer_gone => {
-                outcome.map_err(|e| anyhow::anyhow!("the reader task panicked: {e}"))??;
-                // A direct transfer runs on its own socket, so the peer closing
-                // the *Tor* stream says nothing about it — and the sending side
-                // hangs up as soon as its own half is done, which is normal.
-                // Leaving here would drop the file on the floor with every byte
-                // already on disk.
-                if direct_task.as_ref().is_some_and(|t| !t.is_finished()) {
-                    peer_gone = true;
-                    leaving.get_or_insert(Ended::PeerHungUp);
-                } else {
-                    break Ended::PeerHungUp;
                 }
             }
 
@@ -603,7 +568,7 @@ where
                 &mut receiving,
                 &mut direct_task,
                 &direct_done_tx,
-                &outbox,
+                outbox,
                 screen,
             )
             .await
@@ -633,18 +598,8 @@ where
         }
     };
 
-    // Order matters. The reader task holds the inbox sender, and the writer
-    // outlives its queue only while a sender exists. Stop the reader first, then
-    // drop ours, or `writing.await` waits on a channel nothing will close.
-    reading.abort();
-    drop(outbox);
-    match writing.await {
-        Ok(Ok(())) => {}
-        // A write failing as the peer hangs up is the normal race, not a fault.
-        Ok(Err(e)) if ended == Ended::PeerHungUp => tracing::debug!("write at hang-up: {e:#}"),
-        Ok(Err(e)) => bail!(e),
-        Err(e) => bail!("the writer task panicked: {e}"),
-    }
+    // Nothing is torn down here. The link belongs to the caller and outlives
+    // this call — that is the point of it being borrowed.
 
     if let Some(r) = receiving {
         screen.system(format!(
@@ -1361,6 +1316,29 @@ mod tests {
         crate::ui::Typed::Line(s.to_owned())
     }
 
+    /// One conversation over its own link, opened and closed around it.
+    ///
+    /// What `main` does, in one call, so a test reads as "these two talk" and
+    /// not as connection bookkeeping. The link outliving the call is exercised
+    /// in [`crate::link`]'s own tests; here it has nothing to outlive.
+    async fn talk<R, W>(
+        reader: R,
+        writer: W,
+        peer: &str,
+        incoming_dir: &Path,
+        lines: &mut mpsc::Receiver<crate::ui::Typed>,
+        screen: &Screen,
+    ) -> Result<Ended>
+    where
+        R: futures::io::AsyncRead + Unpin + Send + 'static,
+        W: futures::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut link = Link::open(reader, writer).await?;
+        let talked = run(&mut link, peer, incoming_dir, lines, screen).await;
+        let closed = link.close(matches!(talked, Ok(Ended::PeerHungUp))).await;
+        talked.and_then(|ended| closed.map(|()| ended))
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("murmure-chat-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1464,7 +1442,7 @@ mod tests {
             let (screen, _updates) = crate::ui::channel();
 
             let talking = tokio::spawn(async move {
-                run(
+                talk(
                     alice_r.compat(),
                     alice_w.compat_write(),
                     "them",
@@ -1550,11 +1528,11 @@ mod tests {
 
             let to_b = to.clone();
             let bob = tokio::spawn(async move {
-                run(br.compat(), bw.compat_write(), "alice", &to_b, &mut b_rx, &b_screen).await
+                talk(br.compat(), bw.compat_write(), "alice", &to_b, &mut b_rx, &b_screen).await
             });
             let unused = dir.join("unused");
             let alice = tokio::spawn(async move {
-                run(ar.compat(), aw.compat_write(), "bob", &unused, &mut a_rx, &a_screen).await
+                talk(ar.compat(), aw.compat_write(), "bob", &unused, &mut a_rx, &a_screen).await
             });
 
             alice.await.unwrap().unwrap();
@@ -1683,11 +1661,11 @@ mod tests {
 
             let to_b = to.clone();
             let bob = tokio::spawn(async move {
-                run(br.compat(), bw.compat_write(), "alice", &to_b, &mut b_rx, &b_screen).await
+                talk(br.compat(), bw.compat_write(), "alice", &to_b, &mut b_rx, &b_screen).await
             });
             let unused = dir.join("unused");
             let alice = tokio::spawn(async move {
-                run(ar.compat(), aw.compat_write(), "bob", &unused, &mut a_rx, &a_screen).await
+                talk(ar.compat(), aw.compat_write(), "bob", &unused, &mut a_rx, &a_screen).await
             });
             alice.await.unwrap().unwrap();
             bob.await.unwrap().unwrap();
@@ -1781,11 +1759,11 @@ mod tests {
 
             let to_b = to.clone();
             let bob = tokio::spawn(async move {
-                run(br.compat(), bw.compat_write(), "alice", &to_b, &mut b_rx, &b_screen).await
+                talk(br.compat(), bw.compat_write(), "alice", &to_b, &mut b_rx, &b_screen).await
             });
             let unused = dir.join("unused");
             let alice = tokio::spawn(async move {
-                run(ar.compat(), aw.compat_write(), "bob", &unused, &mut a_rx, &a_screen).await
+                talk(ar.compat(), aw.compat_write(), "bob", &unused, &mut a_rx, &a_screen).await
             });
             alice.await.unwrap().unwrap();
             bob.await.unwrap().unwrap();

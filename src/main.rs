@@ -34,6 +34,7 @@ mod chat;
 mod contacts;
 mod files;
 mod identity;
+mod link;
 mod onion;
 mod proto;
 mod store;
@@ -55,6 +56,7 @@ use tor_hsservice::{HsNickname, RunningOnionService};
 
 use crate::contacts::Contacts;
 use crate::identity::Identity;
+use crate::link::Link;
 use crate::transport::tor::{self, KeyHandover};
 use crate::ui::{Kind, Screen};
 
@@ -429,7 +431,21 @@ where
     // input box learns who it is pointed at — and, whatever happens next,
     // learns that it is pointed at nobody again.
     screen.in_call(Some(peer));
-    let ended = chat::run(reader, writer, peer, incoming_dir, lines, screen).await;
+    // The link is opened and closed around the conversation here, which is
+    // exactly the pairing the connection pool will take over: a call will stop
+    // being the reason a connection exists.
+    let ended = async {
+        let mut link = Link::open(reader, writer).await?;
+        let talked = chat::run(&mut link, peer, incoming_dir, lines, screen).await;
+        // Close either way, and let the conversation's own failure win — a
+        // writer complaining about a stream the peer already dropped explains
+        // less than whatever ended the call.
+        let closed = link
+            .close(matches!(talked, Ok(chat::Ended::PeerHungUp)))
+            .await;
+        talked.and_then(|ended| closed.map(|()| ended))
+    }
+    .await;
     screen.in_call(None);
 
     match ended {
