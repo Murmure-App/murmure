@@ -90,9 +90,14 @@ makes murmure tiring to use exactly as it is. If B is too much for one pass,
 build A first *with B's shape* — a connection pool that happens to carry only
 keepalives — rather than a design that has to be thrown away.
 
-> ✅ **B chosen, 2026-08-05.** The refactor is in scope. The order of work below
-> still starts with a pool carrying keepalives only, because that is the shape
-> B needs anyway and it is testable on its own — not as a hedge against B.
+> ✅ **B chosen, 2026-08-05.** The refactor is in scope.
+>
+> An earlier version of the order of work below started with "a pool carrying
+> keepalives only" and moved the conversation onto it four steps later. That was
+> A wearing B's name. It would have shipped an intermediate state that is
+> strictly worse than today — N held circuits *and* a fresh 7-to-50-second dial
+> every time somebody speaks — and it would have written the call path twice.
+> The keepalive is a detail inside the first step, not a step.
 
 ### What it costs
 
@@ -167,15 +172,21 @@ handshake exists to catch. New variants go at the end of the enum.
 
 ## Order of work
 
-1. The connection pool, with B's shape, carrying keepalives only.
-2. Consent: `/presence`, acceptance, storage in the contacts book.
-3. The outbox, and draining it on a presence transition.
-4. Move the conversation onto the pooled connection (B proper).
-5. History, opt-in, last.
+1. **The pool, carrying the conversation.** A connection is held open per
+   consenting contact, keepalives ride on it, and `chat::run` stops owning a
+   stream — it borrows one from the pool. This is B, and it is one step because
+   splitting it ships something worse than what exists. Large, so several
+   commits; one milestone.
+2. **Consent**: `/presence`, acceptance, storage in the contacts book. Until
+   this exists, step 1 pools connections to every contact in the book, which is
+   the right shape and the wrong policy.
+3. **The outbox**, and draining it on a presence transition.
+4. **History**, opt-in, last, and declinable.
 
-Steps 1-3 deliver the prize on their own: a message sent to someone who is out
-arrives when they come back. Step 4 is what makes murmure stop feeling slow.
-Step 5 is a separate decision and can be declined.
+Step 1 is what makes murmure stop feeling slow — for a contact you have agreed
+to see, the dial disappears. Steps 1-3 together deliver the actual prize: a
+message sent to someone who is out arrives when they come back. Step 4 is a
+separate decision.
 
 ## Open questions
 
