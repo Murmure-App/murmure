@@ -61,7 +61,7 @@ crate into the graph: `tor-hsclient 0.44.0` and `tor-hscrypto 0.44.0` are alread
 
 - `Cargo.toml` - add `onion-service-client` and `experimental-api` to arti-client; add the direct `tor-*` deps needed to name `HsIdKeypair`, `OnionServiceConfig`, `HsNickname`; add tokio, futures, rand, anyhow, tracing-subscriber.
 - `src/main.rs` - replace the hello-world stub with the milestone binary: build two clients, publish, print the address, dial it.
-- `aidd_docs/INSTALL.md` - strike the keystore reservation in the Architecture section and in "Ce qui reste ouvert", record the verified answer.
+- `aidd_docs/INSTALL.md` - strike the keystore reservation in the Architecture section and in "What remains open", record the verified answer.
 
 ### Files to create
 
@@ -223,7 +223,7 @@ flowchart TD
 #### Tasks
 
 1. Replace the keystore reservation in the Architecture section with the verified answer and the API reference.
-2. Remove "La propriété de la clé d'identité" from "Ce qui reste ouvert" and remove piège number 1 from "Les trois pièges".
+2. Remove "Ownership of the identity key" from "What remains open" and remove trap number 1 from "The two traps".
 3. Record the two feature flags this milestone forced on, and note the `experimental-api` dependency as a migration cost at the next arti bump.
 4. Note vanguards as an open follow-up.
 

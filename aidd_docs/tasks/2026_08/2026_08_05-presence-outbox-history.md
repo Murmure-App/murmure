@@ -3,7 +3,7 @@ name: design
 description: Presence, a sender-side outbox, and persistent history — what each one is, what it costs, and what must be decided before any of it is written.
 argument-hint: N/A
 objective: "murmure stops requiring both people to be online at the same moment, without introducing a server, a third party, or a new place where metadata leaks."
-status: proposed
+status: accepted
 ---
 
 # Design: presence, outbox, history
@@ -89,6 +89,10 @@ loop stops owning the stream and starts borrowing one from a pool.
 makes murmure tiring to use exactly as it is. If B is too much for one pass,
 build A first *with B's shape* — a connection pool that happens to carry only
 keepalives — rather than a design that has to be thrown away.
+
+> ✅ **B chosen, 2026-08-05.** The refactor is in scope. The order of work below
+> still starts with a pool carrying keepalives only, because that is the shape
+> B needs anyway and it is testable on its own — not as a hedge against B.
 
 ### What it costs
 

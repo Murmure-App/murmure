@@ -1,147 +1,149 @@
-# murmure — messagerie pair-à-pair en terminal
+# murmure — peer-to-peer terminal messaging
 
-**Date** : 2026-07-30
-**Statut** : idée clarifiée, prête pour l'étape suivante
+**Date**: 2026-07-30
+**Status**: idea clarified, ready for the next step
 
 ---
 
-## L'idée
+## The idea
 
-Une messagerie en terminal entre personnes qui se connaissent déjà. Les messages vont
-d'une machine à l'autre sans qu'aucun intermédiaire puisse les lire, ni savoir qui parle
-à qui. Rien à payer, rien à héberger, aucun compte.
+Terminal messaging between people who already know each other. Messages go from
+one machine to the other with no intermediary able to read them, or to know who
+talks to whom. Nothing to pay, nothing to host, no account.
 
-## Le besoin derrière
+## The need behind it
 
-Ne dépendre de personne, et ne rien débourser. Ce n'est pas la confidentialité du contenu
-qui motive le projet — le chiffrement de bout en bout la donne déjà, y compris chez Signal
-ou WhatsApp. Ce que ces produits ne donnent pas, et que ce projet vise :
+To depend on nobody, and to spend nothing. What motivates the project is not
+confidentiality of content — end-to-end encryption already gives that, Signal
+and WhatsApp included. What those products do not give, and what this project
+aims at:
 
-- Personne ne sait **qui parle à qui**, ni quand.
-- Aucune société ne peut fermer, facturer, ou changer ses conditions.
-- Aucun annuaire central à qui faire confiance pour la clé publique de son correspondant.
+- Nobody knows **who talks to whom**, or when.
+- No company can shut it down, bill for it, or change its terms.
+- No central directory to trust for a correspondent's public key.
 
-## Ce qui est décidé
+## What is decided
 
-### Identité
+### Identity
 
-Chaque utilisateur génère une paire de clés sur sa machine. Son identifiant public en est
-**dérivé** — il ne change jamais, et il n'est pas son adresse IP. Le dériver de la clé
-signifie que revendiquer cette identité exige de posséder la clé privée : un imposteur ne
-peut pas se placer sous l'identifiant de quelqu'un d'autre.
+Every user generates a key pair on their machine. Their public identifier is
+**derived** from it — it never changes, and it is not their IP address. Deriving
+it from the key means that claiming that identity requires holding the private
+key: an impostor cannot place themselves under somebody else's identifier.
 
-### Premier contact
+### First contact
 
-Les deux personnes s'échangent leur identifiant par n'importe quel canal, **même non
-sécurisé** (SMS, WhatsApp, mail). Le canal n'a pas besoin d'être sûr : un identifiant
-public est fait pour être vu. Le seul risque est qu'on le **remplace** en route, et c'est
-la comparaison d'une courte empreinte à l'oral qui l'écarte — la voix de la personne est
-l'authentification.
+The two people exchange their identifiers over any channel, **even an insecure
+one** (SMS, WhatsApp, email). The channel does not need to be safe: a public
+identifier is made to be seen. The only risk is that it gets **replaced** in
+transit, and comparing a short fingerprint out loud is what rules that out — the
+person's voice is the authentication.
 
-Entre amis uniquement. **Le cas de deux inconnus est explicitement hors périmètre**, et
-sans solution : sans rien de commun au départ, aucune technique ne distingue un
-correspondant d'un imposteur.
+Between friends only. **The case of two strangers is explicitly out of scope**,
+and has no solution: with nothing in common to start from, no technique
+distinguishes a correspondent from an impostor.
 
-### Connexion — trois chemins
+### Connection — three paths
 
-Le programme les essaye **dans l'ordre**, automatiquement. L'utilisateur ne choisit rien
-par défaut.
+The program tries them **in order**, automatically. By default the user chooses
+nothing.
 
-1. **Direct** — connexion de machine à machine, port ouvert sur la box.
-2. **Assisté** — traversée de NAT avec l'aide d'infrastructure publique gratuite.
-3. **Relayé** — réseau Tor.
+1. **Direct** — machine to machine, a port opened on the router.
+2. **Assisted** — NAT traversal with the help of free public infrastructure.
+3. **Relayed** — the Tor network.
 
-Deux modes d'installation :
+Two installation modes:
 
-- **Simple** : ne demande rien, essaye les trois dans l'ordre.
-- **Personnalisée** : permet d'imposer un chemin précis. Techniquement, un interrupteur
-  par-dessus l'échelle, pas un second programme.
+- **Simple**: asks nothing, tries all three in order.
+- **Custom**: allows forcing a specific path. Technically a switch on top of the
+  ladder, not a second program.
 
 ### Messages
 
-Aucun stockage intermédiaire. Les deux correspondants doivent être connectés **en même
-temps** — c'est un coup de fil, pas un SMS. Un message qui échoue revient à l'envoyeur
-après plusieurs tentatives, comme un recommandé.
+No intermediate storage. Both correspondents have to be connected **at the same
+time** — it is a phone call, not a text message. A message that fails comes back
+to the sender after several attempts, like a registered letter.
 
-### Contenus
+### Content
 
-Texte, images et fichiers. **Rien n'atterrit sur le disque sans confirmation explicite**
-du destinataire. Les images ne sont pas affichées dans le terminal en v1 (certains
-terminaux modernes en sont capables — à revoir plus tard, pas maintenant).
+Text, images and files. **Nothing lands on disk without the recipient's explicit
+confirmation.** Images are not displayed in the terminal in v1 (some modern
+terminals can do it — to revisit later, not now).
 
-Un transfert interrompu **reprend où il s'était arrêté**.
+An interrupted transfer **resumes where it stopped**.
 
 ### Usage
 
-Carnet de contacts, plusieurs conversations, et **indicateur de présence** (qui est
-joignable) dès la v1.
+A contacts book, several conversations, and a **presence indicator** (who is
+reachable) from v1.
 
-### Historique
+### History
 
-Deux modes, au choix de l'utilisateur :
+Two modes, at the user's choice:
 
-- **Rien n'est conservé** — on quitte, tout disparaît.
-- **Conservé chiffré** sur le disque.
+- **Nothing is kept** — quit, and it all disappears.
+- **Kept encrypted** on disk.
 
-**Jamais en clair**, quel que soit le mode.
+**Never in the clear**, in either mode.
 
-### Forme
+### Form
 
-Interface en mode texte riche dans le terminal : couleurs, cadres, zones qui se
-rafraîchissent, raccourcis clavier. Pas de fenêtre graphique, pas d'application web.
-
----
-
-## Critère de réussite
-
-> Deux machines, deux réseaux différents, deux villes. Chacun lance la commande. Ils
-> comparent une empreinte à l'oral, elle correspond. L'un tape une phrase, l'autre la voit
-> apparaître. L'un envoie un fichier, l'autre reçoit une demande de confirmation, accepte,
-> et le fichier arrive intact.
+A rich text-mode interface in the terminal: colours, frames, areas that refresh,
+keyboard shortcuts. No graphical window, no web application.
 
 ---
 
-## Ce qui reste ouvert
+## Success criterion
 
-### À trancher au design
+> Two machines, two different networks, two cities. Each person runs the
+> command. They compare a fingerprint out loud, and it matches. One types a
+> sentence, the other sees it appear. One sends a file, the other gets a
+> confirmation prompt, accepts, and the file arrives intact.
 
-| Sujet | La question |
+---
+
+## What remains open
+
+### To settle at design time
+
+| Topic | The question |
 | --- | --- |
-| **Le carnet identifiant → adresse** | Pour les chemins 1 et 2, quelque chose doit traduire l'identifiant en adresse du jour. Un serveur (refusé), une table distribuée entre utilisateurs (vide tant qu'il n'y a pas de foule — le projet démarre à deux), ou s'appuyer sur le carnet déjà peuplé de Tor. Dernière vraie inconnue technique du projet. |
-| **Le coût de la présence** | Sans serveur, savoir qui est joignable veut dire interroger chaque contact en boucle. Coût réseau permanent, et signale sa propre présence à tous ses contacts en continu. Le compromis reste à régler. |
-| **La reprise de transfert entre sessions** | Où vit l'état d'un transfert partiel si les deux se déconnectent, et comment vérifier l'intégrité au bout. |
+| **The identifier → address directory** | For paths 1 and 2, something has to translate an identifier into today's address. A server (refused), a table distributed among users (empty as long as there is no crowd — this project starts with two people), or leaning on Tor's already-populated directory. The project's last real technical unknown. |
+| **The cost of presence** | With no server, knowing who is reachable means polling every contact in a loop. A permanent network cost, and it continuously signals one's own presence to every contact. The trade-off is still to be settled. |
+| **Transfer resume across sessions** | Where the state of a partial transfer lives if both sides disconnect, and how integrity is checked at the end. |
 
-### Hypothèses posées, à confirmer
+### Assumptions made, to be confirmed
 
-- Le chiffrement s'appuie sur un **protocole établi et audité**, jamais sur une
-  construction maison. La cryptographie faite soi-même échoue silencieusement.
-- **Une identité par machine.** Utiliser le même compte sur deux ordinateurs n'est pas prévu.
-- **Perdre la machine, c'est perdre l'identité.** Aucune sauvegarde ni récupération de clé.
+- Encryption relies on an **established and audited protocol**, never on a
+  home-made construction. Home-made cryptography fails silently.
+- **One identity per machine.** Using the same account on two computers is not
+  planned for.
+- **Losing the machine means losing the identity.** No key backup, no recovery.
 
-### Risques assumés
+### Accepted risks
 
-- Sur les chemins 1 et 2, **le correspondant voit l'adresse IP**, donc approximativement la
-  ville. Acceptable entre amis, validé. Seul le chemin 3 (relayé) la masque.
-- **Le chemin direct ne marchera pas pour tout le monde.** En 4G et chez certains
-  opérateurs, la machine n'a aucune adresse joignable, quoi que fasse l'utilisateur.
+- On paths 1 and 2, **the correspondent sees the IP address**, so roughly the
+  city. Acceptable between friends, validated. Only path 3 (relayed) hides it.
+- **The direct path will not work for everyone.** On 4G and at some ISPs, the
+  machine has no reachable address at all, whatever the user does.
 
 ---
 
-## Ordre de grandeur
+## Order of magnitude
 
-| Périmètre | Estimation |
+| Scope | Estimate |
 | --- | --- |
-| Noyau chiffré, une conversation, un seul chemin réseau | quelques soirées |
-| + carnet de contacts, présence, plusieurs conversations | +2 à 3 semaines |
-| + reprise de transfert de fichiers | +1 semaine |
-| + les deux autres chemins réseau | +2 à 4 semaines |
+| Encrypted core, one conversation, a single network path | a few evenings |
+| + contacts book, presence, several conversations | +2 to 3 weeks |
+| + file transfer resume | +1 week |
+| + the other two network paths | +2 to 4 weeks |
 
-Projet complet : plusieurs mois de soirées pour une personne seule.
+Complete project: several months of evenings for one person alone.
 
 ---
 
-## Étape suivante
+## Next step
 
-Choisir l'architecture technique et la pile avant d'écrire du code. Le langage conditionne
-les bibliothèques de chiffrement, de terminal et de réseau — autant que ce choix soit fait
-une bonne fois.
+Choose the technical architecture and the stack before writing code. The
+language conditions the encryption, terminal and network libraries — that choice
+may as well be made once and for all.
