@@ -291,9 +291,15 @@ struct Receiving {
 /// conversation ends, the caller goes back to reading commands from the same
 /// keyboard, and the connection is still there for the next call.
 /// `incoming_dir` is where accepted files land.
+///
+/// `first` is a frame the caller has already taken off the inbox. A connection
+/// kept open between calls has to be watched by somebody, and whoever watches
+/// it learns that a call is starting by reading the frame that starts it — so
+/// that frame arrives here rather than on the wire. See [`crate::pool`].
 pub async fn run(
     link: &mut Link,
     peer: &str,
+    first: Option<Message>,
     incoming_dir: &Path,
     lines: &mut mpsc::Receiver<crate::ui::Typed>,
     screen: &Screen,
@@ -337,8 +343,32 @@ pub async fn run(
     // and the socket, and reports back through the channel.
     let mut direct_task: Option<tokio::task::JoinHandle<()>> = None;
     let (direct_done_tx, mut direct_done) = mpsc::channel::<DirectDone>(1);
+    // Only ever `Some` on the first turn of the loop, which is what makes the
+    // `continue` below safe: everything after the select is bookkeeping about
+    // state that no frame has had a chance to touch yet.
+    let mut first = first;
 
     let ended = loop {
+        // The frame that announced this call, put back in front of every other
+        // one so the conversation starts where the peer thinks it does.
+        if let Some(msg) = first.take() {
+            let outcome = handle(
+                msg, peer, incoming_dir,
+                &mut pending, &mut next_number, &mut next_batch,
+                &mut receiving, &mut sending, &mut offered,
+                &mut direct_task, &direct_done_tx,
+                outbox, screen,
+            ).await;
+            match outcome {
+                Err(e) => {
+                    screen.error(format!("{e:#}"));
+                    break Ended::PeerHungUp;
+                }
+                Ok(false) => break Ended::PeerHungUp,
+                Ok(true) => continue,
+            }
+        }
+
         tokio::select! {
             // Ordered, not random, and the order is load-bearing twice over.
             //
@@ -1338,7 +1368,7 @@ mod tests {
         // apart. Which one is which does not matter here — chat is given the
         // peer's name by its caller.
         let mut link = Link::open(reader, writer, &crate::identity::Identity::for_test(seed)).await?;
-        let talked = run(&mut link, peer, incoming_dir, lines, screen).await;
+        let talked = run(&mut link, peer, None, incoming_dir, lines, screen).await;
         let closed = link.close(matches!(talked, Ok(Ended::PeerHungUp))).await;
         talked.and_then(|ended| closed.map(|()| ended))
     }
@@ -1569,6 +1599,72 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// The frame that announced the call keeps its place at the front.
+    ///
+    /// A connection held open between calls is watched by the pool, so the way
+    /// the pool learns a call is starting is by reading the frame that starts
+    /// it. That frame is off the wire before the conversation exists, and if it
+    /// were dropped the peer's opening line would vanish — worse, silently, and
+    /// only for the side that had kept the connection.
+    #[tokio::test]
+    async fn a_call_starts_with_the_frame_that_announced_it() {
+        let dir = scratch("first-frame");
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        let (one, two) = (
+            crate::identity::Identity::for_test([1u8; 32]),
+            crate::identity::Identity::for_test([2u8; 32]),
+        );
+        let (mine, theirs) = tokio::join!(
+            Link::open(ar.compat(), aw.compat_write(), &one),
+            Link::open(br.compat(), bw.compat_write(), &two)
+        );
+        let mut mine = mine.unwrap();
+        let theirs = theirs.unwrap();
+
+        let (keys, mut lines) = mpsc::channel::<crate::ui::Typed>(4);
+        let (screen, mut updates) = crate::ui::channel();
+
+        // Everything said after the announcement, still on the wire.
+        theirs
+            .outbox
+            .send(Message::Text("and then this".into()))
+            .await
+            .unwrap();
+
+        // Reads the screen, and hangs up once the second line has landed.
+        let collect = tokio::spawn(async move {
+            let mut seen: Vec<String> = Vec::new();
+            while let Some(update) = updates.recv().await {
+                let crate::ui::Update::Line(entry) = update else {
+                    continue;
+                };
+                let text = entry.text().to_owned();
+                if text.contains("and then this") {
+                    let _ = keys.send(line("/bye")).await;
+                }
+                seen.push(text);
+            }
+            seen
+        });
+
+        let announced = Message::Text("said before you looked".into());
+        let ended = run(&mut mine, "bob", Some(announced), &dir, &mut lines, &screen)
+            .await
+            .unwrap();
+        assert_eq!(ended, Ended::WeHungUp);
+
+        drop(screen);
+        let seen = collect.await.unwrap();
+        let first = seen.iter().position(|l| l.contains("said before you looked"));
+        let then = seen.iter().position(|l| l.contains("and then this"));
+        assert!(first.is_some(), "the announcing frame must reach the screen");
+        assert!(first < then, "and must reach it before anything said after");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A file offered, accepted and received, byte for byte.

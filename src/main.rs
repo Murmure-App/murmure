@@ -36,6 +36,7 @@ mod files;
 mod identity;
 mod link;
 mod onion;
+mod pool;
 mod proto;
 mod store;
 mod transport;
@@ -57,6 +58,8 @@ use tor_hsservice::{HsNickname, RunningOnionService};
 use crate::contacts::Contacts;
 use crate::identity::Identity;
 use crate::link::Link;
+use crate::pool::Pool;
+use crate::proto::Message;
 use crate::transport::tor::{self, KeyHandover};
 use crate::ui::{Kind, Screen};
 
@@ -291,34 +294,77 @@ async fn serve(
     // ---- the idle loop ---------------------------------------------------
     let incoming = tor::incoming(requests);
     futures::pin_mut!(incoming);
+    // Connections that outlived the call held over them. Starts empty: nothing
+    // is dialled ahead of being wanted.
+    let mut pool = Pool::default();
 
     loop {
         // The select only *picks* the event. Handling it happens after, so that
         // no borrow held by a branch future is still alive while a conversation
-        // runs — a conversation needs `lines` for itself.
+        // runs — a conversation needs `lines`, and a call out of the pool needs
+        // the pool.
         let event = tokio::select! {
             stream = incoming.next() => Event::Called(stream.map(Box::new)),
             line = lines.recv() => Event::Typed(line),
+            (peer, frame) = pool.ready() => Event::Spoke(peer, frame),
         };
 
         match event {
             Event::Called(Some(stream)) => {
-                // Still nothing here says who is calling: an onion service is
-                // told nothing about its client, and restricted discovery only
-                // decides *whether* one may read our descriptor. The name comes
-                // out of the handshake, one signature later, which is why the
-                // greeting below is the only anonymous line left.
-                screen.system("-- incoming call --");
-                screen.status("in a call");
+                // An onion service is told nothing about its client, so the
+                // name below comes out of the handshake — one signature later —
+                // and not from the connection.
                 let (reader, writer) = stream.split();
-                if let Flow::Quit =
-                    converse(reader, writer, identity, book, None, &incoming_dir, lines, screen).await
-                {
+                let mut link = match Link::open(reader, writer, identity).await {
+                    Ok(link) => link,
+                    Err(e) => {
+                        screen.error(format!("-- a call was dropped: {e:#} --"));
+                        continue;
+                    }
+                };
+                let name = name_for(book, &link.peer);
+                screen.system(format!("-- {name} is calling --"));
+                screen.status("in a call");
+                let (flow, alive) =
+                    converse(&mut link, &name, None, &incoming_dir, lines, screen).await;
+                shelve(&mut pool, link, alive).await;
+                if let Flow::Quit = flow {
                     break;
                 }
                 screen.status("listening");
             }
             Event::Called(None) => bail!("the incoming-stream channel closed"),
+            // Somebody we are already connected to has started talking. There
+            // was nothing to dial and nothing to answer: the frame *is* the
+            // call, and it has to be handed on rather than dropped.
+            Event::Spoke(peer, Some(Ok(msg))) => {
+                let Some(mut link) = pool.take(&peer) else {
+                    // `ready` only reports links the pool is holding.
+                    continue;
+                };
+                let name = name_for(book, &peer);
+                screen.system(format!("-- {name} is calling --"));
+                screen.status("in a call");
+                let (flow, alive) =
+                    converse(&mut link, &name, Some(msg), &incoming_dir, lines, screen).await;
+                shelve(&mut pool, link, alive).await;
+                if let Flow::Quit = flow {
+                    break;
+                }
+                screen.status("listening");
+            }
+            // A kept connection ended while nobody was talking over it. Not
+            // news the operator can act on — the next `/call` simply dials
+            // again — so it goes to the log and nowhere else.
+            Event::Spoke(peer, ended) => {
+                if let Some(link) = pool.take(&peer) {
+                    let _ = link.close(true).await;
+                }
+                match ended {
+                    Some(Err(e)) => tracing::debug!("an idle connection failed: {e:#}"),
+                    _ => tracing::debug!("an idle connection was closed by the peer"),
+                }
+            }
             // The interface is gone: Ctrl-C, or the terminal closed.
             Event::Typed(None) => break,
             Event::Typed(Some(line)) => {
@@ -333,7 +379,7 @@ async fn serve(
                 // the line was received — so a `/call` that is working looks
                 // like a `/call` that was swallowed.
                 screen.say(Kind::Mine, format!("> {}", line.trim()));
-                match command(line, book, &live, lines, started, screen).await {
+                match command(line, book, &live, &mut pool, lines, started, screen).await {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Quit) => break,
                     // A bad command must not end the program.
@@ -404,6 +450,11 @@ enum Event {
     Called(Option<Box<arti_client::DataStream>>),
     /// The operator typed a line. [`None`] means the interface closed.
     Typed(Option<ui::Typed>),
+    /// Something arrived on a connection we were already holding open.
+    ///
+    /// Anything but a frame means that connection is finished — see
+    /// [`crate::pool::Pool::ready`].
+    Spoke(HsId, Option<Result<Message>>),
 }
 
 /// What the idle loop does after a command.
@@ -412,94 +463,81 @@ enum Flow {
     Quit,
 }
 
-/// Hold one conversation and say whether the operator wants out of the program
-/// as well as out of the call.
+/// The name we know a proved identity by, or something honest if we do not.
 ///
-/// `expected` is the contact we meant to reach, on an outgoing call, and
-/// [`None`] when somebody dialled us. Either way the name shown comes from the
-/// address the peer *proved*, never from the one we hoped for.
+/// The address is what the far side signed for, so a stranger who reaches this
+/// point is a stranger by name only — someone we filed once and forgot, or who
+/// kept a descriptor from before. Their fingerprint is shown so the operator
+/// can recognise them if they ever knew them.
+fn name_for(book: &Contacts, peer: &HsId) -> String {
+    let address = peer.display_unredacted().to_string();
+    match book.name_of(&address) {
+        Some(name) => name.to_owned(),
+        None => format!("someone not in your book ({})", onion::fingerprint(&address)),
+    }
+}
+
+/// Put a link back in the pool, or close it if the call ended because it died.
+///
+/// The whole point of the pool is that hanging up is not disconnecting — so
+/// this is the one place that decides which of the two just happened, and there
+/// is exactly one answer: the peer going away.
+async fn shelve(pool: &mut Pool, link: Link, alive: bool) {
+    if alive {
+        pool.keep(link);
+    } else if let Err(e) = link.close(true).await {
+        tracing::debug!("closing a spent connection: {e:#}");
+    }
+}
+
+/// Hold one conversation over an already-open link.
+///
+/// Returns whether the operator wants out of the program as well as out of the
+/// call, and whether the connection is still worth keeping — a call ending is
+/// not the connection ending, and only the peer going away makes it one.
 ///
 /// Never propagates an error: a dropped call must not end the program, so a
 /// failure is shown and treated as an ordinary hang-up.
-#[allow(clippy::too_many_arguments)]
-async fn converse<R, W>(
-    reader: R,
-    writer: W,
-    identity: &Identity,
-    book: &Contacts,
-    expected: Option<&str>,
+async fn converse(
+    link: &mut Link,
+    peer: &str,
+    first: Option<Message>,
     incoming_dir: &Path,
     lines: &mut mpsc::Receiver<ui::Typed>,
     screen: &Screen,
-) -> Flow
-where
-    R: futures::io::AsyncRead + Unpin + Send + 'static,
-    W: futures::io::AsyncWrite + Unpin + Send + 'static,
-{
-    // The link is opened and closed around the conversation here, which is
-    // exactly the pairing the connection pool will take over: a call will stop
-    // being the reason a connection exists.
-    let mut link = match Link::open(reader, writer, identity).await {
-        Ok(link) => link,
-        Err(e) => {
-            screen.error(format!("-- call dropped: {e:#} --"));
-            return Flow::Continue;
-        }
-    };
-
-    // Who this actually is. The handshake proved the address; the book turns it
-    // into a name, and a stranger who got this far is one we used to know.
-    let address = link.peer.display_unredacted().to_string();
-    let peer = match book.name_of(&address) {
-        Some(name) => name.to_owned(),
-        None => format!("someone not in your book ({})", onion::fingerprint(&address)),
-    };
-
-    // An outgoing call that reaches the wrong key is not a call to answer. It
-    // cannot happen by accident — we dialled an address and the far side proved
-    // that same address — so if it ever does, something is wrong enough that
-    // continuing would be the mistake.
-    if let Some(meant) = expected
-        && meant != peer
-    {
-        screen.error(format!(
-            "-- refused: you called {meant}, but the far side proved it is {peer} --"
-        ));
-        let _ = link.close(false).await;
-        return Flow::Continue;
-    }
-
+) -> (Flow, bool) {
     // The one place both an outgoing and an incoming call pass through, so the
     // input box learns who it is pointed at — and, whatever happens next,
     // learns that it is pointed at nobody again.
-    screen.in_call(Some(&peer));
-    let talked = chat::run(&mut link, &peer, incoming_dir, lines, screen).await;
-    // Close either way, and let the conversation's own failure win — a writer
-    // complaining about a stream the peer already dropped explains less than
-    // whatever ended the call.
-    let closed = link
-        .close(matches!(talked, Ok(chat::Ended::PeerHungUp)))
-        .await;
-    let ended = talked.and_then(|ended| closed.map(|()| ended));
+    screen.in_call(Some(peer));
+    let ended = chat::run(link, peer, first, incoming_dir, lines, screen).await;
     screen.in_call(None);
 
     match ended {
         Ok(ended) => {
-            screen.system(format!("-- {} --", ended.describe(&peer)));
+            screen.system(format!("-- {} --", ended.describe(peer)));
+            let alive = ended != chat::Ended::PeerHungUp;
             if ended.leaves() {
-                return Flow::Quit;
+                return (Flow::Quit, alive);
             }
+            (Flow::Continue, alive)
         }
-        Err(e) => screen.error(format!("-- call dropped: {e:#} --")),
+        // Whatever went wrong went wrong on this connection, so it is not one
+        // to offer the next `/call`.
+        Err(e) => {
+            screen.error(format!("-- call dropped: {e:#} --"));
+            (Flow::Continue, false)
+        }
     }
-    Flow::Continue
 }
 
 /// Run one typed command.
+#[allow(clippy::too_many_arguments)]
 async fn command(
     line: &str,
     book: &mut Contacts,
     live: &Live<'_>,
+    pool: &mut Pool,
     lines: &mut mpsc::Receiver<ui::Typed>,
     started: Instant,
     screen: &Screen,
@@ -564,7 +602,7 @@ async fn command(
                 .address_of(name)
                 .ok_or_else(|| anyhow::anyhow!("no contact called {name} — /add them first"))?
                 .to_owned();
-            return call(started, live, book, name, &address, lines, screen).await;
+            return call(started, live, pool, name, &address, lines, screen).await;
         }
         "/copy" => {
             // Exactly what the other person has to type after `/add <name>`, in
@@ -590,11 +628,12 @@ async fn command(
     Ok(Flow::Continue)
 }
 
-/// Dial a contact and hold a conversation.
+/// Reach a contact — from the pool if we are already connected, by dialling if
+/// not — and hold a conversation.
 async fn call(
     started: Instant,
     live: &Live<'_>,
-    book: &Contacts,
+    pool: &mut Pool,
     name: &str,
     address: &str,
     lines: &mut mpsc::Receiver<ui::Typed>,
@@ -603,6 +642,20 @@ async fn call(
     let hs_id: tor_hscrypto::pk::HsId = address
         .parse()
         .map_err(|e| anyhow::anyhow!("{address} is not a valid onion address: {e}"))?;
+
+    // The connection may already be there, in which case there is nothing to
+    // compose. This is what the pool is for, and the only visible difference is
+    // that the seven-to-fifty-second wait does not happen.
+    if let Some(mut link) = pool.take(&hs_id) {
+        screen.system(format!("-- still connected to {name} --"));
+        screen.status(format!("in a call with {name}"));
+        let (flow, alive) = converse(&mut link, name, None, live.incoming_dir, lines, screen).await;
+        shelve(pool, link, alive).await;
+        if let Flow::Continue = flow {
+            screen.status("listening");
+        }
+        return Ok(flow);
+    }
 
     screen.system(format!(
         "calling {name} — fingerprint {}",
@@ -656,10 +709,34 @@ async fn call(
         }
     };
 
+    let (reader, writer) = stream.split();
+    let mut link = match Link::open(reader, writer, live.identity).await {
+        Ok(link) => link,
+        Err(e) => {
+            screen.error(format!("-- call dropped: {e:#} --"));
+            screen.status("listening");
+            return Ok(Flow::Continue);
+        }
+    };
+
+    // We dialled an address and the far side proved a key. If the two disagree,
+    // something between us answered for them — so this is refused rather than
+    // answered, and it is checked here rather than by name, because the key is
+    // what was signed for.
+    if link.peer != hs_id {
+        screen.error(format!(
+            "-- refused: you called {name}, but the far side proved a different key ({}) --",
+            onion::fingerprint(&link.peer.display_unredacted().to_string())
+        ));
+        let _ = link.close(false).await;
+        screen.status("listening");
+        return Ok(Flow::Continue);
+    }
+
     screen.system(format!("-- connected to {name} --"));
     screen.status(format!("in a call with {name}"));
-    let (reader, writer) = stream.split();
-    let flow = converse(reader, writer, live.identity, book, Some(name), live.incoming_dir, lines, screen).await;
+    let (flow, alive) = converse(&mut link, name, None, live.incoming_dir, lines, screen).await;
+    shelve(pool, link, alive).await;
     if let Flow::Continue = flow {
         screen.status("listening");
     }
@@ -673,7 +750,8 @@ fn help(screen: &Screen) {
         "",
         "commands:",
         "  /add <name> <address> <key>   file a friend (address and key, both)",
-        "  /call <name>                  call them — 7-50 s, /cancel to give up",
+        "  /call <name>                  call them — 7-50 s the first time, then instant",
+        "                                for as long as the connection holds. /cancel to give up",
         "  /contacts                     list the book",
         "  /forget <name>                drop a contact",
         "  /copy                         your address and key, to the clipboard",

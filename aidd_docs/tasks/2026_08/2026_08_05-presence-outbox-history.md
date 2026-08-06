@@ -172,21 +172,38 @@ handshake exists to catch. New variants go at the end of the enum.
 
 ## Order of work
 
-1. **The pool, carrying the conversation.** A connection is held open per
-   consenting contact, keepalives ride on it, and `chat::run` stops owning a
-   stream — it borrows one from the pool. This is B, and it is one step because
-   splitting it ships something worse than what exists. Large, so several
-   commits; one milestone.
-2. **Consent**: `/presence`, acceptance, storage in the contacts book. Until
-   this exists, step 1 pools connections to every contact in the book, which is
-   the right shape and the wrong policy.
+1. **The pool, carrying the conversation.** ✅ A connection outlives the call
+   held over it, and `chat::run` stops owning a stream — it borrows one from the
+   pool. This is B.
+
+   Two things were found by building it rather than by planning it:
+
+   - **Nothing could be pooled, because nothing had a name.** An onion service
+     is told nothing about its client, so an incoming connection came from
+     "they" and could not be filed under a contact. The handshake now makes each
+     side sign a challenge with the key its `.onion` address is derived from,
+     and `proto::VERSION` went to 2 for it. That was the prerequisite, and it is
+     the whole reason step 1 took two commits before the pool itself.
+   - **The pool does not dial.** A link enters it because a call already
+     happened. That sidesteps the policy problem noted under step 2 entirely —
+     there is never a moment where murmure opens a connection nobody consented
+     to — and it costs nothing, because the expensive part of a call is the
+     first one either way.
+
+   Still open, and moved to step 2 where the consent to spend it exists:
+   keepalives and a liveness timeout. Without them a pooled link can go stale
+   silently, and `/call alice` is instant into a socket nobody is listening on.
+
+2. **Consent**: `/presence`, acceptance, storage in the contacts book — and,
+   with it, the two things that turn a kept connection into presence: dialling a
+   consenting contact ahead of being asked, and keepalives so a dead link is
+   noticed rather than discovered.
 3. **The outbox**, and draining it on a presence transition.
 4. **History**, opt-in, last, and declinable.
 
-Step 1 is what makes murmure stop feeling slow — for a contact you have agreed
-to see, the dial disappears. Steps 1-3 together deliver the actual prize: a
-message sent to someone who is out arrives when they come back. Step 4 is a
-separate decision.
+Step 1 is what makes murmure stop feeling slow — the second call to someone is
+free. Steps 1-3 together deliver the actual prize: a message sent to someone who
+is out arrives when they come back. Step 4 is a separate decision.
 
 ## Open questions
 
