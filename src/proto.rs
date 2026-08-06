@@ -42,7 +42,7 @@ use crate::identity::Identity;
 /// is young enough that maintaining two wire formats would cost more than
 /// telling two people to run the same build, and a version that is refused
 /// loudly is worth more than one that half-works.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// Sent before anything else, so that a stream carrying something other than
 /// murmure fails as itself rather than as a nonsensical version number.
@@ -309,14 +309,18 @@ pub enum Message {
         /// every file in the message; the recipient still decides.
         direct: bool,
     },
-    /// "Are you still there?" — answered with [`Message::Pong`].
+    /// "I am still here."
     ///
-    /// Only meaningful on an already-open stream, where it is free. Presence for
-    /// contacts *without* an open stream costs a full rendezvous; see the
-    /// presence section of `aidd_docs/INSTALL.md`.
+    /// Sent on a timer by both sides of an open connection and answered by
+    /// nobody: any frame at all proves the far side is alive, so a reply would
+    /// only be a second way to learn the same thing. Swallowed by
+    /// [`crate::link`] before it can reach a conversation — a keepalive must
+    /// never look like somebody starting to talk.
+    ///
+    /// Free on a stream that is already open, which is the only place it is
+    /// sent. Presence for a contact with no open stream costs a full
+    /// rendezvous, and that is what the connection pool exists to avoid.
     Ping,
-    /// Answer to [`Message::Ping`].
-    Pong,
     /// "I have a file for you." Answered with [`Message::FileAccept`] or
     /// [`Message::FileReject`], never automatically — a file lands on the
     /// recipient's disk, so the recipient says yes.
@@ -360,6 +364,18 @@ pub enum Message {
     FileChunk(Vec<u8>),
     /// No more data. The recipient verifies the hash before keeping anything.
     FileDone,
+    /// "May I keep a connection open to you, and see when you are up?"
+    ///
+    /// Being reachable and being watched are different permissions. Restricted
+    /// discovery already settles the first — a stranger cannot even read our
+    /// descriptor — and this settles the second, which is why it is asked out
+    /// loud instead of being assumed from the contacts book.
+    PresenceAsk,
+    /// "Yes." From here on both sides hold a connection open to each other.
+    PresenceYes,
+    /// "No", or "not any more". Sent on refusal and on `/presence <name> off`,
+    /// and in both cases the sender stops holding a connection open.
+    PresenceNo,
 }
 
 impl Message {
@@ -711,7 +727,7 @@ mod tests {
         let sent = vec![
             Message::Text("bonjour".into()),
             Message::Ping,
-            Message::Pong,
+            Message::PresenceAsk,
             Message::Text("un message plus long, avec des accents éàü".into()),
         ];
 

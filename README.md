@@ -132,6 +132,7 @@ baked in.
 ```text
 /add alice xxxx….onion descriptor:x25519:XXXX…    file them under a name
 /call alice                                       dial (7–50 s, /cancel to stop)
+/presence alice                                   ask to see each other online
 /send ~/rapport.pdf                               offer a file (during a call)
 /accept   /refuse                                 answer an offer of theirs
 /bye                                              hang up
@@ -141,6 +142,10 @@ baked in.
 Then **compare the fingerprint out loud** — the short `hati … 7ryd` form shown
 next to the name. It is the address itself, so if it matches you are talking to
 the key you meant to. Nothing else authenticates the other side.
+
+The 7–50 seconds is the price of the *first* call. The connection outlives the
+call held over it, so calling the same person again costs nothing until one of
+you leaves.
 
 `/help` lists the rest, including the scroll keys.
 
@@ -163,6 +168,36 @@ Two honest limits, both upstream's:
 
 Adding a contact takes effect without a restart, but the new descriptor has to
 reach the directory first — give it a minute.
+
+## Presence
+
+`/presence alice` asks alice whether the two of you should see when each other
+is online. She agrees by typing `/presence` back at you. From then on, both
+murmures hold a connection open to each other whenever they run, and:
+
+- you each see `-- alice is online --` when the other starts up, and
+  `-- alice went offline --` when they stop;
+- `/call alice` is instant, because there is nothing left to dial;
+- `/contacts` shows who is up.
+
+Either of you ends it with `/presence alice off`, and the other is told.
+
+**It is asked rather than assumed, and that is the whole design.** Restricted
+discovery already decides who can *reach* you. Being watched is a second
+permission: a friend who can call you does not thereby get to know when you are
+at your machine. So nothing is dialled on anyone's behalf until both sides have
+said yes, an unanswered request stays unanswered for ever, and a `yes` to a
+question you never asked changes nothing.
+
+There is no panel of coloured dots. Presence is shown when you ask for
+`/contacts` and when someone's state changes, and not otherwise — a permanent
+list of who is online is a list, readable by anyone behind you, of who you talk
+to.
+
+What it costs: while presence is on with someone, you are holding a Tor circuit
+to them and sending a two-byte keepalive each minute. That is visible to your
+guard node as *traffic*, exactly as any open circuit is. It says nothing about
+who is on the other end.
 
 ## Sending a file
 

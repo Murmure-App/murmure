@@ -194,11 +194,33 @@ handshake exists to catch. New variants go at the end of the enum.
    keepalives and a liveness timeout. Without them a pooled link can go stale
    silently, and `/call alice` is instant into a socket nobody is listening on.
 
-2. **Consent**: `/presence`, acceptance, storage in the contacts book — and,
-   with it, the two things that turn a kept connection into presence: dialling a
-   consenting contact ahead of being asked, and keepalives so a dead link is
-   noticed rather than discovered.
-3. **The outbox**, and draining it on a presence transition.
+2. **Consent, keepalives, and dialling ahead.** ✅ `/presence <name>` and
+   `/presence <name> off`, a four-state agreement stored in the book, a
+   `Ping` every 60 s, a peer declared gone after 240 s of silence, and a sweep
+   every 60 s that opens a connection to everyone who agreed and reopens the
+   ones that dropped.
+
+   Three things settled while building it:
+
+   - **`Pong` is gone.** Both sides ping on their own timer and *any* frame
+     proves the far side is alive, so a reply was a second way to learn the same
+     thing. `proto::VERSION` went to 3.
+   - **A keepalive must never reach a conversation.** The pool starts a call on
+     the first frame of an idle link, so a forwarded `Ping` would open a phantom
+     call every minute. `link` drops them where they arrive.
+   - **The goodbye frame the design asked for was not built.** Closing the
+     stream already says it — the reader reports the end, and the far side's
+     liveness timer covers the case where the close never arrives. A frame whose
+     only job is to be redundant with a close is a frame that can disagree with
+     one.
+
+   The state machine is a pure function with no I/O, in `contacts.rs`, so
+   "silence is not consent" and "a yes to a question nobody asked changes
+   nothing" are tests rather than intentions.
+3. **The outbox**, and draining it on a presence transition. Everything it
+   needs now exists: `Heard::Reached` is the transition, and `Pool::send`
+   already queues a frame for a connection that does not exist yet — it is the
+   in-memory, four-frame, presence-only version of exactly this.
 4. **History**, opt-in, last, and declinable.
 
 Step 1 is what makes murmure stop feeling slow — the second call to someone is

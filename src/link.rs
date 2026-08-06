@@ -22,6 +22,8 @@
 //! file. Making the failure part of the same queue means the ordering is the
 //! channel's, not something the call loop has to arrange.
 
+use std::time::Duration;
+
 use anyhow::{Context as _, Result, bail};
 use futures::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -43,6 +45,21 @@ const OUTBOX: usize = 32;
 /// Same size as the outbox and for the same reason — a peer that floods us is
 /// slowed at the socket rather than in memory, and 32 chunks is about 2 MB.
 const INBOX: usize = 32;
+
+/// How often a connection says it is still there.
+///
+/// Provisional, and the design notes say so: the right number is measured
+/// against real Tor latency, not reasoned about. Sixty seconds is chosen to be
+/// cheap — a `Ping` is two bytes on a circuit that is already built — while
+/// still noticing a peer within a few minutes.
+const KEEPALIVE: Duration = Duration::from_secs(60);
+
+/// How long a connection may say nothing at all before it is declared gone.
+///
+/// Four keepalives, not one. Tor latency is spiky, and a contact who flickers
+/// between present and absent is worse than no indicator at all — so this errs
+/// towards believing someone is still there.
+const SILENCE: Duration = Duration::from_secs(4 * 60);
 
 /// A connection to a peer, framed and version-checked.
 ///
@@ -86,20 +103,58 @@ impl Link {
         let (inbox_tx, inbox) = mpsc::channel::<Result<Message>>(INBOX);
 
         let writing = tokio::spawn(async move {
-            while let Some(msg) = queued.recv().await {
-                proto::write_frame(&mut writer, &msg).await?;
+            let mut beat = tokio::time::interval(KEEPALIVE);
+            // A tick the moment the timer is made, which we do not want: the
+            // handshake just proved this connection live.
+            beat.tick().await;
+            // A file transfer can hold this task for minutes. The default is to
+            // fire every tick that was missed, back to back, which would send a
+            // burst of keepalives the instant the transfer ended.
+            beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    msg = queued.recv() => match msg {
+                        Some(msg) => proto::write_frame(&mut writer, &msg).await?,
+                        // Every sender is gone: the link is closing.
+                        None => break,
+                    },
+                    _ = beat.tick() => proto::write_frame(&mut writer, &Message::Ping).await?,
+                }
             }
             Ok(())
         });
 
-        // Decides nothing: every frame goes to whoever holds the inbox, which
-        // owns the state that says what a frame means.
+        // Decides nothing, with one exception: a keepalive is answered by being
+        // dropped. Everything else goes to whoever holds the inbox, which owns
+        // the state that says what a frame means.
         let reading = tokio::spawn(async move {
             loop {
-                match proto::read_frame(&mut reader).await {
+                // A peer whose machine slept, whose circuit died, or whose
+                // network vanished sends nothing and closes nothing. Without a
+                // deadline the connection stays in the pool for ever, and the
+                // instant `/call` it promises goes to a socket nobody is on.
+                let frame = match tokio::time::timeout(SILENCE, proto::read_frame(&mut reader)).await
+                {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        let _ = inbox_tx
+                            .send(Err(anyhow::anyhow!(
+                                "nothing heard for {} minutes — they are gone",
+                                SILENCE.as_secs() / 60
+                            )))
+                            .await;
+                        break;
+                    }
+                };
+                match frame {
                     // A clean end. Dropping the sender is the signal; there is
                     // nothing to report.
                     Ok(None) => break,
+                    // Proof of life and nothing else. It must not go any
+                    // further: the first frame on an idle connection is how the
+                    // pool learns someone has started talking, so a forwarded
+                    // keepalive would open a call every minute.
+                    Ok(Some(Message::Ping)) => {}
                     Ok(Some(msg)) => {
                         if inbox_tx.send(Ok(msg)).await.is_err() {
                             break;
@@ -269,6 +324,68 @@ mod tests {
         let (a, mut b) = pair().await;
         a.close(false).await.unwrap();
         assert!(b.inbox.recv().await.is_none(), "a closed link must not hang");
+    }
+
+    /// A connection nobody is using stays up, and stays quiet.
+    ///
+    /// Both halves matter. Keepalives have to cross, or the far side declares
+    /// us gone; and they must not be *visible*, because the first frame on an
+    /// idle connection is how the pool learns a call is starting. A forwarded
+    /// keepalive would open a phantom call every minute.
+    #[tokio::test(start_paused = true)]
+    async fn keepalives_cross_an_idle_link_without_being_seen() {
+        let (a, mut b) = pair().await;
+
+        // Long enough for several keepalives in each direction.
+        tokio::time::sleep(KEEPALIVE * 5).await;
+
+        a.outbox.send(Message::Text("still here".into())).await.unwrap();
+        assert_eq!(
+            b.inbox.recv().await.unwrap().unwrap(),
+            Message::Text("still here".into()),
+            "the first thing to reach the inbox must be the first thing said"
+        );
+    }
+
+    /// A peer that stops without closing is noticed rather than kept for ever.
+    ///
+    /// This is the failure the pool cannot survive without: a machine that
+    /// slept, a circuit that died, a network that vanished. Nothing arrives and
+    /// nothing closes, so the only evidence is silence — and the connection has
+    /// to be declared spent, or `/call` promises an instant call to a socket
+    /// nobody is on.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_goes_silent_is_declared_gone() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+
+        // The far side handshakes and then says nothing ever again — which is
+        // exactly what a peer whose machine slept looks like from here.
+        let mute = tokio::spawn(async move {
+            let mut r = br.compat();
+            let mut w = bw.compat_write();
+            proto::handshake(&mut r, &mut w, &Identity::for_test([2u8; 32]))
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let mut link = Link::open(ar.compat(), aw.compat_write(), &Identity::for_test([1u8; 32]))
+            .await
+            .unwrap();
+
+        let why = link
+            .inbox
+            .recv()
+            .await
+            .expect("silence must be reported, not waited on for ever")
+            .expect_err("a peer saying nothing is not a peer saying something");
+        assert!(
+            why.to_string().contains("gone"),
+            "the reason has to be readable: {why:#}"
+        );
+        mute.abort();
     }
 
     /// The end of the stream never overtakes what was said before it.

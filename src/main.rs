@@ -6,6 +6,7 @@
 //! ```text
 //! /add <name> <address> <key>   file a friend under a name
 //! /call <name>                  call them
+//! /presence <name>              ask to see when each other is online
 //! /contacts                     list the book
 //! /forget <name>                drop a contact
 //! /quit                         leave
@@ -16,6 +17,13 @@
 //!
 //! Both sides must be online at the same time. It is a phone call, not a text
 //! message.
+//!
+//! A connection outlives the call held over it, so the second `/call` to
+//! somebody costs nothing. Two people who have agreed presence go further: a
+//! connection to each other is held open from startup, which is both how each
+//! sees the other is up and why calling them is instant. Nobody is dialled
+//! without having said yes — being reachable and being watched are different
+//! permissions, and restricted discovery only settles the first.
 //!
 //! The identity is a 32-byte seed murmure owns; the `.onion` address is derived
 //! from it, so it survives restarts and is unforgeable without the seed. The
@@ -55,10 +63,10 @@ use tor_hscrypto::pk::{HsClientDescEncKey, HsId};
 use tor_hsservice::config::restricted_discovery::HsClientNickname;
 use tor_hsservice::{HsNickname, RunningOnionService};
 
-use crate::contacts::Contacts;
+use crate::contacts::{Contacts, Presence, Said};
 use crate::identity::Identity;
 use crate::link::Link;
-use crate::pool::Pool;
+use crate::pool::{Heard, Pool};
 use crate::proto::Message;
 use crate::transport::tor::{self, KeyHandover};
 use crate::ui::{Kind, Screen};
@@ -78,6 +86,15 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// How many typed lines may queue while something else is running.
 const KEYBOARD: usize = 16;
+
+/// How often we check that every contact we agreed presence with is still
+/// connected, and dial the ones that are not.
+///
+/// A no-op for anyone already connected, so the cost is one map lookup per
+/// contact per minute. What it buys is the only recovery path there is: a
+/// contact whose machine slept comes back on the next sweep, and nothing else
+/// would ever notice.
+const PRESENCE_SWEEP: Duration = Duration::from_secs(60);
 
 fn main() -> ExitCode {
     let run_dir = run_dir();
@@ -136,7 +153,9 @@ async fn run(run_dir: &Path) -> Result<()> {
     // ---- identity and book ---------------------------------------------
     let seed_path = run_dir.join("identity.seed");
     let existed = seed_path.exists();
-    let identity = Identity::load_or_create(&seed_path)?;
+    // Shared rather than owned: a background dial runs in its own task and
+    // needs the seed to prove who it is. One copy, not one per dial.
+    let identity = Arc::new(Identity::load_or_create(&seed_path)?);
     identity.check_permissions()?;
     let expected = identity.onion_address();
     let mut book = Contacts::open(&run_dir.join("contacts.sealed"), &identity)?;
@@ -196,7 +215,7 @@ async fn serve(
     started: Instant,
     run_dir: &Path,
     seed_path: &Path,
-    identity: &Identity,
+    identity: &Arc<Identity>,
     expected: tor_hscrypto::pk::HsId,
     screen: &Screen,
     book: &mut Contacts,
@@ -294,9 +313,13 @@ async fn serve(
     // ---- the idle loop ---------------------------------------------------
     let incoming = tor::incoming(requests);
     futures::pin_mut!(incoming);
-    // Connections that outlived the call held over them. Starts empty: nothing
-    // is dialled ahead of being wanted.
-    let mut pool = Pool::default();
+    // Connections that outlived the call held over them, plus the ones presence
+    // asked for. Starts empty; the first sweep below fills it.
+    let mut pool = Pool::new();
+    // Fires immediately, which is what connects to everyone at startup, and
+    // then every minute to pick up whoever came back.
+    let mut sweep = tokio::time::interval(PRESENCE_SWEEP);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         // The select only *picks* the event. Handling it happens after, so that
@@ -306,38 +329,56 @@ async fn serve(
         let event = tokio::select! {
             stream = incoming.next() => Event::Called(stream.map(Box::new)),
             line = lines.recv() => Event::Typed(line),
-            (peer, frame) = pool.ready() => Event::Spoke(peer, frame),
+            heard = pool.ready() => Event::Spoke(heard),
+            _ = sweep.tick() => Event::Sweep,
         };
 
         match event {
+            // Somebody connected. That is not yet a call: it may be a contact
+            // coming online, or a presence request, and neither should open a
+            // conversation. The connection goes into the pool and the first
+            // frame on it decides what it was — the same path a connection we
+            // already held takes, so there is one answer and not two.
+            //
+            // An onion service is told nothing about its client, so the name
+            // comes out of the handshake, one signature later, and not from the
+            // connection.
             Event::Called(Some(stream)) => {
-                // An onion service is told nothing about its client, so the
-                // name below comes out of the handshake — one signature later —
-                // and not from the connection.
                 let (reader, writer) = stream.split();
-                let mut link = match Link::open(reader, writer, identity).await {
-                    Ok(link) => link,
-                    Err(e) => {
-                        screen.error(format!("-- a call was dropped: {e:#} --"));
-                        continue;
+                match Link::open(reader, writer, identity).await {
+                    Ok(link) => {
+                        let name = name_for(book, &link.peer);
+                        let agreed = book.presence_of(&name) == Presence::On;
+                        // Somebody we agreed to watch arriving *is* the whole of
+                        // "they are online" — there is nothing else to observe.
+                        if pool.keep(link).await && agreed {
+                            screen.system(format!("-- {name} is online --"));
+                        }
                     }
-                };
-                let name = name_for(book, &link.peer);
-                screen.system(format!("-- {name} is calling --"));
-                screen.status("in a call");
-                let (flow, alive) =
-                    converse(&mut link, &name, None, &incoming_dir, lines, screen).await;
-                shelve(&mut pool, link, alive).await;
-                if let Flow::Quit = flow {
-                    break;
+                    Err(e) => screen.error(format!("-- a connection was dropped: {e:#} --")),
                 }
-                screen.status("listening");
             }
             Event::Called(None) => bail!("the incoming-stream channel closed"),
+            // Agreeing to be seen is not something said during a call, so it is
+            // settled out here and opens no conversation.
+            Event::Spoke(Heard::Frame(peer, msg)) if said_about_presence(&msg).is_some() => {
+                let said = said_about_presence(&msg).expect("guarded by the arm");
+                // A stranger who got this far is someone we forgot. There is
+                // nowhere to record an agreement with them, so nothing to say.
+                match book.name_of(&peer.display_unredacted().to_string()) {
+                    None => tracing::debug!("a presence frame from nobody in the book"),
+                    Some(name) => {
+                        let name = name.to_owned();
+                        if let Err(e) = presence(&name, said, book, &mut pool, &live, screen).await {
+                            screen.error(format!("{e:#}"));
+                        }
+                    }
+                }
+            }
             // Somebody we are already connected to has started talking. There
             // was nothing to dial and nothing to answer: the frame *is* the
             // call, and it has to be handed on rather than dropped.
-            Event::Spoke(peer, Some(Ok(msg))) => {
+            Event::Spoke(Heard::Frame(peer, msg)) => {
                 let Some(mut link) = pool.take(&peer) else {
                     // `ready` only reports links the pool is holding.
                     continue;
@@ -353,18 +394,22 @@ async fn serve(
                 }
                 screen.status("listening");
             }
-            // A kept connection ended while nobody was talking over it. Not
-            // news the operator can act on — the next `/call` simply dials
-            // again — so it goes to the log and nowhere else.
-            Event::Spoke(peer, ended) => {
-                if let Some(link) = pool.take(&peer) {
-                    let _ = link.close(true).await;
-                }
-                match ended {
-                    Some(Err(e)) => tracing::debug!("an idle connection failed: {e:#}"),
-                    _ => tracing::debug!("an idle connection was closed by the peer"),
-                }
+            // A background dial landed. This is the whole of "alice is online":
+            // being connected to somebody is the same fact as seeing them.
+            Event::Spoke(Heard::Reached(peer)) => {
+                screen.system(format!("-- {} is online --", name_for(book, &peer)));
             }
+            // A connection ended with nobody talking over it. Only worth saying
+            // for someone we were watching on purpose; otherwise the next
+            // `/call` simply dials again and there is nothing to report.
+            Event::Spoke(Heard::Lost(peer)) => {
+                let name = name_for(book, &peer);
+                if book.presence_of(&name) == Presence::On {
+                    screen.system(format!("-- {name} went offline --"));
+                }
+                tracing::debug!("a held connection ended");
+            }
+            Event::Sweep => hold_presence(&mut pool, book, &live),
             // The interface is gone: Ctrl-C, or the terminal closed.
             Event::Typed(None) => break,
             Event::Typed(Some(line)) => {
@@ -402,7 +447,7 @@ struct Live<'a> {
     client: &'a tor::Client,
     service: &'a Arc<RunningOnionService>,
     nickname: &'a HsNickname,
-    identity: &'a Identity,
+    identity: &'a Arc<Identity>,
     /// Where a file accepted during a call is written.
     incoming_dir: &'a Path,
 }
@@ -450,11 +495,11 @@ enum Event {
     Called(Option<Box<arti_client::DataStream>>),
     /// The operator typed a line. [`None`] means the interface closed.
     Typed(Option<ui::Typed>),
-    /// Something arrived on a connection we were already holding open.
-    ///
-    /// Anything but a frame means that connection is finished — see
-    /// [`crate::pool::Pool::ready`].
-    Spoke(HsId, Option<Result<Message>>),
+    /// Something happened on the pool: a frame, a connection lost, or a
+    /// background dial landing.
+    Spoke(Heard),
+    /// Time to make sure everyone we agreed presence with is still connected.
+    Sweep,
 }
 
 /// What the idle loop does after a command.
@@ -477,6 +522,81 @@ fn name_for(book: &Contacts, peer: &HsId) -> String {
     }
 }
 
+/// Open a connection to everyone who agreed presence, and keep it open.
+///
+/// Cheap to call often: a contact already connected, or already being dialled,
+/// is skipped. Calling it on a timer is the only recovery there is — a peer
+/// whose machine slept closes nothing and says nothing, so the sweep that finds
+/// them missing is what brings them back.
+fn hold_presence(pool: &mut Pool, book: &Contacts, live: &Live<'_>) {
+    for (name, contact) in book.agreed() {
+        match contact.address.parse::<HsId>() {
+            Ok(peer) => pool.reach(live.client, peer, live.identity),
+            // Refused by `/add`, so this cannot happen without a corrupt book.
+            Err(e) => tracing::warn!("{name}'s address is unusable: {e}"),
+        }
+    }
+}
+
+/// Read a frame as a presence event, if that is what it is.
+///
+/// [`None`] for everything else, which is what tells the idle loop that a frame
+/// is somebody starting to talk rather than somebody answering a question.
+fn said_about_presence(msg: &Message) -> Option<Said> {
+    match msg {
+        Message::PresenceAsk => Some(Said::TheyAsk),
+        Message::PresenceYes => Some(Said::TheyAgree),
+        Message::PresenceNo => Some(Said::TheyRefuse),
+        _ => None,
+    }
+}
+
+/// Apply one presence event, and everything that follows from it.
+///
+/// One function for both directions — a request we type and a frame that
+/// arrives — because they are the same state machine and splitting them is how
+/// the two halves drift apart. The machine itself is in [`crate::contacts`] and
+/// touches nothing; this is the part that stores, sends, and says.
+async fn presence(
+    name: &str,
+    said: Said,
+    book: &mut Contacts,
+    pool: &mut Pool,
+    live: &Live<'_>,
+    screen: &Screen,
+) -> Result<()> {
+    let Some(address) = book.address_of(name).map(str::to_owned) else {
+        bail!("no contact called {name} — /add them first");
+    };
+    let peer: HsId = address
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{name}'s address is not a valid onion address: {e}"))?;
+
+    let was = book.presence_of(name);
+    let step = was.step(said, name);
+    book.set_presence(name, step.to)?;
+    if let Some(reply) = step.reply {
+        // Queued if there is no connection yet, which is the normal case for a
+        // request: presence is asked of somebody we are not yet connected to.
+        pool.send(peer, reply).await;
+    }
+    if let Some(note) = step.note {
+        screen.system(note);
+    }
+
+    match step.to {
+        // Agreed. Connect now rather than waiting up to a minute for the sweep.
+        Presence::On => pool.reach(live.client, peer, live.identity),
+        // Not agreed, or no longer. Let go of the connection — `forget` closes
+        // it rather than dropping it, so the refusal queued above still gets
+        // out. Skipped when nothing changed, or a plain `/presence x off` typed
+        // twice would hang up a connection a call had left open.
+        Presence::Off if was != Presence::Off => pool.forget(&peer).await,
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Put a link back in the pool, or close it if the call ended because it died.
 ///
 /// The whole point of the pool is that hanging up is not disconnecting — so
@@ -484,7 +604,8 @@ fn name_for(book: &Contacts, peer: &HsId) -> String {
 /// is exactly one answer: the peer going away.
 async fn shelve(pool: &mut Pool, link: Link, alive: bool) {
     if alive {
-        pool.keep(link);
+        // Back where it was; nothing to announce, since nobody arrived.
+        let _ = pool.keep(link).await;
     } else if let Err(e) = link.close(true).await {
         tracing::debug!("closing a spent connection: {e:#}");
     }
@@ -570,8 +691,17 @@ async fn command(
             let Some(name) = parts.next() else {
                 bail!("usage: /forget <name>");
             };
+            // Read before the removal, because after it there is no contact to
+            // look the address up on.
+            let address = book.address_of(name).and_then(|a| a.parse::<HsId>().ok());
             if book.remove(name)? {
                 live.resync(book)?;
+                // Somebody forgotten is somebody we stop holding a connection
+                // to. Leaving one open would keep answering for a name that no
+                // longer exists.
+                if let Some(peer) = address {
+                    pool.forget(&peer).await;
+                }
                 screen.system(format!("forgot {name}"));
                 // Upstream is explicit that this is not revocation: the
                 // introduction points are not rotated, so a client that already
@@ -588,11 +718,34 @@ async fn command(
                 screen.system("(no contacts yet — /add <name> <address>.onion <key>)");
             }
             for (name, contact) in book.iter() {
+                // Presence is shown when the list is asked for, and never on its
+                // own. A permanent panel of who is online is a panel that says,
+                // continuously and to anyone behind you, who you talk to.
+                let standing = match contact.presence {
+                    Presence::Off => String::new(),
+                    Presence::WeAsked => "  (presence: asked, waiting)".to_owned(),
+                    Presence::TheyAsked => format!("  (asks to see you — /presence {name})"),
+                    Presence::On => match contact.address.parse::<HsId>() {
+                        Ok(peer) if pool.holds(&peer) => "  (online)".to_owned(),
+                        _ => "  (presence on, not connected)".to_owned(),
+                    },
+                };
                 screen.system(format!(
-                    "  {name:<16} {}",
+                    "  {name:<16} {}{standing}",
                     onion::fingerprint(&contact.address)
                 ));
             }
+        }
+        "/presence" => {
+            let Some(name) = parts.next() else {
+                bail!("usage: /presence <name>   — or /presence <name> off");
+            };
+            let said = match parts.next() {
+                Some("off") | Some("no") => Said::WeStop,
+                None => Said::WeAsk,
+                Some(other) => bail!("/presence {name} {other}? the only extra word is 'off'"),
+            };
+            presence(name, said, book, pool, live, screen).await?;
         }
         "/call" => {
             let Some(name) = parts.next() else {
@@ -752,7 +905,9 @@ fn help(screen: &Screen) {
         "  /add <name> <address> <key>   file a friend (address and key, both)",
         "  /call <name>                  call them — 7-50 s the first time, then instant",
         "                                for as long as the connection holds. /cancel to give up",
-        "  /contacts                     list the book",
+        "  /presence <name>              ask to see when each other is online. they must agree,",
+        "                                and either of you can stop it with /presence <name> off",
+        "  /contacts                     list the book, and who is online",
         "  /forget <name>                drop a contact",
         "  /copy                         your address and key, to the clipboard",
         "  /help                         this",

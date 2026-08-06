@@ -685,12 +685,11 @@ async fn handle(
             let body = files::sanitize_for_display(&body);
             screen.say(Kind::Theirs, format!("{peer}> {body}"));
         }
-        Message::Ping => {
-            if outbox.send(Message::Pong).await.is_err() {
-                return Ok(false);
-            }
-        }
-        Message::Pong => {}
+        // Keepalives never get here — [`crate::link`] drops them where they
+        // arrive, because a conversation is not the thing that keeps a
+        // connection alive. Presence is answered out in the idle loop for the
+        // same reason: agreeing to be seen is not something said during a call.
+        Message::Ping | Message::PresenceAsk | Message::PresenceYes | Message::PresenceNo => {}
 
         // The old one-file-per-conversation offer. Kept so a peer running the
         // previous version is still understood: it is the same thing as a Post
