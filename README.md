@@ -135,6 +135,7 @@ baked in.
 /call alice                                       dial (7–50 s, /cancel to stop)
 /answer   /decline                                take, or turn down, a call
 /tell alice on rentre à 19h                       leave a message for later
+/history                                          what is kept (nothing, by default)
 /presence alice                                   ask to see each other online
 /send ~/rapport.pdf                               offer a file (during a call)
 /accept   /refuse                                 answer an offer of theirs
@@ -311,6 +312,35 @@ Either way a link that cannot be established falls back to Tor and says so, so
 
 One more limit: a resumed transfer always uses Tor — the direct stream carries no
 offsets, so the two sides would have to agree on one out of band.
+
+## History, if you ask for it
+
+**Off.** Close murmure and the conversation is gone. That was never designed —
+it fell out of holding everything in memory — but it is a real property: a
+machine seized, stolen, or borrowed reveals nothing about what was said.
+
+`/history on` gives that up on purpose. What you say and what you are told is
+kept, sealed with the same construction as the contacts book, capped at a
+megabyte with the oldest dropped. `/history` reads the last lines back.
+`/history off` **erases** what is there — anything less would leave you believing
+you had stopped keeping a record while the record you already have sits on the
+disk.
+
+Two things happen the moment you turn it on:
+
+- **Everyone you are connected to is told**, and told again on every future
+  connection. Being recorded and knowing you are recorded are different things,
+  and the second is the only part that can honestly be offered.
+- **They can refuse.** `/history no alice` asks alice not to write down what you
+  say; her murmure honours it, stops at once mid-call, and erases what it
+  already had of yours. Nothing here can stop a build that lies, and nothing
+  pretends to — it is worth what any request not to repeat something is worth.
+
+Not JSON, not SQLite. JSON would be the conversation in plaintext on the disk,
+and sealing it leaves the JSON doing nothing. SQLite buys incremental append and
+range queries, which a scrollback read from the end at startup does not need, and
+costs either a C library arti does not ship or per-row encryption that leaves
+message count, sizes and timing readable.
 
 ## Files on disk
 

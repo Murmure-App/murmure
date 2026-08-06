@@ -42,7 +42,7 @@ use crate::identity::Identity;
 /// is young enough that maintaining two wire formats would cost more than
 /// telling two people to run the same build, and a version that is refused
 /// loudly is worth more than one that half-works.
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 
 /// Sent before anything else, so that a stream carrying something other than
 /// murmure fails as itself rather than as a nonsensical version number.
@@ -399,6 +399,20 @@ pub enum Message {
     /// Delivery has to be confirmed rather than assumed: putting a frame on a
     /// link is not the far end receiving it, and the link can die in between.
     Got(u64),
+    /// "I am keeping a record of this", or "I have stopped."
+    ///
+    /// Sent when the setting is flipped and whenever a connection opens while
+    /// it is on. Being recorded and knowing you are recorded are different
+    /// things, and the second one is the only part that can honestly be
+    /// offered: nothing here can stop a build that lies, and nothing pretends
+    /// to.
+    Recording(bool),
+    /// "Please do not keep what I say."
+    ///
+    /// Honoured, and worth exactly what the other person's goodwill is worth —
+    /// the same as every other request not to repeat something. It is here
+    /// because the alternative is that the objection has nowhere to go at all.
+    DontRecord,
 }
 
 impl Message {

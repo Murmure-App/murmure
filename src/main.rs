@@ -8,6 +8,7 @@
 //! /call <name>                  call them
 //! /answer   /decline            take, or turn down, a call coming in
 //! /tell <name> <message>        leave a message; it waits until they are up
+//! /history                      what is kept, if anything. off by default
 //! /presence <name>              ask to see when each other is online
 //! /contacts                     list the book
 //! /forget <name>                drop a contact
@@ -33,6 +34,11 @@
 //! without somebody asking for it** — being reachable and being watched are
 //! different permissions, and restricted discovery only settles the first.
 //!
+//! **Nothing is written down unless you ask.** Closing murmure ends the
+//! conversation, and a machine seized or borrowed reveals nothing about what was
+//! said. `/history on` gives that up on purpose, tells everyone you are
+//! connected to, and can be refused by them — see [`crate::history`].
+//!
 //! The identity is a 32-byte seed murmure owns; the `.onion` address is derived
 //! from it, so it survives restarts and is unforgeable without the seed. The
 //! contacts book is sealed under a key derived from that same seed: losing the
@@ -49,6 +55,7 @@
 mod chat;
 mod contacts;
 mod files;
+mod history;
 mod identity;
 mod link;
 mod onion;
@@ -73,6 +80,7 @@ use tor_hsservice::config::restricted_discovery::HsClientNickname;
 use tor_hsservice::{HsNickname, RunningOnionService};
 
 use crate::contacts::{Contacts, Presence, Said};
+use crate::history::History;
 use crate::identity::Identity;
 use crate::link::Link;
 use crate::outbox::Outbox;
@@ -170,6 +178,7 @@ async fn run(run_dir: &Path) -> Result<()> {
     let expected = identity.onion_address();
     let mut book = Contacts::open(&run_dir.join("contacts.sealed"), &identity)?;
     let mut outbox = Outbox::open(&run_dir.join("outbox.sealed"), &identity)?;
+    let mut history = History::open(&run_dir.join("history.sealed"), &identity)?;
 
     // The address is known before Tor is up, because it comes from the seed —
     // so the interface can show it immediately.
@@ -214,9 +223,17 @@ async fn run(run_dir: &Path) -> Result<()> {
         ));
     }
 
+    if history.on() {
+        screen.system(format!(
+            "history is ON — {} line{} kept. /history off erases them.",
+            history.len(),
+            if history.len() == 1 { "" } else { "s" }
+        ));
+    }
+
     let outcome = serve(
         started, run_dir, &seed_path, &identity, expected, &screen, &mut book, &mut outbox,
-        &mut lines,
+        &mut history, &mut lines,
     )
     .await;
     if let Err(e) = &outcome {
@@ -243,6 +260,7 @@ async fn serve(
     screen: &Screen,
     book: &mut Contacts,
     outbox: &mut Outbox,
+    history: &mut History,
     lines: &mut mpsc::Receiver<ui::Typed>,
 ) -> Result<()> {
     let nickname = NICKNAME
@@ -382,6 +400,7 @@ async fn serve(
                         if pool.keep(link).await && agreed {
                             screen.system(format!("-- {name} is online --"));
                         }
+                        declare_history(&peer, &name, book, history, &mut pool).await;
                         deliver(&peer, outbox, &mut pool, screen).await;
                     }
                     Err(e) => screen.error(format!("-- a connection was dropped: {e:#} --")),
@@ -404,6 +423,39 @@ async fn serve(
                     }
                 }
             }
+            // Where the other side stands on keeping a record. State, not an
+            // event: repeated on every connection, so a restart on either side
+            // cannot quietly lose it.
+            Event::Spoke(Heard::Frame(peer, Message::Recording(on))) => {
+                let name = name_for(book, &peer);
+                screen.system(match on {
+                    true => format!("-- {name} is keeping a record of what you two say --"),
+                    false => format!("-- {name} stopped keeping a record --"),
+                });
+            }
+            Event::Spoke(Heard::Frame(peer, Message::DontRecord)) => {
+                match book.name_of(&peer.display_unredacted().to_string()) {
+                    None => tracing::debug!("an objection from nobody in the book"),
+                    Some(name) => {
+                        let name = name.to_owned();
+                        let news = !book.objects_to_history(&name);
+                        match book.set_objection(&name, true) {
+                            // Honoured backwards as well as forwards: what is
+                            // already written down about somebody who has now
+                            // asked not to be is not something to keep.
+                            Ok(_) => match history.forget(&peer.display_unredacted().to_string()) {
+                                Ok(gone) if news => screen.system(format!(
+                                    "-- {name} asked not to be written down; \
+                                     nothing of theirs is kept, and {gone} line(s) were erased --"
+                                )),
+                                Ok(_) => {}
+                                Err(e) => screen.error(format!("{e:#}")),
+                            },
+                            Err(e) => screen.error(format!("{e:#}")),
+                        }
+                    }
+                }
+            }
             // Something written to us while we were out. Shown where it lands
             // rather than ringing: a message left last week is not a call, and
             // making it one would let `/decline` throw away something the
@@ -418,10 +470,21 @@ async fn serve(
                         // arrives again — which must cost a second frame, never
                         // a second copy on screen.
                         match book.accept_left(&name, id) {
-                            Ok(true) => screen.say(
-                                Kind::Theirs,
-                                format!("{name} ({})> {body}", outbox::how_long_ago(at)),
-                            ),
+                            Ok(true) => {
+                                screen.say(
+                                    Kind::Theirs,
+                                    format!("{name} ({})> {body}", outbox::how_long_ago(at)),
+                                );
+                                if let Some(h) = recording(history, book, &name)
+                                    && let Err(e) = h.note(
+                                        &peer.display_unredacted().to_string(),
+                                        false,
+                                        &body,
+                                    )
+                                {
+                                    screen.error(format!("{e:#}"));
+                                }
+                            }
                             Ok(false) => tracing::debug!("a message we already had"),
                             Err(e) => screen.error(format!("{e:#}")),
                         }
@@ -476,7 +539,9 @@ async fn serve(
             // A background dial landed. This is the whole of "alice is online":
             // being connected to somebody is the same fact as seeing them.
             Event::Spoke(Heard::Reached(peer)) => {
-                screen.system(format!("-- {} is online --", name_for(book, &peer)));
+                let name = name_for(book, &peer);
+                screen.system(format!("-- {name} is online --"));
+                declare_history(&peer, &name, book, history, &mut pool).await;
                 deliver(&peer, outbox, &mut pool, screen).await;
             }
             // A connection ended with nobody talking over it. Only worth saying
@@ -512,7 +577,8 @@ async fn serve(
                 // like a `/call` that was swallowed.
                 screen.say(Kind::Mine, format!("> {}", line.trim()));
                 match command(
-                    line, book, &live, &mut pool, outbox, &mut ringing, lines, started, screen,
+                    line, book, &live, &mut pool, outbox, history, &mut ringing, lines, started,
+                    screen,
                 )
                     .await
                 {
@@ -626,6 +692,36 @@ fn hold_presence(pool: &mut Pool, book: &Contacts, live: &Live<'_>) {
             // Refused by `/add`, so this cannot happen without a corrupt book.
             Err(e) => tracing::warn!("{name}'s address is unusable: {e}"),
         }
+    }
+}
+
+/// The record this conversation should be written into, or [`None`].
+///
+/// Two ways to get `None`, and both are refusals: history is off, or this
+/// contact asked not to be written down. Turning history on must not quietly
+/// override somebody who already said no, so the check is here — at the one
+/// place a conversation is handed a record — and not at the switch.
+fn recording<'a>(history: &'a mut History, book: &Contacts, name: &str) -> Option<&'a mut History> {
+    (history.on() && !book.objects_to_history(name)).then_some(history)
+}
+
+/// Everything a fresh connection has to be told about the record.
+///
+/// Both are standing facts rather than events: one that travelled once would be
+/// forgotten by the far side at their next restart, and the whole point is that
+/// nobody is written down without knowing it.
+async fn declare_history(
+    peer: &HsId,
+    name: &str,
+    book: &Contacts,
+    history: &History,
+    pool: &mut Pool,
+) {
+    if history.on() && !book.objects_to_history(name) {
+        pool.send(*peer, Message::Recording(true)).await;
+    }
+    if book.iter().any(|(n, c)| n == name && c.we_object) {
+        pool.send(*peer, Message::DontRecord).await;
     }
 }
 
@@ -745,19 +841,21 @@ async fn shelve(pool: &mut Pool, link: Link, alive: bool) {
 ///
 /// Never propagates an error: a dropped call must not end the program, so a
 /// failure is shown and treated as an ordinary hang-up.
+#[allow(clippy::too_many_arguments)]
 async fn converse(
     link: &mut Link,
     peer: &str,
     first: Option<Message>,
     incoming_dir: &Path,
     lines: &mut mpsc::Receiver<ui::Typed>,
+    history: Option<&mut History>,
     screen: &Screen,
 ) -> (Flow, bool) {
     // The one place both an outgoing and an incoming call pass through, so the
     // input box learns who it is pointed at — and, whatever happens next,
     // learns that it is pointed at nobody again.
     screen.in_call(Some(peer));
-    let ended = chat::run(link, peer, first, incoming_dir, lines, screen).await;
+    let ended = chat::run(link, peer, first, incoming_dir, lines, history, screen).await;
     screen.in_call(None);
 
     match ended {
@@ -786,6 +884,7 @@ async fn command(
     live: &Live<'_>,
     pool: &mut Pool,
     outbox: &mut Outbox,
+    history: &mut History,
     ringing: &mut Option<Ringing>,
     lines: &mut mpsc::Receiver<ui::Typed>,
     started: Instant,
@@ -831,9 +930,14 @@ async fn command(
                     // What was written to a name that no longer exists goes
                     // with it. Keeping it would deliver, months later, to
                     // somebody the operator decided to stop knowing.
-                    let dropped = outbox.discard(&peer.display_unredacted().to_string())?;
+                    let address = peer.display_unredacted().to_string();
+                    let dropped = outbox.discard(&address)?;
                     if dropped > 0 {
                         screen.system(format!("dropped {dropped} message(s) waiting for {name}"));
+                    }
+                    let erased = history.forget(&address)?;
+                    if erased > 0 {
+                        screen.system(format!("erased {erased} line(s) of history with {name}"));
                     }
                     pool.forget(&peer).await;
                 }
@@ -865,14 +969,105 @@ async fn command(
                         _ => "  (presence on, not connected)".to_owned(),
                     },
                 };
+                let record = match (contact.objects_to_history, contact.we_object) {
+                    (true, true) => "  (neither of you is written down)",
+                    (true, false) => "  (asked not to be written down)",
+                    (false, true) => "  (you asked them not to write you down)",
+                    (false, false) => "",
+                };
                 let waiting = match outbox.waiting_for(&contact.address) {
                     0 => String::new(),
                     n => format!("  ({n} waiting to go out)"),
                 };
                 screen.system(format!(
-                    "  {name:<16} {}{standing}{waiting}",
+                    "  {name:<16} {}{standing}{waiting}{record}",
                     onion::fingerprint(&contact.address)
                 ));
+            }
+        }
+        "/history" => {
+            match (parts.next(), parts.next()) {
+                // Reading it back. The default is one conversation's worth,
+                // because the useful question is almost always "what did we say
+                // just now", not "what have I ever kept".
+                (None, _) => {
+                    if !history.on() {
+                        screen.system("history is off — nothing is being kept. /history on");
+                    }
+                    let lines = history.tail(None, history::SHOWN);
+                    if lines.is_empty() && history.on() {
+                        screen.system("(nothing kept yet)");
+                    }
+                    for line in lines {
+                        let who = match book.name_of(&line.with) {
+                            Some(name) if line.mine => format!("you → {name}"),
+                            Some(name) => name.to_owned(),
+                            None => onion::fingerprint(&line.with),
+                        };
+                        screen.say(
+                            if line.mine { Kind::Mine } else { Kind::Theirs },
+                            format!("[{}] {who}> {}", outbox::how_long_ago(line.at), line.body),
+                        );
+                    }
+                }
+                (Some("on"), _) => {
+                    history.set(true)?;
+                    screen.system("history is ON — what you say and what you are told is kept,");
+                    screen.system("sealed, on this disk. /history off erases it again.");
+                    // Everyone connected is told, now rather than at their next
+                    // connection: somebody in a call with you right now is the
+                    // person who most needs to know.
+                    for (name, contact) in book.iter() {
+                        if contact.objects_to_history {
+                            continue;
+                        }
+                        if let Ok(peer) = contact.address.parse::<HsId>()
+                            && pool.holds(&peer)
+                        {
+                            pool.send(peer, Message::Recording(true)).await;
+                            tracing::debug!("told {name} the record is on");
+                        }
+                    }
+                }
+                (Some("off"), _) => {
+                    let erased = history.set(false)?;
+                    screen.system(format!("history is OFF — {erased} line(s) erased."));
+                    for (_, contact) in book.iter() {
+                        if let Ok(peer) = contact.address.parse::<HsId>()
+                            && pool.holds(&peer)
+                        {
+                            pool.send(peer, Message::Recording(false)).await;
+                        }
+                    }
+                }
+                // Our side of somebody else's record. A request, and worth what
+                // their goodwill is worth — which is what every request not to
+                // repeat something has ever been worth.
+                (Some(verb @ ("no" | "ok")), Some(name)) => {
+                    let objecting = verb == "no";
+                    let address = book
+                        .address_of(name)
+                        .ok_or_else(|| anyhow::anyhow!("no contact called {name}"))?
+                        .to_owned();
+                    let peer: HsId = address
+                        .parse()
+                        .map_err(|e| anyhow::anyhow!("{name}'s address is unusable: {e}"))?;
+                    book.set_our_objection(name, objecting)?;
+                    // Queued if they are not connected, so the request is not
+                    // lost by having been made at the wrong moment.
+                    if objecting {
+                        pool.send(peer, Message::DontRecord).await;
+                        screen.system(format!("asked {name} not to write down what you say."));
+                        screen.system("nothing here can enforce that. it is a request.");
+                    } else {
+                        pool.send(peer, Message::Recording(false)).await;
+                        screen.system(format!("withdrew that request to {name}."));
+                    }
+                }
+                (Some("no" | "ok"), None) => bail!("usage: /history no <name>"),
+                (Some(other), _) => {
+                    bail!("/history {other}? try /history, /history on, /history off, /history no <name>")
+                }
             }
         }
         "/tell" => {
@@ -908,6 +1103,11 @@ async fn command(
                 ));
             }
             screen.say(Kind::Mine, format!("you (to {name})> {body}"));
+            if let Some(h) = recording(history, book, name)
+                && let Err(e) = h.note(&address, true, body)
+            {
+                screen.error(format!("{e:#}"));
+            }
             if pool.holds(&peer) {
                 deliver(&peer, outbox, pool, screen).await;
             } else {
@@ -938,6 +1138,7 @@ async fn command(
                 Some(call.first),
                 live.incoming_dir,
                 lines,
+                recording(history, book, &call.name),
                 screen,
             )
             .await;
@@ -978,7 +1179,7 @@ async fn command(
                 .address_of(name)
                 .ok_or_else(|| anyhow::anyhow!("no contact called {name} — /add them first"))?
                 .to_owned();
-            return call(started, live, pool, name, &address, lines, screen).await;
+            return call(started, live, pool, book, history, name, &address, lines, screen).await;
         }
         "/copy" => {
             // Exactly what the other person has to type after `/add <name>`, in
@@ -1006,10 +1207,13 @@ async fn command(
 
 /// Reach a contact — from the pool if we are already connected, by dialling if
 /// not — and hold a conversation.
+#[allow(clippy::too_many_arguments)]
 async fn call(
     started: Instant,
     live: &Live<'_>,
     pool: &mut Pool,
+    book: &Contacts,
+    history: &mut History,
     name: &str,
     address: &str,
     lines: &mut mpsc::Receiver<ui::Typed>,
@@ -1025,7 +1229,16 @@ async fn call(
     if let Some(mut link) = pool.take(&hs_id) {
         screen.system(format!("-- still connected to {name} --"));
         screen.status(format!("in a call with {name}"));
-        let (flow, alive) = converse(&mut link, name, None, live.incoming_dir, lines, screen).await;
+        let (flow, alive) = converse(
+            &mut link,
+            name,
+            None,
+            live.incoming_dir,
+            lines,
+            recording(history, book, name),
+            screen,
+        )
+        .await;
         shelve(pool, link, alive).await;
         if let Flow::Continue = flow {
             screen.status("listening");
@@ -1111,7 +1324,16 @@ async fn call(
 
     screen.system(format!("-- connected to {name} --"));
     screen.status(format!("in a call with {name}"));
-    let (flow, alive) = converse(&mut link, name, None, live.incoming_dir, lines, screen).await;
+    let (flow, alive) = converse(
+        &mut link,
+        name,
+        None,
+        live.incoming_dir,
+        lines,
+        recording(history, book, name),
+        screen,
+    )
+    .await;
     shelve(pool, link, alive).await;
     if let Flow::Continue = flow {
         screen.status("listening");
@@ -1137,6 +1359,10 @@ fn help(screen: &Screen) {
         "  /contacts                     list the book, and who is online",
         "  /forget <name>                drop a contact",
         "  /copy                         your address and key, to the clipboard",
+        "  /history                      the last lines kept, if any",
+        "  /history on   /history off    start or stop keeping a record. off by default;",
+        "                                'off' erases what is there, and both tell your contacts",
+        "  /history no <name>            ask them not to write down what you say",
         "  /help                         this",
         "  /quit                         leave, hanging up first if you are in a call",
         "during a call:",

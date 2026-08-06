@@ -164,6 +164,18 @@ pub struct Contact {
     /// makes that redelivery free: anything below this mark is something we
     /// already have, acknowledged again and shown to nobody.
     pub seen: u64,
+    /// This contact asked not to be written down.
+    ///
+    /// Their side of `/history`. Honoured whatever our own setting is, so
+    /// turning history on does not quietly override somebody who already said
+    /// no.
+    pub objects_to_history: bool,
+    /// We asked *them* not to write us down.
+    ///
+    /// Kept so the request can be repeated on every connection. It is a
+    /// standing objection, not an event: one that only travelled once would be
+    /// silently forgotten by the far side after any restart.
+    pub we_object: bool,
 }
 
 /// A name-to-contact book.
@@ -195,8 +207,8 @@ impl Contacts {
                 anyhow::anyhow!(
                     "the contacts book at {} is unreadable: {e}\n\
                      It was written by an older murmure — a contact now carries a \
-                     service discovery key, a presence setting and a delivery \
-                     mark. Delete the file and /add your contacts again; nothing \
+                     service discovery key, a presence setting, a delivery mark \
+                     and a history objection. Delete the file and /add your contacts again; nothing \
                      else is lost, and the addresses and keys are not secrets.",
                     path.display()
                 )
@@ -232,6 +244,8 @@ impl Contacts {
             discovery: discovery.trim().to_owned(),
             presence: Presence::Off,
             seen: 0,
+            objects_to_history: false,
+            we_object: false,
         };
         check_name(name)?;
         crate::onion::check_address(&entry.address)?;
@@ -310,6 +324,40 @@ impl Contacts {
         entry.presence = presence;
         self.save()?;
         Ok(true)
+    }
+
+    /// Record whether *we* object to this contact writing us down.
+    pub fn set_our_objection(&mut self, name: &str, objects: bool) -> Result<bool> {
+        let Some(entry) = self.entries.get_mut(name.trim()) else {
+            return Ok(false);
+        };
+        if entry.we_object == objects {
+            return Ok(true);
+        }
+        entry.we_object = objects;
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Record whether this contact objects to being written down.
+    pub fn set_objection(&mut self, name: &str, objects: bool) -> Result<bool> {
+        let Some(entry) = self.entries.get_mut(name.trim()) else {
+            return Ok(false);
+        };
+        if entry.objects_to_history == objects {
+            return Ok(true);
+        }
+        entry.objects_to_history = objects;
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Does this contact object to being written down? Unknown names object,
+    /// which is the safe answer for somebody we cannot ask.
+    pub fn objects_to_history(&self, name: &str) -> bool {
+        self.entries
+            .get(name.trim())
+            .is_none_or(|c| c.objects_to_history)
     }
 
     /// Accept a message id from this contact, or say we have it already.

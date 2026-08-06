@@ -165,6 +165,10 @@ is not recoverable by apology.
 
 ## Protocol
 
+> Ended at **6**, not 2 — one bump per shipped step plus the caller-identity
+> prerequisite and the call ring. Each was a variant added or removed, and
+> postcard encodes a variant's position.
+
 `proto::VERSION` goes to 2. Presence frames, a goodbye frame, and the outbox's
 delivery ordering all change the shape of `Message`, and postcard encodes a
 variant's *position*, not its name — so this is exactly the bump the version
@@ -248,8 +252,29 @@ handshake exists to catch. New variants go at the end of the enum.
 
    The cap is per contact and reported: 64, oldest dropped, and the sender is
    told how many and how many remain.
-4. **History**, opt-in, last, and declinable. Still undecided, and still the one
-   that should not be built on autopilot — see above.
+4. **History**, opt-in, last, and declinable. ✅ Off by default and persisted
+   off; `/history on` starts a capped, sealed log under `store.rs`; `/history`
+   reads it back; `/history off` erases it.
+
+   Four decisions the design left open:
+
+   - **Turning it off erases.** Anything else leaves the operator believing they
+     stopped keeping a record while the record they have sits on the disk.
+   - **Capped in bytes, not messages.** `MAX_TEXT` is 32 KB, so "a few thousand
+     messages" is a gigabyte, not the megabyte the design assumed. One megabyte
+     of bodies, oldest dropped.
+   - **"Declinable" was built as a wire fact, both ways.** `Message::Recording`
+     says you are keeping a record; `Message::DontRecord` asks you not to. Both
+     are repeated on every connection, because a fact that travelled once is
+     forgotten by the far side at their next restart. `VERSION` 6.
+   - **A refusal takes effect mid-call and reaches backwards.** The conversation
+     the request is made *during* is the only one the person making it can see,
+     so waiting for the next connection would keep exactly the wrong part. What
+     was already kept of theirs is erased too.
+
+   The honest limit is stated in the interface, not only here: nothing can stop
+   a build that lies, and the request is worth what any request not to repeat
+   something is worth.
 
 Step 1 is what makes murmure stop feeling slow — the second call to someone is
 free. Steps 1-3 together deliver the actual prize: a message sent to someone who
@@ -263,4 +288,6 @@ is out arrives when they come back. Step 4 is a separate decision.
   is also a screen that says, continuously, who you talk to. It should probably
   not be on by default either.
 - Whether an outbox message that expires is deleted or surfaced. Silently
-  dropping a message is the failure mode users never forgive.
+  dropping a message is the failure mode users never forgive. **Settled by not
+  expiring anything**: the cap is by count, the drop is reported, and a message
+  with no deadline cannot quietly miss one.
