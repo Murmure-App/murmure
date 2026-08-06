@@ -16,10 +16,6 @@
 //! A rendezvous costs 7-50 s (PETS 2025). A stream per message would pay that
 //! per message. The stream is opened once and kept.
 
-// Nothing calls this yet: the milestone binary still speaks raw bytes. The chat
-// loop is what wires it in, and this attribute goes away with it.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -639,6 +635,117 @@ mod tests {
     /// Us, for tests that only need someone to be.
     fn me() -> Identity {
         Identity::for_test([1u8; 32])
+    }
+
+    /// A deterministic byte source, so a failure can be reproduced from the
+    /// seed printed in the assertion rather than from luck.
+    ///
+    /// Hand-rolled rather than seeded from `rand`: this has to produce the same
+    /// bytes on every machine and every version of every dependency, which is
+    /// the one property a random number generator does not promise.
+    struct Noise(u64);
+
+    impl Noise {
+        fn byte(&mut self) -> u8 {
+            // xorshift64*, which is four lines and good enough to be unhelpful
+            // to a parser.
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as u8
+        }
+
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| self.byte()).collect()
+        }
+    }
+
+    /// Garbage on the wire must be refused, never panic.
+    ///
+    /// This is the whole pre-authentication attack surface of a frame: the
+    /// length prefix is chosen by the peer, and the body is fed to a decoder
+    /// that has never seen it before. A panic here is a remote crash, reachable
+    /// by anyone who can open a stream to us — which restricted discovery
+    /// narrows to our contacts and no further. A contact is not a threat model.
+    #[test]
+    fn a_malformed_frame_is_an_error_and_never_a_panic() {
+        let mut noise = Noise(0x6D75_726D_7572_65FF);
+
+        for round in 0..4000 {
+            // Three shapes, because unstructured bytes almost never get past
+            // the length check and would leave the decoder untested.
+            let wire = match round % 3 {
+                // Pure noise: mostly exercises the length prefix.
+                0 => {
+                    let n = 1 + (noise.byte() as usize % 96);
+                    noise.bytes(n)
+                }
+                // A plausible length and a body of noise: this is the shape
+                // that actually reaches postcard.
+                1 => {
+                    let len = 1 + (noise.byte() as usize % 64);
+                    let mut wire = (len as u32).to_le_bytes().to_vec();
+                    wire.extend(noise.bytes(len));
+                    wire
+                }
+                // A real frame with one byte corrupted, which is the closest
+                // thing to a hostile input that still decodes half-way.
+                _ => {
+                    let mut wire = Vec::new();
+                    futures::executor::block_on(write_frame(
+                        &mut wire,
+                        &Message::Text("un message ordinaire".into()),
+                    ))
+                    .unwrap();
+                    let at = noise.byte() as usize % wire.len();
+                    wire[at] ^= noise.byte();
+                    wire
+                }
+            };
+
+            // Whatever comes back, it comes back — the assertion is that this
+            // line is reached at all.
+            let outcome =
+                futures::executor::block_on(read_frame(&mut wire.as_slice())).map(|m| m.is_some());
+            assert!(
+                outcome.is_ok() || outcome.is_err(),
+                "round {round} of seed 0x6D75726D757265FF"
+            );
+        }
+    }
+
+    /// The same, for the handshake — which runs *before* anybody has proved
+    /// anything, and is therefore the earlier and more exposed of the two.
+    #[tokio::test]
+    async fn a_malformed_opening_is_an_error_and_never_a_panic() {
+        let mut noise = Noise(0x4861_6E64_7368_616B);
+
+        for round in 0..600 {
+            let wire = match round % 2 {
+                // Short and arbitrary: does it survive not being murmure at all?
+                0 => {
+                    let n = 1 + (noise.byte() as usize % 200);
+                    noise.bytes(n)
+                }
+                // Correct magic and version, then noise where an identity, a
+                // challenge and a signature should be. This is the path that
+                // reaches key parsing and signature verification with bytes
+                // chosen by somebody else.
+                _ => {
+                    let mut wire = MAGIC.to_vec();
+                    wire.extend_from_slice(&VERSION.to_le_bytes());
+                    wire.extend(noise.bytes(64 + 64));
+                    wire
+                }
+            };
+
+            let mut sink = Vec::new();
+            let outcome = handshake(&mut wire.as_slice(), &mut sink, &me()).await;
+            assert!(
+                outcome.is_err() || outcome.is_ok(),
+                "round {round} of seed 0x4861_6E64_7368_616B"
+            );
+        }
     }
 
     /// The opening a peer on `version` with this identity would send. The

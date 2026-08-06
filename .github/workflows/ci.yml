@@ -9,6 +9,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Advisories are published against code that has not changed. Weekly, so a
+  # dependency that becomes dangerous on a quiet week is still noticed.
+  schedule:
+    - cron: "0 6 * * 1"
 
 # A second push to the same branch makes the first one's answer irrelevant.
 concurrency:
@@ -65,3 +69,29 @@ jobs:
       # rather than on the code.
       - name: Tests
         run: cargo test --locked
+
+  # Known vulnerabilities in the dependency tree. Its own job, on its own
+  # schedule as well as on push: an advisory is published against code that has
+  # not changed, so a check that only runs when somebody commits is a check that
+  # finds it late.
+  audit:
+    runs-on: ubuntu-latest
+    # Narrower than the default token, and wider than the workflow's own
+    # read-only default: the scheduled run has to be able to open an issue, or a
+    # advisory published on a quiet week is found by nobody.
+    permissions:
+      contents: read
+      issues: write
+      checks: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2023-0071 — a timing sidechannel in RSA private-key
+          # operations, reached through `ssh-key-fork-arti`, which arti uses to
+          # read and write its keystore. There is no fixed version, and murmure
+          # performs no RSA operation of any kind: every key here is ed25519 or
+          # x25519. Ignored with a name and a reason rather than silently, so
+          # that the day arti drops it this line is what says so.
+          ignore: RUSTSEC-2023-0071
