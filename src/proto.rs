@@ -42,7 +42,7 @@ use crate::identity::Identity;
 /// is young enough that maintaining two wire formats would cost more than
 /// telling two people to run the same build, and a version that is refused
 /// loudly is worth more than one that half-works.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 /// Sent before anything else, so that a stream carrying something other than
 /// murmure fails as itself rather than as a nonsensical version number.
@@ -376,6 +376,13 @@ pub enum Message {
     /// "No", or "not any more". Sent on refusal and on `/presence <name> off`,
     /// and in both cases the sender stops holding a connection open.
     PresenceNo,
+    /// "I am not taking this call."
+    ///
+    /// A connection outlives the call held over it, so nothing about the
+    /// *connection* says whether anybody picked up. Without this the caller
+    /// types into a conversation the other side never entered, and has no way
+    /// to tell that from someone reading slowly.
+    CallDecline,
 }
 
 impl Message {

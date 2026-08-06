@@ -132,6 +132,7 @@ baked in.
 ```text
 /add alice xxxx….onion descriptor:x25519:XXXX…    file them under a name
 /call alice                                       dial (7–50 s, /cancel to stop)
+/answer   /decline                                take, or turn down, a call
 /presence alice                                   ask to see each other online
 /send ~/rapport.pdf                               offer a file (during a call)
 /accept   /refuse                                 answer an offer of theirs
@@ -146,6 +147,11 @@ the key you meant to. Nothing else authenticates the other side.
 The 7–50 seconds is the price of the *first* call. The connection outlives the
 call held over it, so calling the same person again costs nothing until one of
 you leaves.
+
+**A call still has to be answered.** The connection being open is not consent to
+talk over it, so a call coming in shows `-- alice is calling --` and waits for
+`/answer`. What she said first is held unread until then; `/decline` tells her
+you are not taking it, and you never see it.
 
 `/help` lists the rest, including the scroll keys.
 
@@ -177,7 +183,8 @@ murmures hold a connection open to each other whenever they run, and:
 
 - you each see `-- alice is online --` when the other starts up, and
   `-- alice went offline --` when they stop;
-- `/call alice` is instant, because there is nothing left to dial;
+- `/call alice` is instant, because there is nothing left to dial — she still
+  has to `/answer`;
 - `/contacts` shows who is up.
 
 Either of you ends it with `/presence alice off`, and the other is told.

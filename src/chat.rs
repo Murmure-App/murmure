@@ -111,6 +111,8 @@ pub enum Ended {
     PeerHungUp,
     /// We did, with `/bye`.
     WeHungUp,
+    /// They would not take the call.
+    Declined,
     /// We did, with `/quit`: hang up *and* leave the program.
     Quit,
     /// stdin reached EOF: Ctrl-D, or a piped script running out.
@@ -122,6 +124,7 @@ impl Ended {
     pub fn describe(self, peer: &str) -> String {
         match self {
             Ended::PeerHungUp => format!("{peer} hung up"),
+            Ended::Declined => format!("{peer} is not taking the call"),
             Ended::WeHungUp | Ended::Quit => "you hung up".to_owned(),
             Ended::InputClosed => "input closed".to_owned(),
         }
@@ -526,6 +529,9 @@ pub async fn run(
             // channel returns `None` for ever, which would spin.
             frame = inbox.recv(), if !peer_gone => {
                 let msg = match frame {
+                    // Not a hang-up: they never picked up. The connection is
+                    // untouched and still worth keeping.
+                    Some(Ok(Message::CallDecline)) => break Ended::Declined,
                     Some(Ok(msg)) => msg,
                     // The stream failed rather than closing. Nothing queued is
                     // lost: it was all handed over above, before this.
@@ -689,7 +695,14 @@ async fn handle(
         // arrive, because a conversation is not the thing that keeps a
         // connection alive. Presence is answered out in the idle loop for the
         // same reason: agreeing to be seen is not something said during a call.
-        Message::Ping | Message::PresenceAsk | Message::PresenceYes | Message::PresenceNo => {}
+        // A decline is caught by the loop, which has to *end* on it rather
+        // than absorb it. Reaching here means it arrived mid-conversation,
+        // where it says nothing.
+        Message::Ping
+        | Message::PresenceAsk
+        | Message::PresenceYes
+        | Message::PresenceNo
+        | Message::CallDecline => {}
 
         // The old one-file-per-conversation offer. Kept so a peer running the
         // previous version is still understood: it is the same thing as a Post
@@ -1662,6 +1675,48 @@ mod tests {
         let then = seen.iter().position(|l| l.contains("and then this"));
         assert!(first.is_some(), "the announcing frame must reach the screen");
         assert!(first < then, "and must reach it before anything said after");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Being turned down ends the call, and says so as itself.
+    ///
+    /// The connection outlives the call, so nothing about the *connection*
+    /// says whether anybody picked up. Without a frame for it, a caller types
+    /// into a conversation the far side never entered and cannot tell that from
+    /// somebody reading slowly.
+    #[tokio::test]
+    async fn a_call_nobody_takes_ends_as_a_refusal_not_a_hang_up() {
+        let dir = scratch("declined");
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        let (one, two) = (
+            crate::identity::Identity::for_test([1u8; 32]),
+            crate::identity::Identity::for_test([2u8; 32]),
+        );
+        let (caller, called) = tokio::join!(
+            Link::open(ar.compat(), aw.compat_write(), &one),
+            Link::open(br.compat(), bw.compat_write(), &two)
+        );
+        let mut caller = caller.unwrap();
+        let called = called.unwrap();
+
+        called.outbox.send(Message::CallDecline).await.unwrap();
+
+        let (_keys, mut lines) = mpsc::channel::<crate::ui::Typed>(1);
+        let (screen, _updates) = crate::ui::channel();
+        let ended = run(&mut caller, "bob", None, &dir, &mut lines, &screen)
+            .await
+            .unwrap();
+
+        assert_eq!(ended, Ended::Declined);
+        assert!(!ended.leaves(), "a refusal is not a reason to close murmure");
+        assert!(
+            ended.describe("bob").contains("not taking"),
+            "and it must not read as a hang-up: {}",
+            ended.describe("bob")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

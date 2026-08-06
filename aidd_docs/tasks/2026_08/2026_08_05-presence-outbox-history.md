@@ -217,6 +217,16 @@ handshake exists to catch. New variants go at the end of the enum.
    The state machine is a pure function with no I/O, in `contacts.rs`, so
    "silence is not consent" and "a yes to a question nobody asked changes
    nothing" are tests rather than intentions.
+
+   **One thing the pool got wrong, caught by the person it was built for.** With
+   a connection already open, the first frame on it was taken as a call *and
+   answered* — no ring, no choice, and the caller's opening line displayed
+   before anyone decided to take the call. A held connection is not consent to
+   talk over it. So the frame is now held unread until `/answer`, `/decline`
+   sends `Message::CallDecline` (`VERSION` 4) so the caller is not left
+   guessing, and a second caller during a ring is turned down rather than left
+   on silence. `Ended::Declined` exists because "they did not pick up" and "they
+   hung up" are different things to be told.
 3. **The outbox**, and draining it on a presence transition. Everything it
    needs now exists: `Heard::Reached` is the transition, and `Pool::send`
    already queues a frame for a connection that does not exist yet — it is the

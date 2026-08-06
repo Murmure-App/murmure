@@ -6,6 +6,7 @@
 //! ```text
 //! /add <name> <address> <key>   file a friend under a name
 //! /call <name>                  call them
+//! /answer   /decline            take, or turn down, a call coming in
 //! /presence <name>              ask to see when each other is online
 //! /contacts                     list the book
 //! /forget <name>                drop a contact
@@ -19,11 +20,15 @@
 //! message.
 //!
 //! A connection outlives the call held over it, so the second `/call` to
-//! somebody costs nothing. Two people who have agreed presence go further: a
-//! connection to each other is held open from startup, which is both how each
-//! sees the other is up and why calling them is instant. Nobody is dialled
-//! without having said yes — being reachable and being watched are different
-//! permissions, and restricted discovery only settles the first.
+//! somebody costs nothing. A call coming in still has to be answered: the
+//! connection being open is not consent to talk over it, so the caller's first
+//! words are held unread until `/answer`.
+//!
+//! Two people who have agreed presence go further: a connection to each other
+//! is held open from startup, which is both how each sees the other is up and
+//! why calling them is instant. **Nothing is dialled, and no call is placed,
+//! without somebody asking for it** — being reachable and being watched are
+//! different permissions, and restricted discovery only settles the first.
 //!
 //! The identity is a 32-byte seed murmure owns; the `.onion` address is derived
 //! from it, so it survives restarts and is unforgeable without the seed. The
@@ -320,6 +325,9 @@ async fn serve(
     // then every minute to pick up whoever came back.
     let mut sweep = tokio::time::interval(PRESENCE_SWEEP);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Somebody calling, waiting to be answered. One at a time, like the calls
+    // themselves.
+    let mut ringing: Option<Ringing> = None;
 
     loop {
         // The select only *picks* the event. Handling it happens after, so that
@@ -375,24 +383,32 @@ async fn serve(
                     }
                 }
             }
-            // Somebody we are already connected to has started talking. There
-            // was nothing to dial and nothing to answer: the frame *is* the
-            // call, and it has to be handed on rather than dropped.
+            // Somebody we are already connected to has started talking. The
+            // frame *is* the call arriving — there is no dial to notice and
+            // nothing else to announce it.
+            //
+            // It is held, not acted on. The connection was open before anybody
+            // wanted to talk, so entering the conversation here would be
+            // answering the phone on the caller's behalf, and reading what they
+            // said before deciding whether to take the call.
             Event::Spoke(Heard::Frame(peer, msg)) => {
-                let Some(mut link) = pool.take(&peer) else {
-                    // `ready` only reports links the pool is holding.
-                    continue;
-                };
                 let name = name_for(book, &peer);
-                screen.system(format!("-- {name} is calling --"));
-                screen.status("in a call");
-                let (flow, alive) =
-                    converse(&mut link, &name, Some(msg), &incoming_dir, lines, screen).await;
-                shelve(&mut pool, link, alive).await;
-                if let Flow::Quit = flow {
-                    break;
+                if ringing.is_some() {
+                    // Already being called by somebody else. Answer for them
+                    // rather than leaving a second caller waiting on silence.
+                    pool.send(peer, Message::CallDecline).await;
+                    screen.system(format!("-- {name} called while you were busy --"));
+                    continue;
                 }
-                screen.status("listening");
+                screen.system(format!(
+                    "-- {name} is calling — /answer to take it, /decline to refuse --"
+                ));
+                screen.status(format!("{name} is calling"));
+                ringing = Some(Ringing {
+                    peer,
+                    name,
+                    first: msg,
+                });
             }
             // A background dial landed. This is the whole of "alice is online":
             // being connected to somebody is the same fact as seeing them.
@@ -406,6 +422,13 @@ async fn serve(
                 let name = name_for(book, &peer);
                 if book.presence_of(&name) == Presence::On {
                     screen.system(format!("-- {name} went offline --"));
+                }
+                // A caller who left is not a caller to answer. Without this the
+                // prompt sits there and `/answer` walks into a dead link.
+                if ringing.as_ref().is_some_and(|r| r.peer == peer) {
+                    ringing = None;
+                    screen.system(format!("-- {name} stopped calling --"));
+                    screen.status("listening");
                 }
                 tracing::debug!("a held connection ended");
             }
@@ -424,7 +447,9 @@ async fn serve(
                 // the line was received — so a `/call` that is working looks
                 // like a `/call` that was swallowed.
                 screen.say(Kind::Mine, format!("> {}", line.trim()));
-                match command(line, book, &live, &mut pool, lines, started, screen).await {
+                match command(line, book, &live, &mut pool, &mut ringing, lines, started, screen)
+                    .await
+                {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Quit) => break,
                     // A bad command must not end the program.
@@ -536,6 +561,19 @@ fn hold_presence(pool: &mut Pool, book: &Contacts, live: &Live<'_>) {
             Err(e) => tracing::warn!("{name}'s address is unusable: {e}"),
         }
     }
+}
+
+/// Somebody calling, waiting for an answer.
+///
+/// The connection was already open, so a call is announced by the caller's
+/// first frame and by nothing else. That frame is held here — unread, unshown —
+/// until somebody says whether to take the call. Answering it is what hands it
+/// to the conversation, in its rightful place at the front.
+struct Ringing {
+    peer: HsId,
+    /// What we know them by, worked out once when the call came in.
+    name: String,
+    first: Message,
 }
 
 /// Read a frame as a presence event, if that is what it is.
@@ -659,6 +697,7 @@ async fn command(
     book: &mut Contacts,
     live: &Live<'_>,
     pool: &mut Pool,
+    ringing: &mut Option<Ringing>,
     lines: &mut mpsc::Receiver<ui::Typed>,
     started: Instant,
     screen: &Screen,
@@ -735,6 +774,43 @@ async fn command(
                     onion::fingerprint(&contact.address)
                 ));
             }
+        }
+        "/answer" => {
+            let Some(call) = ringing.take() else {
+                bail!("nobody is calling");
+            };
+            let Some(mut link) = pool.take(&call.peer) else {
+                // The connection went away between the ring and the answer.
+                bail!("{} is no longer connected", call.name);
+            };
+            screen.system(format!("-- in a call with {} --", call.name));
+            screen.status(format!("in a call with {}", call.name));
+            let (flow, alive) = converse(
+                &mut link,
+                &call.name,
+                Some(call.first),
+                live.incoming_dir,
+                lines,
+                screen,
+            )
+            .await;
+            shelve(pool, link, alive).await;
+            if let Flow::Continue = flow {
+                screen.status("listening");
+            }
+            return Ok(flow);
+        }
+        "/decline" => {
+            let Some(call) = ringing.take() else {
+                bail!("nobody is calling");
+            };
+            // Told, rather than left to wonder: the connection stays open
+            // either way, so silence would look exactly like a slow reader.
+            pool.send(call.peer, Message::CallDecline).await;
+            // Whatever they said goes with it. Declining a call is not a way of
+            // reading it.
+            screen.system(format!("-- turned down the call from {} --", call.name));
+            screen.status("listening");
         }
         "/presence" => {
             let Some(name) = parts.next() else {
@@ -905,6 +981,8 @@ fn help(screen: &Screen) {
         "  /add <name> <address> <key>   file a friend (address and key, both)",
         "  /call <name>                  call them — 7-50 s the first time, then instant",
         "                                for as long as the connection holds. /cancel to give up",
+        "  /answer                       take the call somebody is making",
+        "  /decline                      turn it down; they are told, and hear nothing else",
         "  /presence <name>              ask to see when each other is online. they must agree,",
         "                                and either of you can stop it with /presence <name> off",
         "  /contacts                     list the book, and who is online",
