@@ -42,7 +42,7 @@ use crate::identity::Identity;
 /// is young enough that maintaining two wire formats would cost more than
 /// telling two people to run the same build, and a version that is refused
 /// loudly is worth more than one that half-works.
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 
 /// Sent before anything else, so that a stream carrying something other than
 /// murmure fails as itself rather than as a nonsensical version number.
@@ -383,6 +383,22 @@ pub enum Message {
     /// types into a conversation the other side never entered, and has no way
     /// to tell that from someone reading slowly.
     CallDecline,
+    /// Something written while the recipient was not there.
+    ///
+    /// Not a call and not a line in one: it is shown where it lands and
+    /// answered with [`Message::Got`]. Turning it into a call would mean a
+    /// message left last week rings the phone, and would let a `/decline`
+    /// throw away something the sender believes was delivered.
+    ///
+    /// `at` travels with it because a message delivered a week late must not
+    /// read as one just said. `id` is the sender's, increasing for ever, and is
+    /// what both sides use to tell a redelivery from something new.
+    Left { id: u64, at: u64, body: String },
+    /// "I have it." What lets the sender stop keeping a message.
+    ///
+    /// Delivery has to be confirmed rather than assumed: putting a frame on a
+    /// link is not the far end receiving it, and the link can die in between.
+    Got(u64),
 }
 
 impl Message {
@@ -393,7 +409,7 @@ impl Message {
     /// allocation sizes, so they are checked on the way in as well as out.
     fn check(&self) -> Result<()> {
         match self {
-            Message::Text(body) if body.len() > MAX_TEXT => bail!(
+            Message::Text(body) | Message::Left { body, .. } if body.len() > MAX_TEXT => bail!(
                 "text body is {} bytes, over the {MAX_TEXT}-byte limit",
                 body.len()
             ),

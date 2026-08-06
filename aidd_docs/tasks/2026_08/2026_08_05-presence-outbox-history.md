@@ -227,11 +227,29 @@ handshake exists to catch. New variants go at the end of the enum.
    guessing, and a second caller during a ring is turned down rather than left
    on silence. `Ended::Declined` exists because "they did not pick up" and "they
    hung up" are different things to be told.
-3. **The outbox**, and draining it on a presence transition. Everything it
-   needs now exists: `Heard::Reached` is the transition, and `Pool::send`
-   already queues a frame for a connection that does not exist yet — it is the
-   in-memory, four-frame, presence-only version of exactly this.
-4. **History**, opt-in, last, and declinable.
+3. **The outbox**, and draining it on a presence transition. ✅ `/tell <name>
+   <message>` seals a message under `store.rs` in `outbox.sealed`, and it goes
+   out the next time a connection to that contact appears — from a dial
+   landing, from them connecting to us, or from a call.
+
+   Three decisions that were not in the design:
+
+   - **A message left is not a call.** It arrives as `Message::Left` and is
+     shown where it lands. Making it ring would mean something written last week
+     rings the phone, and would let `/decline` throw away what the sender has
+     every reason to believe arrived.
+   - **Delivery is acknowledged, not assumed.** `Message::Got` is what empties
+     the queue; a frame handed to a link is not a message received, and the link
+     can die in between. `VERSION` 5.
+   - **The duplicate that acknowledgement creates is closed on the receiver.** A
+     lost `Got` costs a redelivery, so a contact carries `seen`, the lowest id
+     not yet accepted. A redelivery costs one frame and never a second line on
+     screen.
+
+   The cap is per contact and reported: 64, oldest dropped, and the sender is
+   told how many and how many remain.
+4. **History**, opt-in, last, and declinable. Still undecided, and still the one
+   that should not be built on autopilot — see above.
 
 Step 1 is what makes murmure stop feeling slow — the second call to someone is
 free. Steps 1-3 together deliver the actual prize: a message sent to someone who

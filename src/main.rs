@@ -7,6 +7,7 @@
 //! /add <name> <address> <key>   file a friend under a name
 //! /call <name>                  call them
 //! /answer   /decline            take, or turn down, a call coming in
+//! /tell <name> <message>        leave a message; it waits until they are up
 //! /presence <name>              ask to see when each other is online
 //! /contacts                     list the book
 //! /forget <name>                drop a contact
@@ -16,8 +17,10 @@
 //! During a call, `/send <path>` offers a file, `/accept` and `/refuse` answer
 //! one, and `/bye` hangs up. An accepted file lands in `<run dir>/incoming/`.
 //!
-//! Both sides must be online at the same time. It is a phone call, not a text
-//! message.
+//! `/call` needs both people online at the same moment. `/tell` does not: the
+//! message is sealed on your own disk and goes out the next time that contact
+//! appears. Nobody else ever holds it — no server, and never your other
+//! contacts, who would learn when you write to somebody who is not them.
 //!
 //! A connection outlives the call held over it, so the second `/call` to
 //! somebody costs nothing. A call coming in still has to be answered: the
@@ -49,6 +52,7 @@ mod files;
 mod identity;
 mod link;
 mod onion;
+mod outbox;
 mod pool;
 mod proto;
 mod store;
@@ -71,6 +75,7 @@ use tor_hsservice::{HsNickname, RunningOnionService};
 use crate::contacts::{Contacts, Presence, Said};
 use crate::identity::Identity;
 use crate::link::Link;
+use crate::outbox::Outbox;
 use crate::pool::{Heard, Pool};
 use crate::proto::Message;
 use crate::transport::tor::{self, KeyHandover};
@@ -164,6 +169,7 @@ async fn run(run_dir: &Path) -> Result<()> {
     identity.check_permissions()?;
     let expected = identity.onion_address();
     let mut book = Contacts::open(&run_dir.join("contacts.sealed"), &identity)?;
+    let mut outbox = Outbox::open(&run_dir.join("outbox.sealed"), &identity)?;
 
     // The address is known before Tor is up, because it comes from the seed —
     // so the interface can show it immediately.
@@ -200,7 +206,19 @@ async fn run(run_dir: &Path) -> Result<()> {
     //
     // From here on, every failure has to reach the screen rather than stdout:
     // stdout is the alternate screen now.
-    let outcome = serve(started, run_dir, &seed_path, &identity, expected, &screen, &mut book, &mut lines).await;
+    if outbox.len() > 0 {
+        screen.system(format!(
+            "{} message{} still waiting to go out.",
+            outbox.len(),
+            if outbox.len() == 1 { "" } else { "s" }
+        ));
+    }
+
+    let outcome = serve(
+        started, run_dir, &seed_path, &identity, expected, &screen, &mut book, &mut outbox,
+        &mut lines,
+    )
+    .await;
     if let Err(e) = &outcome {
         screen.error(format!("{e:#}"));
         screen.status("stopped");
@@ -224,6 +242,7 @@ async fn serve(
     expected: tor_hscrypto::pk::HsId,
     screen: &Screen,
     book: &mut Contacts,
+    outbox: &mut Outbox,
     lines: &mut mpsc::Receiver<ui::Typed>,
 ) -> Result<()> {
     let nickname = NICKNAME
@@ -355,13 +374,15 @@ async fn serve(
                 let (reader, writer) = stream.split();
                 match Link::open(reader, writer, identity).await {
                     Ok(link) => {
-                        let name = name_for(book, &link.peer);
+                        let peer = link.peer;
+                        let name = name_for(book, &peer);
                         let agreed = book.presence_of(&name) == Presence::On;
                         // Somebody we agreed to watch arriving *is* the whole of
                         // "they are online" — there is nothing else to observe.
                         if pool.keep(link).await && agreed {
                             screen.system(format!("-- {name} is online --"));
                         }
+                        deliver(&peer, outbox, &mut pool, screen).await;
                     }
                     Err(e) => screen.error(format!("-- a connection was dropped: {e:#} --")),
                 }
@@ -381,6 +402,48 @@ async fn serve(
                             screen.error(format!("{e:#}"));
                         }
                     }
+                }
+            }
+            // Something written to us while we were out. Shown where it lands
+            // rather than ringing: a message left last week is not a call, and
+            // making it one would let `/decline` throw away something the
+            // sender has every reason to believe arrived.
+            Event::Spoke(Heard::Frame(peer, Message::Left { id, at, body })) => {
+                match book.name_of(&peer.display_unredacted().to_string()) {
+                    None => tracing::debug!("a message left by nobody in the book"),
+                    Some(name) => {
+                        let name = name.to_owned();
+                        // Shown only the first time. Their outbox keeps it until
+                        // we acknowledge, so a lost acknowledgement means it
+                        // arrives again — which must cost a second frame, never
+                        // a second copy on screen.
+                        match book.accept_left(&name, id) {
+                            Ok(true) => screen.say(
+                                Kind::Theirs,
+                                format!("{name} ({})> {body}", outbox::how_long_ago(at)),
+                            ),
+                            Ok(false) => tracing::debug!("a message we already had"),
+                            Err(e) => screen.error(format!("{e:#}")),
+                        }
+                        // Acknowledged either way: the sender is holding it
+                        // until we say we have it, and we do.
+                        pool.send(peer, Message::Got(id)).await;
+                    }
+                }
+            }
+            // They have it. That, and only that, is what lets go of it.
+            Event::Spoke(Heard::Frame(peer, Message::Got(id))) => {
+                let address = peer.display_unredacted().to_string();
+                match outbox.delivered(&address, id) {
+                    Ok(true) => {
+                        let left = outbox.waiting_for(&address);
+                        let name = name_for(book, &peer);
+                        if left == 0 {
+                            screen.system(format!("-- everything you wrote to {name} arrived --"));
+                        }
+                    }
+                    Ok(false) => tracing::debug!("an acknowledgement we had already acted on"),
+                    Err(e) => screen.error(format!("{e:#}")),
                 }
             }
             // Somebody we are already connected to has started talking. The
@@ -414,6 +477,7 @@ async fn serve(
             // being connected to somebody is the same fact as seeing them.
             Event::Spoke(Heard::Reached(peer)) => {
                 screen.system(format!("-- {} is online --", name_for(book, &peer)));
+                deliver(&peer, outbox, &mut pool, screen).await;
             }
             // A connection ended with nobody talking over it. Only worth saying
             // for someone we were watching on purpose; otherwise the next
@@ -447,7 +511,9 @@ async fn serve(
                 // the line was received — so a `/call` that is working looks
                 // like a `/call` that was swallowed.
                 screen.say(Kind::Mine, format!("> {}", line.trim()));
-                match command(line, book, &live, &mut pool, &mut ringing, lines, started, screen)
+                match command(
+                    line, book, &live, &mut pool, outbox, &mut ringing, lines, started, screen,
+                )
                     .await
                 {
                     Ok(Flow::Continue) => {}
@@ -560,6 +626,28 @@ fn hold_presence(pool: &mut Pool, book: &Contacts, live: &Live<'_>) {
             // Refused by `/add`, so this cannot happen without a corrupt book.
             Err(e) => tracing::warn!("{name}'s address is unusable: {e}"),
         }
+    }
+}
+
+/// Put everything waiting for this peer on the wire.
+///
+/// Nothing is removed here. A frame handed to a link is not a message received
+/// — the link can die in between — so what leaves the queue is decided by their
+/// [`Message::Got`] and by nothing else. Sending the same thing twice is the
+/// price, and the recipient's delivery mark makes it cost nothing.
+async fn deliver(peer: &HsId, outbox: &Outbox, pool: &mut Pool, screen: &Screen) {
+    let address = peer.display_unredacted().to_string();
+    let waiting = outbox.frames_for(&address);
+    if waiting.is_empty() {
+        return;
+    }
+    screen.system(format!(
+        "-- sending {} message{} you left --",
+        waiting.len(),
+        if waiting.len() == 1 { "" } else { "s" }
+    ));
+    for frame in waiting {
+        pool.send(*peer, frame).await;
     }
 }
 
@@ -697,6 +785,7 @@ async fn command(
     book: &mut Contacts,
     live: &Live<'_>,
     pool: &mut Pool,
+    outbox: &mut Outbox,
     ringing: &mut Option<Ringing>,
     lines: &mut mpsc::Receiver<ui::Typed>,
     started: Instant,
@@ -739,6 +828,13 @@ async fn command(
                 // to. Leaving one open would keep answering for a name that no
                 // longer exists.
                 if let Some(peer) = address {
+                    // What was written to a name that no longer exists goes
+                    // with it. Keeping it would deliver, months later, to
+                    // somebody the operator decided to stop knowing.
+                    let dropped = outbox.discard(&peer.display_unredacted().to_string())?;
+                    if dropped > 0 {
+                        screen.system(format!("dropped {dropped} message(s) waiting for {name}"));
+                    }
                     pool.forget(&peer).await;
                 }
                 screen.system(format!("forgot {name}"));
@@ -769,10 +865,61 @@ async fn command(
                         _ => "  (presence on, not connected)".to_owned(),
                     },
                 };
+                let waiting = match outbox.waiting_for(&contact.address) {
+                    0 => String::new(),
+                    n => format!("  ({n} waiting to go out)"),
+                };
                 screen.system(format!(
-                    "  {name:<16} {}{standing}",
+                    "  {name:<16} {}{standing}{waiting}",
                     onion::fingerprint(&contact.address)
                 ));
+            }
+        }
+        "/tell" => {
+            let Some(name) = parts.next() else {
+                bail!("usage: /tell <name> <message>");
+            };
+            // Everything after the name, spacing and all. `split_whitespace`
+            // has eaten it, so take it from the original line.
+            let body = line
+                .split_once(name)
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or_default();
+            if body.is_empty() {
+                bail!("usage: /tell {name} <message>");
+            }
+            let address = book
+                .address_of(name)
+                .ok_or_else(|| anyhow::anyhow!("no contact called {name} — /add them first"))?
+                .to_owned();
+            let peer: HsId = address
+                .parse()
+                .map_err(|e| anyhow::anyhow!("{name}'s address is unusable: {e}"))?;
+
+            // Queued first, always, even when they are connected. One path, so
+            // a message is on disk before anything is attempted with it and a
+            // failure at any point after this cannot lose it.
+            let dropped = outbox.queue(&address, body.to_owned())?;
+            if dropped > 0 {
+                screen.error(format!(
+                    "{dropped} older message{} to {name} dropped — {} were already waiting",
+                    if dropped == 1 { " was" } else { "s were" },
+                    outbox.waiting_for(&address)
+                ));
+            }
+            screen.say(Kind::Mine, format!("you (to {name})> {body}"));
+            if pool.holds(&peer) {
+                deliver(&peer, outbox, pool, screen).await;
+            } else {
+                screen.system(format!(
+                    "{name} is not connected — kept, and it goes out when they next are ({} waiting)",
+                    outbox.waiting_for(&address)
+                ));
+                // Not reached for a contact we hold no agreement with: they are
+                // dialled by a call, and by nothing this can do for them.
+                if book.presence_of(name) == Presence::On {
+                    pool.reach(live.client, peer, live.identity);
+                }
             }
         }
         "/answer" => {
@@ -979,6 +1126,8 @@ fn help(screen: &Screen) {
         "",
         "commands:",
         "  /add <name> <address> <key>   file a friend (address and key, both)",
+        "  /tell <name> <message>        leave a message. it waits, sealed on your disk,",
+        "                                until they are next online — no server holds it",
         "  /call <name>                  call them — 7-50 s the first time, then instant",
         "                                for as long as the connection holds. /cancel to give up",
         "  /answer                       take the call somebody is making",

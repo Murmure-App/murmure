@@ -4,8 +4,9 @@ Peer-to-peer terminal messaging over Tor onion services.
 
 The point is not that nobody can read your messages — every messenger does that
 now. The point is that **nobody can tell who you talk to**: no account, no
-directory, no server anyone operates. Both sides must be online at the same
-time. It is a phone call, not a text message.
+directory, no server anyone operates. A call needs both of you online at the
+same moment; a message left with `/tell` does not — it waits, sealed on your own
+disk, until the other person appears.
 
 > ## Read this before trusting it
 >
@@ -133,6 +134,7 @@ baked in.
 /add alice xxxx….onion descriptor:x25519:XXXX…    file them under a name
 /call alice                                       dial (7–50 s, /cancel to stop)
 /answer   /decline                                take, or turn down, a call
+/tell alice on rentre à 19h                       leave a message for later
 /presence alice                                   ask to see each other online
 /send ~/rapport.pdf                               offer a file (during a call)
 /accept   /refuse                                 answer an offer of theirs
@@ -205,6 +207,29 @@ What it costs: while presence is on with someone, you are holding a Tor circuit
 to them and sending a two-byte keepalive each minute. That is visible to your
 guard node as *traffic*, exactly as any open circuit is. It says nothing about
 who is on the other end.
+
+## Leaving a message
+
+`/tell alice on rentre à 19h` when alice is out. The message is sealed on **your**
+disk and goes out the next time she appears. She sees it where it lands, with
+how long it waited; you see `-- everything you wrote to alice arrived --` when
+her side confirms.
+
+The two obvious places to leave an undelivered message are both worse than not
+having the feature. A **server** ends "no server anyone operates" and whoever
+runs it learns who writes to whom. **Relaying through your contacts** is worse
+still: it tells your friends when you are writing to somebody who is not them.
+Keeping it with the sender costs one thing — the message only moves when you are
+both online at *some* point — and buys everything else.
+
+**Delivery is confirmed, not assumed.** A message leaves your queue when the
+recipient says they have it, never when it is handed to a connection. A lost
+acknowledgement therefore costs a redelivery, and their side keeps a per-sender
+mark so a redelivery is never a duplicate on screen.
+
+Bounded, and bounded out loud: 64 messages per contact. Past that the oldest is
+dropped and you are told which. A message that vanishes without a word is the
+one failure this is built to avoid.
 
 ## Sending a file
 

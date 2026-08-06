@@ -704,6 +704,12 @@ async fn handle(
         | Message::PresenceNo
         | Message::CallDecline => {}
 
+        // Outbox traffic, which belongs to the idle loop: it owns the sealed
+        // queue and the delivery marks, and neither is a thing a conversation
+        // should be reaching into. Ignored rather than acknowledged, so the
+        // sender redelivers once the call is over and nothing is lost.
+        Message::Left { .. } | Message::Got(_) => {}
+
         // The old one-file-per-conversation offer. Kept so a peer running the
         // previous version is still understood: it is the same thing as a Post
         // carrying exactly one file and no text.

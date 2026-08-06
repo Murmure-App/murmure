@@ -157,6 +157,13 @@ pub struct Contact {
     pub discovery: String,
     /// Where this contact stands on seeing, and being seen by, us.
     pub presence: Presence,
+    /// The lowest [`Message::Left`] id from this contact we have not accepted.
+    ///
+    /// Their outbox keeps a message until we acknowledge it, so an
+    /// acknowledgement lost to a dropped link costs a redelivery. This is what
+    /// makes that redelivery free: anything below this mark is something we
+    /// already have, acknowledged again and shown to nobody.
+    pub seen: u64,
 }
 
 /// A name-to-contact book.
@@ -188,9 +195,9 @@ impl Contacts {
                 anyhow::anyhow!(
                     "the contacts book at {} is unreadable: {e}\n\
                      It was written by an older murmure — a contact now carries a \
-                     service discovery key and a presence setting. Delete the file \
-                     and /add your contacts again; nothing else is lost, and the \
-                     addresses and keys are not secrets.",
+                     service discovery key, a presence setting and a delivery \
+                     mark. Delete the file and /add your contacts again; nothing \
+                     else is lost, and the addresses and keys are not secrets.",
                     path.display()
                 )
             })?,
@@ -224,6 +231,7 @@ impl Contacts {
             address: address.trim().to_owned(),
             discovery: discovery.trim().to_owned(),
             presence: Presence::Off,
+            seen: 0,
         };
         check_name(name)?;
         crate::onion::check_address(&entry.address)?;
@@ -300,6 +308,22 @@ impl Contacts {
             return Ok(true);
         }
         entry.presence = presence;
+        self.save()?;
+        Ok(true)
+    }
+
+    /// Accept a message id from this contact, or say we have it already.
+    ///
+    /// Raises the high-water mark on the way through, so a message is shown
+    /// exactly once however many times the sender redelivers it.
+    pub fn accept_left(&mut self, name: &str, id: u64) -> Result<bool> {
+        let Some(entry) = self.entries.get_mut(name.trim()) else {
+            return Ok(false);
+        };
+        if id < entry.seen {
+            return Ok(false);
+        }
+        entry.seen = id + 1;
         self.save()?;
         Ok(true)
     }
