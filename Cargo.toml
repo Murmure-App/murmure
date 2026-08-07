@@ -133,6 +133,23 @@ zeroize = "1"
 ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 
+# A debug build of this tree reached 17 GB, and almost none of it was murmure.
+#
+# arti is around six hundred crates. Cargo's default `dev` profile compiles
+# every one of them with full DWARF, and `target/debug/deps` alone was 13 GB of
+# debug information for code nobody here has ever stepped through.
+[profile.dev]
+# Enough for a backtrace that names a file and a line, which is the only thing
+# a panic in murmure has ever needed. Full DWARF buys stepping through our own
+# code in a debugger; nothing in this project is debugged that way.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies get none at all. A backtrace through `tor-circmgr` will show
+# frames without line numbers, and on the day that matters, deleting these two
+# lines and rebuilding gets them back.
+debug = false
+
 [dev-dependencies]
 tokio-util = { version = "0.7.19", features = ["compat"] }
 # `test-util` is what lets a test drive the clock instead of waiting on it, so
