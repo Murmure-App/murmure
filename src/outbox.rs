@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -110,7 +110,21 @@ impl Outbox {
     }
 
     /// Put a message by for `address`. Returns the number dropped to make room.
+    ///
+    /// Refused here if it is too long to ever travel. [`Message::check`] would
+    /// refuse it at the wire instead, which is far worse than it sounds: the
+    /// write fails, so no acknowledgement comes back, so it stays at the head
+    /// of the queue and kills the writer on every future connection to that
+    /// contact — taking everything queued behind it with it.
     pub fn queue(&mut self, address: &str, body: String) -> Result<usize> {
+        if body.len() > crate::proto::MAX_TEXT {
+            bail!(
+                "that message is {} bytes, over the {}-byte limit. \
+                 Shorten it, or send it as a file during a call.",
+                body.len(),
+                crate::proto::MAX_TEXT
+            );
+        }
         let id = self.next;
         self.next += 1;
         let at = SystemTime::now()
@@ -319,6 +333,35 @@ mod tests {
         let frames = out.frames_for(ALICE);
         assert!(matches!(&frames[0], Message::Left { body, .. } if body == "1"));
         assert!(matches!(frames.last().unwrap(), Message::Left { body, .. } if body == "the newest"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A message too long to ever travel is refused here, not at the wire.
+    ///
+    /// Refused later, it would fail inside the writer task, never be
+    /// acknowledged, stay at the head of the queue, and kill the writer again
+    /// on every future connection — with everything behind it never delivered.
+    #[tokio::test]
+    async fn a_message_too_long_to_send_is_refused_before_it_is_kept() {
+        let (path, identity) = scratch("toolong");
+        let mut out = Outbox::open(&path, &identity).unwrap();
+
+        let too_long = "x".repeat(crate::proto::MAX_TEXT + 1);
+        assert!(out.queue(ALICE, too_long).is_err());
+        assert_eq!(out.waiting_for(ALICE), 0, "and it must not reach the disk");
+
+        // Exactly at the limit still travels.
+        let at_limit = "x".repeat(crate::proto::MAX_TEXT);
+        assert!(out.queue(ALICE, at_limit).is_ok());
+        for frame in out.frames_for(ALICE) {
+            assert!(
+                crate::proto::write_frame(&mut Vec::new(), &frame)
+                    .await
+                    .is_ok(),
+                "anything the outbox keeps has to be something the wire accepts"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

@@ -105,6 +105,14 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(240);
 /// How many typed lines may queue while something else is running.
 const KEYBOARD: usize = 16;
 
+/// How much a caller may say before somebody answers them.
+///
+/// They cannot tell that we have not picked up, so saying more than one thing
+/// is ordinary. Bounded because the alternative is a caller who can make us
+/// hold whatever they like; past this the link's own inbox applies the
+/// backpressure, and the words stay on the wire rather than being lost.
+const RINGING_LINES: usize = 16;
+
 /// How often we check that every contact we agreed presence with is still
 /// connected, and dial the ones that are not.
 ///
@@ -471,6 +479,14 @@ async fn serve(
                         // a second copy on screen.
                         match book.accept_left(&name, id) {
                             Ok(true) => {
+                                // Straight from the network to a terminal, and
+                                // therefore the same trust boundary as a
+                                // filename or a line of a call. Without this a
+                                // contact can write to the clipboard with an
+                                // OSC 52 sequence in a `/tell` — and if history
+                                // is on, the sequence is kept and fires again
+                                // on every `/history`.
+                                let body = files::sanitize_for_display(&body);
                                 screen.say(
                                     Kind::Theirs,
                                     format!("{name} ({})> {body}", outbox::how_long_ago(at)),
@@ -518,12 +534,38 @@ async fn serve(
             // answering the phone on the caller's behalf, and reading what they
             // said before deciding whether to take the call.
             Event::Spoke(Heard::Frame(peer, msg)) => {
+                // Only somebody speaking opens a call. Everything else that
+                // reaches here belongs to a conversation that has already ended
+                // on our side — a refusal, a file frame answering an offer we
+                // no longer hold — and announcing one of those as a call means
+                // `/answer` walks into a conversation with nobody in it.
+                if !matches!(msg, Message::Text(_) | Message::Post { .. }) {
+                    tracing::debug!("a frame that does not open a call, outside one");
+                    continue;
+                }
                 let name = name_for(book, &peer);
-                if ringing.is_some() {
-                    // Already being called by somebody else. Answer for them
-                    // rather than leaving a second caller waiting on silence.
+                // Compared by peer, not merely by "is anybody calling". The
+                // caller cannot tell that we have not answered yet, so a second
+                // line typed before we do is the *same* call — and declining it
+                // would hang up on somebody who is mid-sentence, using the very
+                // frame that says "not taking this call".
+                if ringing.as_ref().is_some_and(|r| r.peer != peer) {
+                    // Somebody else, though. Answer for them rather than
+                    // leaving a second caller waiting on silence.
                     pool.send(peer, Message::CallDecline).await;
                     screen.system(format!("-- {name} called while you were busy --"));
+                    continue;
+                }
+                // The same caller, still waiting. Kept rather than dropped:
+                // they have no signal that we have not answered, so a second
+                // line is an ordinary thing to type — and losing it silently is
+                // the failure the whole outbox exists to avoid.
+                if let Some(call) = ringing.as_mut() {
+                    if call.said.len() < RINGING_LINES {
+                        call.said.push(msg);
+                    } else {
+                        tracing::debug!("a caller said more than we will hold before answering");
+                    }
                     continue;
                 }
                 screen.system(format!(
@@ -533,7 +575,7 @@ async fn serve(
                 ringing = Some(Ringing {
                     peer,
                     name,
-                    first: msg,
+                    said: vec![msg],
                 });
             }
             // A background dial landed. This is the whole of "alice is online":
@@ -750,14 +792,15 @@ async fn deliver(peer: &HsId, outbox: &Outbox, pool: &mut Pool, screen: &Screen)
 /// Somebody calling, waiting for an answer.
 ///
 /// The connection was already open, so a call is announced by the caller's
-/// first frame and by nothing else. That frame is held here — unread, unshown —
-/// until somebody says whether to take the call. Answering it is what hands it
-/// to the conversation, in its rightful place at the front.
+/// first frame and by nothing else. Those frames are held here — unread,
+/// unshown — until somebody says whether to take the call. Answering is what
+/// hands them to the conversation, in their rightful place at the front.
 struct Ringing {
     peer: HsId,
     /// What we know them by, worked out once when the call came in.
     name: String,
-    first: Message,
+    /// Everything they have said so far, in order, unread.
+    said: Vec<Message>,
 }
 
 /// Read a frame as a presence event, if that is what it is.
@@ -845,18 +888,36 @@ async fn shelve(pool: &mut Pool, link: Link, alive: bool) {
 async fn converse(
     link: &mut Link,
     peer: &str,
-    first: Option<Message>,
+    first: Vec<Message>,
     incoming_dir: &Path,
     lines: &mut mpsc::Receiver<ui::Typed>,
     history: Option<&mut History>,
+    book: &mut Contacts,
     screen: &Screen,
 ) -> (Flow, bool) {
     // The one place both an outgoing and an incoming call pass through, so the
     // input box learns who it is pointed at — and, whatever happens next,
     // learns that it is pointed at nobody again.
     screen.in_call(Some(peer));
-    let ended = chat::run(link, peer, first, incoming_dir, lines, history, screen).await;
+    // Set if they ask, mid-call, not to be written down. Stored below rather
+    // than inside the conversation: a standing objection lives in the contacts
+    // book, and a conversation has no business reaching into it.
+    let mut objected = false;
+    let ended = chat::run(
+        link,
+        peer,
+        first,
+        incoming_dir,
+        lines,
+        history,
+        &mut objected,
+        screen,
+    )
+    .await;
     screen.in_call(None);
+    if objected && let Err(e) = book.set_objection(peer, true) {
+        screen.error(format!("could not record that {peer} objects: {e:#}"));
+    }
 
     match ended {
         Ok(ended) => {
@@ -1135,10 +1196,11 @@ async fn command(
             let (flow, alive) = converse(
                 &mut link,
                 &call.name,
-                Some(call.first),
+                call.said,
                 live.incoming_dir,
                 lines,
                 recording(history, book, &call.name),
+                book,
                 screen,
             )
             .await;
@@ -1212,7 +1274,7 @@ async fn call(
     started: Instant,
     live: &Live<'_>,
     pool: &mut Pool,
-    book: &Contacts,
+    book: &mut Contacts,
     history: &mut History,
     name: &str,
     address: &str,
@@ -1232,10 +1294,11 @@ async fn call(
         let (flow, alive) = converse(
             &mut link,
             name,
-            None,
+            Vec::new(),
             live.incoming_dir,
             lines,
             recording(history, book, name),
+            book,
             screen,
         )
         .await;
@@ -1327,10 +1390,11 @@ async fn call(
     let (flow, alive) = converse(
         &mut link,
         name,
-        None,
+        Vec::new(),
         live.incoming_dir,
         lines,
         recording(history, book, name),
+        book,
         screen,
     )
     .await;

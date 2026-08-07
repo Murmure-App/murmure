@@ -298,17 +298,24 @@ struct Receiving {
 /// keyboard, and the connection is still there for the next call.
 /// `incoming_dir` is where accepted files land.
 ///
-/// `first` is a frame the caller has already taken off the inbox. A connection
-/// kept open between calls has to be watched by somebody, and whoever watches
-/// it learns that a call is starting by reading the frame that starts it — so
-/// that frame arrives here rather than on the wire. See [`crate::pool`].
+/// `first` is what the caller has already taken off the inbox, oldest first. A
+/// connection kept open between calls has to be watched by somebody, and
+/// whoever watches it learns that a call is starting by reading the frames that
+/// start it — so they arrive here rather than on the wire. A caller cannot tell
+/// that nobody has answered yet, so there may be several. See [`crate::pool`].
+///
+/// `objected` is set if the peer asks mid-call not to be written down. A
+/// conversation cannot reach the contacts book itself, and the request is a
+/// standing one rather than an event — so it has to leave here to be stored.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     link: &mut Link,
     peer: &str,
-    first: Option<Message>,
+    first: Vec<Message>,
     incoming_dir: &Path,
     lines: &mut mpsc::Receiver<crate::ui::Typed>,
     history: Option<&mut History>,
+    objected: &mut bool,
     screen: &Screen,
 ) -> Result<Ended> {
     // Filed under the address, never the name: a name is ours to change, and a
@@ -357,15 +364,14 @@ pub async fn run(
     // and the socket, and reports back through the channel.
     let mut direct_task: Option<tokio::task::JoinHandle<()>> = None;
     let (direct_done_tx, mut direct_done) = mpsc::channel::<DirectDone>(1);
-    // Only ever `Some` on the first turn of the loop, which is what makes the
-    // `continue` below safe: everything after the select is bookkeeping about
-    // state that no frame has had a chance to touch yet.
-    let mut first = first;
+    // Drained before anything is waited on, so what was said before we picked
+    // up keeps its place at the front and its order.
+    let mut first = std::collections::VecDeque::from(first);
 
     let ended = loop {
-        // The frame that announced this call, put back in front of every other
-        // one so the conversation starts where the peer thinks it does.
-        if let Some(msg) = first.take() {
+        // The frames that announced this call, put back in front of every
+        // other one so the conversation starts where the peer thinks it does.
+        if let Some(msg) = first.pop_front() {
             let outcome = handle(
                 msg, peer, &with, incoming_dir,
                 &mut pending, &mut next_number, &mut next_batch,
@@ -558,13 +564,31 @@ pub async fn run(
                         continue;
                     }
                     Some(Ok(Message::DontRecord)) => {
+                        // Backwards as well as forwards. The conversation the
+                        // request is made *during* is the only one the person
+                        // making it can see, so stopping at the next line would
+                        // keep exactly the part they were objecting to.
+                        let erased = match history.as_mut() {
+                            None => 0,
+                            Some(h) => match h.forget(&with) {
+                                Ok(gone) => gone,
+                                Err(e) => {
+                                    screen.error(format!("{e:#}"));
+                                    0
+                                }
+                            },
+                        };
                         if history.is_some() {
                             screen.system(format!(
-                                "-- {peer} asked not to be written down; nothing more of \
-                                 theirs is kept --"
+                                "-- {peer} asked not to be written down; nothing of theirs \
+                                 is kept, and {erased} line(s) were erased --"
                             ));
                         }
                         history = None;
+                        // Reported up so it reaches the contacts book. Without
+                        // that it is an event, and the next call would start
+                        // recording them again.
+                        *objected = true;
                         continue;
                     }
                     Some(Ok(msg)) => msg,
@@ -1455,7 +1479,11 @@ mod tests {
         // apart. Which one is which does not matter here — chat is given the
         // peer's name by its caller.
         let mut link = Link::open(reader, writer, &crate::identity::Identity::for_test(seed)).await?;
-        let talked = run(&mut link, peer, None, incoming_dir, lines, None, screen).await;
+        let mut objected = false;
+        let talked = run(
+            &mut link, peer, Vec::new(), incoming_dir, lines, None, &mut objected, screen,
+        )
+        .await;
         let closed = link.close(matches!(talked, Ok(Ended::PeerHungUp))).await;
         talked.and_then(|ended| closed.map(|()| ended))
     }
@@ -1739,9 +1767,19 @@ mod tests {
         });
 
         let announced = Message::Text("said before you looked".into());
-        let ended = run(&mut mine, "bob", Some(announced), &dir, &mut lines, None, &screen)
-            .await
-            .unwrap();
+        let mut objected = false;
+        let ended = run(
+            &mut mine,
+            "bob",
+            vec![announced],
+            &dir,
+            &mut lines,
+            None,
+            &mut objected,
+            &screen,
+        )
+        .await
+        .unwrap();
         assert_eq!(ended, Ended::WeHungUp);
 
         drop(screen);
@@ -1781,9 +1819,19 @@ mod tests {
 
         let (_keys, mut lines) = mpsc::channel::<crate::ui::Typed>(1);
         let (screen, _updates) = crate::ui::channel();
-        let ended = run(&mut caller, "bob", None, &dir, &mut lines, None, &screen)
-            .await
-            .unwrap();
+        let mut objected = false;
+        let ended = run(
+            &mut caller,
+            "bob",
+            Vec::new(),
+            &dir,
+            &mut lines,
+            None,
+            &mut objected,
+            &screen,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ended, Ended::Declined);
         assert!(!ended.leaves(), "a refusal is not a reason to close murmure");
@@ -1830,10 +1878,11 @@ mod tests {
         run(
             &mut mine,
             "bob",
-            Some(announced),
+            vec![announced],
             &dir,
             &mut lines,
             Some(&mut history),
+            &mut false,
             &screen,
         )
         .await
@@ -1849,11 +1898,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Asking not to be written down stops it at once, mid-call.
+    /// Asking not to be written down stops it at once, and reaches backwards.
     ///
-    /// Waiting for the next connection would keep the rest of the conversation
-    /// that the request was made *during* — which is the only conversation the
-    /// person making it can see.
+    /// The conversation the request is made *during* is the only one the person
+    /// making it can see. An earlier version of this test asserted that what
+    /// came before the request was kept — which is what the code did, and the
+    /// opposite of what the design says. The test was wrong, and it is what let
+    /// the code stay wrong.
     #[tokio::test]
     async fn asking_not_to_be_written_down_takes_effect_immediately() {
         let dir = scratch("dontrecord");
@@ -1872,14 +1923,16 @@ mod tests {
         let (keys, mut lines) = mpsc::channel::<crate::ui::Typed>(4);
         let (screen, updates) = crate::ui::channel();
         let watch = tokio::spawn(react(updates, keys, &["après la demande"], "/bye".to_owned()));
+        let mut objected = false;
 
         run(
             &mut mine,
             "bob",
-            Some(Message::Text("avant la demande".into())),
+            vec![Message::Text("avant la demande".into())],
             &dir,
             &mut lines,
             Some(&mut history),
+            &mut objected,
             &screen,
         )
         .await
@@ -1891,11 +1944,11 @@ mod tests {
             .iter()
             .map(|l| l.body.as_str())
             .collect();
-        assert_eq!(
-            kept,
-            ["avant la demande"],
-            "what came after the request must not be kept"
+        assert!(
+            kept.is_empty(),
+            "neither what came after the request nor what came before it: {kept:?}"
         );
+        assert!(objected, "and the objection has to leave here to be stored");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

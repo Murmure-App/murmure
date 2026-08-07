@@ -255,14 +255,20 @@ impl Contacts {
         // whole entry: re-filing someone under the details they already have is
         // idempotent, and must stay so even once presence has moved off its
         // default.
-        if let Some(existing) = self.entries.get(name)
-            && (existing.address != entry.address || existing.discovery != entry.discovery)
-        {
-            bail!(
-                "{name} is already someone else's name in this book.\n\
-                 Remove it first if you really mean to point it at a new address:\n  \
-                 /forget {name}"
-            );
+        if let Some(existing) = self.entries.get(name) {
+            if existing.address != entry.address || existing.discovery != entry.discovery {
+                bail!(
+                    "{name} is already someone else's name in this book.\n\
+                     Remove it first if you really mean to point it at a new address:\n  \
+                     /forget {name}"
+                );
+            }
+            // Already filed under exactly these details, so there is nothing to
+            // do — and doing it anyway is not harmless. `entry` was built with
+            // every mutable field at its default, so inserting it would reset a
+            // presence agreement, the delivery mark that makes a redelivery
+            // free, and both history objections. Silently, on a re-paste.
+            return Ok(());
         }
         self.entries.insert(name.to_owned(), entry);
         self.save()
@@ -470,8 +476,20 @@ mod tests {
         let mut book = Contacts::open(&path, &identity).unwrap();
         book.add("alice", ADDR_A, KEY_A).unwrap();
 
-        // Same name, same entry: idempotent, not an error.
+        // Same name, same entry: idempotent, not an error — and idempotent
+        // means nothing changes, not merely that nothing complains.
+        book.set_presence("alice", Presence::On).unwrap();
+        book.accept_left("alice", 41).unwrap();
+        book.set_objection("alice", true).unwrap();
+        book.set_our_objection("alice", true).unwrap();
         assert!(book.add("alice", ADDR_A, KEY_A).is_ok());
+        assert_eq!(book.presence_of("alice"), Presence::On, "presence survives");
+        assert!(book.objects_to_history("alice"), "their objection survives");
+        let (_, alice) = book.iter().next().unwrap();
+        assert_eq!(alice.seen, 42, "the delivery mark survives");
+        assert!(alice.we_object, "and ours survives");
+        // Back to defaults for the rest of the test.
+        book.set_presence("alice", Presence::Off).unwrap();
         // Same name, different address: refused.
         assert!(book.add("alice", ADDR_B, KEY_A).is_err());
         // Same name and address, rotated key: also refused. A contact whose key
