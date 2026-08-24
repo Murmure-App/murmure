@@ -134,6 +134,9 @@ pub fn safe_name(raw: &str) -> Result<String> {
     if last.is_empty() || last == "." || last == ".." {
         bail!("the peer sent {raw:?} as a filename, which is not a name");
     }
+    if last.starts_with('.') {
+        bail!("the peer sent {raw:?} as a filename, which is a hidden file");
+    }
     if last.len() > crate::proto::MAX_NAME {
         bail!("the peer sent a {}-byte filename", last.len());
     }
@@ -149,6 +152,16 @@ pub fn safe_name(raw: &str) -> Result<String> {
     // received on one machine can be moved to another.
     if last.contains(':') {
         bail!("the peer sent {last:?}, which is not a portable filename");
+    }
+    let stem = last.split('.').next().unwrap_or(&last);
+    let is_reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6"
+            | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6"
+            | "LPT7" | "LPT8" | "LPT9"
+    );
+    if is_reserved {
+        bail!("the peer sent {last:?}, which is a reserved device name");
     }
     Ok(last)
 }
@@ -216,14 +229,9 @@ pub fn finish(dir: &Path, offer: &Offer) -> Result<PathBuf> {
     let partial = partial_path(dir, &offer.hash);
     let got = hash_file(&partial)?;
     if got != offer.hash {
-        // Keep the bytes: the operator may want to look. Rename so a retry
-        // starts clean rather than resuming onto known-bad data.
-        let quarantine = partial.with_extension("corrupt");
-        let _ = fs::rename(&partial, &quarantine);
+        let _ = fs::remove_file(&partial);
         bail!(
-            "the received file does not match the hash it was offered under; \
-             kept as {} rather than trusted",
-            quarantine.display()
+            "the received file does not match the hash it was offered under; discarded corrupted download"
         );
     }
 
@@ -291,10 +299,21 @@ mod tests {
     /// The one that matters: a name from the network must never become a path.
     #[test]
     fn a_hostile_filename_cannot_escape_the_directory() {
-        assert_eq!(safe_name("../../.ssh/authorized_keys").unwrap(), "authorized_keys");
+        assert_eq!(safe_name("../../keys/authorized_keys").unwrap(), "authorized_keys");
         assert_eq!(safe_name("/etc/passwd").unwrap(), "passwd");
         assert_eq!(safe_name(r"..\..\Windows\System32\x.dll").unwrap(), "x.dll");
         assert_eq!(safe_name("rapport.pdf").unwrap(), "rapport.pdf");
+
+        // Hidden files
+        assert!(safe_name(".bashrc").is_err());
+        assert!(safe_name("../../.ssh/.id_rsa").is_err());
+        assert_eq!(safe_name("../../.ssh/authorized_keys").unwrap(), "authorized_keys");
+        // Windows reserved devices
+        assert!(safe_name("con").is_err());
+        assert!(safe_name("CON.txt").is_err());
+        assert!(safe_name("nul").is_err());
+        assert!(safe_name("aux.pdf").is_err());
+        assert!(safe_name("com1.dat").is_err());
 
         // Nothing left once the path is gone.
         assert!(safe_name("../..").is_err());
@@ -404,6 +423,10 @@ mod tests {
         assert!(
             !dir.join("rapport.pdf").exists(),
             "a file that failed its hash must not be given its name"
+        );
+        assert!(
+            !partial_path(&dir, &offer.hash).exists(),
+            "corrupted partial must be cleaned up"
         );
 
         let _ = fs::remove_dir_all(&dir);

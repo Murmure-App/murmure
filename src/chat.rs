@@ -900,7 +900,7 @@ async fn handle(
                         let sc = screen.clone();
                         *direct_task = Some(tokio::spawn(async move {
                             let outcome = match push_direct(
-                                s.path, offset, stream,
+                                s.path, offset, d.token, stream,
                                 Progress::new("sending", s.name.clone(), s.size),
                                 sc,
                             )
@@ -1154,11 +1154,14 @@ async fn start_sending(
 async fn push_direct(
     path: PathBuf,
     offset: u64,
+    token: [u8; 32],
     mut stream: crate::transport::direct::Link<quinn::SendStream>,
     mut progress: Progress,
     screen: Screen,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+    stream.write_all(&token).await.context("sending the direct link auth token")?;
 
     let mut file = tokio::fs::File::open(&path)
         .await
@@ -1195,12 +1198,22 @@ async fn pull_direct(
     listener: crate::transport::direct::Listener,
     incoming_dir: PathBuf,
     offer: Offer,
+    token: [u8; 32],
     mut progress: Progress,
     screen: Screen,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
 
     let mut stream = listener.accept().await?;
+    let mut auth = [0u8; 32];
+    stream.read_exact(&mut auth).await.context("reading the direct link auth token")?;
+
+    // Constant-time token verification
+    let mismatch = auth.iter().zip(token.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    if mismatch != 0 {
+        bail!("the connecting direct peer sent an invalid authentication token");
+    }
+
     let partial = files::partial_path(&incoming_dir, &offer.hash);
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -1271,9 +1284,14 @@ async fn accept(
         } else {
             match crate::transport::direct::listen() {
                 Ok(listener) => {
+                    use rand::RngCore as _;
+                    let mut token = [0u8; 32];
+                    rand::rngs::OsRng.fill_bytes(&mut token);
+
                     let direct = proto::Direct {
                         candidates: listener.candidates.clone(),
                         fingerprint: listener.fingerprint,
+                        token,
                     };
                     screen.system(format!("-- taking {:?} over a direct link --", offer.name));
                     let done = direct_done.clone();
@@ -1282,7 +1300,7 @@ async fn accept(
                     let sc = screen.clone();
                     let bar = Progress::new("receiving", mine.name.clone(), mine.size);
                     *direct_task = Some(tokio::spawn(async move {
-                        let outcome = match pull_direct(listener, dir, mine.clone(), bar, sc).await {
+                        let outcome = match pull_direct(listener, dir, mine.clone(), token, bar, sc).await {
                             Ok(()) => DirectDone::Received(Box::new(mine)),
                             Err(e) => DirectDone::Failed(format!("{e:#}")),
                         };

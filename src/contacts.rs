@@ -157,13 +157,17 @@ pub struct Contact {
     pub discovery: String,
     /// Where this contact stands on seeing, and being seen by, us.
     pub presence: Presence,
-    /// The lowest [`Message::Left`] id from this contact we have not accepted.
+    /// The lowest contiguous [`Message::Left`] id from this contact we have received.
     ///
     /// Their outbox keeps a message until we acknowledge it, so an
     /// acknowledgement lost to a dropped link costs a redelivery. This is what
     /// makes that redelivery free: anything below this mark is something we
     /// already have, acknowledged again and shown to nobody.
-    pub seen: u64,
+    pub seen_floor: u64,
+    /// Discontiguous [`Message::Left`] ids received above [`Self::seen_floor`].
+    ///
+    /// Kept so messages delivered out of order are not silently dropped.
+    pub seen_above: std::collections::BTreeSet<u64>,
     /// This contact asked not to be written down.
     ///
     /// Their side of `/history`. Honoured whatever our own setting is, so
@@ -243,7 +247,8 @@ impl Contacts {
             address: address.trim().to_owned(),
             discovery: discovery.trim().to_owned(),
             presence: Presence::Off,
-            seen: 0,
+            seen_floor: 0,
+            seen_above: std::collections::BTreeSet::new(),
             objects_to_history: false,
             we_object: false,
         };
@@ -368,16 +373,19 @@ impl Contacts {
 
     /// Accept a message id from this contact, or say we have it already.
     ///
-    /// Raises the high-water mark on the way through, so a message is shown
-    /// exactly once however many times the sender redelivers it.
+    /// Tracks received message IDs with support for out-of-order arrival, so
+    /// a message is shown exactly once however many times the sender redelivers it.
     pub fn accept_left(&mut self, name: &str, id: u64) -> Result<bool> {
         let Some(entry) = self.entries.get_mut(name.trim()) else {
             return Ok(false);
         };
-        if id < entry.seen {
+        if id < entry.seen_floor || entry.seen_above.contains(&id) {
             return Ok(false);
         }
-        entry.seen = id + 1;
+        entry.seen_above.insert(id);
+        while entry.seen_above.remove(&entry.seen_floor) {
+            entry.seen_floor += 1;
+        }
         self.save()?;
         Ok(true)
     }
@@ -486,7 +494,8 @@ mod tests {
         assert_eq!(book.presence_of("alice"), Presence::On, "presence survives");
         assert!(book.objects_to_history("alice"), "their objection survives");
         let (_, alice) = book.iter().next().unwrap();
-        assert_eq!(alice.seen, 42, "the delivery mark survives");
+        assert_eq!(alice.seen_above.len(), 1, "the delivery mark survives");
+        assert!(alice.seen_above.contains(&41));
         assert!(alice.we_object, "and ours survives");
         // Back to defaults for the rest of the test.
         book.set_presence("alice", Presence::Off).unwrap();
@@ -604,6 +613,31 @@ mod tests {
         let (path, identity) = scratch("absent");
         let mut book = Contacts::open(&path, &identity).unwrap();
         assert!(!book.remove("nobody").unwrap());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn accept_left_handles_out_of_order_messages() {
+        let (path, identity) = scratch("out_of_order");
+        let mut book = Contacts::open(&path, &identity).unwrap();
+        book.add("alice", ADDR_A, KEY_A).unwrap();
+
+        // Message 2 arrives first (out of order)
+        assert!(book.accept_left("alice", 2).unwrap());
+        // Message 0 arrives
+        assert!(book.accept_left("alice", 0).unwrap());
+        // Duplicate message 0 rejected
+        assert!(!book.accept_left("alice", 0).unwrap());
+        // Message 1 arrives (filling the gap)
+        assert!(book.accept_left("alice", 1).unwrap());
+        // Duplicate message 1 and 2 rejected
+        assert!(!book.accept_left("alice", 1).unwrap());
+        assert!(!book.accept_left("alice", 2).unwrap());
+
+        let (_, alice) = book.iter().next().unwrap();
+        assert_eq!(alice.seen_floor, 3);
+        assert!(alice.seen_above.is_empty());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
