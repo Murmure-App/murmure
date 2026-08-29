@@ -90,6 +90,6 @@ Ce document rassemble l'ensemble des pistes d'amélioration, des axes de recherc
 
 ## 5. Industrialisation & Packaging
 
-- [ ] **Intégration Continue (CI) Multi-Plateforme :** Mise en place d'un workflow GitHub Actions automatisant les tests, le lint (`clippy`) et le formatage (`rustfmt`) sur Linux et macOS.
-- [ ] **Releases Automatisées :** Publication automatique de binaires précompilés et signés pour chaque version (Linux `x86_64` / `aarch64`, macOS Intel / Apple Silicon).
-- [ ] **Gestionnaires de paquets :** Création de formules pour **Homebrew** (macOS/Linux), paquets **AUR** (Arch Linux) et paquets Debian/Ubuntu (`.deb`).
+- [x] **Intégration Continue (CI) Multi-Plateforme** — ✅ DÉJÀ FAIT (constaté le 2026-08-30) : `.github/workflows/ci.yml` fait tourner tests + clippy sur Linux/macOS à chaque push/PR, plus un audit hebdomadaire des dépendances (`rustsec/audit-check`). `rustfmt --check` volontairement absent — le commentaire du fichier explique pourquoi (rustfmt casserait 450 lignes de style délibéré, à activer le jour où un deuxième contributeur écrit du code ici).
+- [x] **Releases Automatisées** — ✅ DÉJÀ FAIT (constaté le 2026-08-30) : `.github/workflows/release.yml` publie sur chaque tag `v*` des binaires Linux `x86_64`/`aarch64` et macOS universel (Intel+Apple Silicon via `lipo`), avec attestation de provenance et `SHA256SUMS`. Plus complet que ce que demandait la fiche (signature de provenance en plus).
+- [ ] **Gestionnaires de paquets :** Création de formules pour **Homebrew** (macOS/Linux), paquets **AUR** (Arch Linux) et paquets Debian/Ubuntu (`.deb`). — seul point encore ouvert de la section 5.
