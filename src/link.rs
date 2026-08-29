@@ -122,10 +122,13 @@ impl Link {
 
         let writing = tokio::spawn(async move {
             // A fresh sleep, not `interval`: `interval` fires on a fixed grid,
-            // which is exactly the metronome `JITTER` exists to break. Each
-            // iteration draws its own delay, so a burst of traffic (a file
-            // transfer holding this task for minutes) is followed by one
-            // beat at a random offset rather than `interval`'s catch-up burst.
+            // which is exactly the metronome `JITTER` exists to break. This
+            // also changes the semantics on purpose: `select!` reconstructs
+            // the sleep future every pass, so sending any frame resets the
+            // keepalive clock rather than firing regardless of traffic. A
+            // `Ping` is proof of life and so is every other frame — the
+            // reader's `SILENCE` timeout already resets on any of them
+            // (below) — so a busy link simply never needs one.
             loop {
                 tokio::select! {
                     msg = queued.recv() => match msg {
