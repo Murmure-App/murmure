@@ -178,6 +178,23 @@ async fn run(run_dir: &Path) -> Result<()> {
 
     // ---- identity and book ---------------------------------------------
     let seed_path = run_dir.join("identity.seed");
+
+    // A one-shot utility mode rather than a real subcommand: this project has
+    // no argv parser, and env vars are how every other setting works here
+    // (MURMURE_DIR, MURMURE_INCOMING_QUOTA). Runs and exits before Tor, the
+    // TUI, or anything else starts — the terminal is still a plain terminal,
+    // which is what the passphrase prompt needs.
+    if std::env::var_os("MURMURE_ENCRYPT_IDENTITY").is_some() {
+        Identity::encrypt_at_rest(&seed_path)?;
+        println!("identity seed at {} is now passphrase-encrypted.", seed_path.display());
+        return Ok(());
+    }
+    if std::env::var_os("MURMURE_DECRYPT_IDENTITY").is_some() {
+        Identity::decrypt_at_rest(&seed_path)?;
+        println!("identity seed at {} is now stored in the clear.", seed_path.display());
+        return Ok(());
+    }
+
     let existed = seed_path.exists();
     // Shared rather than owned: a background dial runs in its own task and
     // needs the seed to prove who it is. One copy, not one per dial.

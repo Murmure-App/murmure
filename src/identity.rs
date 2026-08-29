@@ -20,7 +20,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
+use argon2::Argon2;
 use rand::RngCore as _;
 use tor_hscrypto::pk::{
     HsClientDescEncKey, HsClientDescEncSecretKey, HsId, HsIdKey, HsIdKeypair,
@@ -28,8 +29,127 @@ use tor_hscrypto::pk::{
 use tor_llcrypto::pk::{curve25519, ed25519};
 use zeroize::Zeroizing;
 
+use crate::store;
+
 /// Length of the ed25519 secret seed murmure persists.
 pub const SEED_LEN: usize = 32;
+
+/// Marks a seed file as passphrase-encrypted rather than raw bytes. Chosen so
+/// the two formats are told apart by content, not just length — an encrypted
+/// file could coincidentally be some other length in a future format.
+const MAGIC: [u8; 6] = *b"MURM1E";
+
+/// Length of the random salt stored alongside an encrypted seed.
+const SALT_LEN: usize = 16;
+
+/// Derive a 32-byte key from a passphrase and salt via Argon2id.
+///
+/// This is the one place a human-chosen secret enters the picture, so it goes
+/// through Argon2id rather than BLAKE3 — a KDF built to be slow against
+/// brute force, unlike `Identity::derive_key`, which derives from a seed that
+/// is already high entropy.
+fn derive_key_from_passphrase(passphrase: &str, salt: &[u8; SALT_LEN]) -> Result<Zeroizing<[u8; 32]>> {
+    let mut out = Zeroizing::new([0u8; 32]);
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), salt, out.as_mut())
+        .map_err(|e| anyhow::anyhow!("deriving a key from the passphrase: {e}"))?;
+    Ok(out)
+}
+
+/// Whether `bytes` is a passphrase-encrypted seed file rather than a raw seed.
+fn is_encrypted(bytes: &[u8]) -> bool {
+    bytes.len() > MAGIC.len() && bytes[..MAGIC.len()] == MAGIC
+}
+
+/// Seal `seed` under `passphrase`. Pure: no file I/O, no prompting — so tests
+/// can drive it directly instead of through the terminal or an env var.
+fn encrypt_seed_bytes(seed: &[u8; SEED_LEN], passphrase: &str) -> Result<Vec<u8>> {
+    let mut salt = [0u8; SALT_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let key = derive_key_from_passphrase(passphrase, &salt)?;
+    let sealed = store::seal(&key, seed)?;
+
+    let mut out = Vec::with_capacity(MAGIC.len() + SALT_LEN + sealed.len());
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&sealed);
+    Ok(out)
+}
+
+/// Open what [`encrypt_seed_bytes`] produced.
+fn decrypt_seed_bytes(bytes: &[u8], passphrase: &str) -> Result<Zeroizing<[u8; SEED_LEN]>> {
+    let rest = &bytes[MAGIC.len()..];
+    if rest.len() < SALT_LEN {
+        bail!("encrypted seed file is truncated");
+    }
+    let (salt, sealed) = rest.split_at(SALT_LEN);
+    let salt: [u8; SALT_LEN] = salt.try_into().expect("split_at guarantees the length");
+
+    let key = derive_key_from_passphrase(passphrase, &salt)?;
+    let plaintext =
+        store::open(&key, sealed).context("wrong passphrase, or the seed file was tampered with")?;
+    plaintext
+        .as_slice()
+        .try_into()
+        .map(Zeroizing::new)
+        .map_err(|_| anyhow::anyhow!("decrypted seed is not {SEED_LEN} bytes"))
+}
+
+/// Read a passphrase for an existing encrypted seed: from the env var if set
+/// (scripting/tests — the value then lives in the process environment, which
+/// is less safe than a prompt nobody else can read), a terminal prompt
+/// otherwise.
+fn read_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
+    if let Ok(p) = std::env::var("MURMURE_SEED_PASSPHRASE") {
+        return Ok(Zeroizing::new(p));
+    }
+    Ok(Zeroizing::new(
+        rpassword::prompt_password(prompt).context("reading the passphrase")?,
+    ))
+}
+
+/// Read a *new* passphrase, confirmed by asking twice, unless the env var
+/// escape hatch is set.
+fn read_new_passphrase() -> Result<Zeroizing<String>> {
+    if let Ok(p) = std::env::var("MURMURE_SEED_PASSPHRASE") {
+        return Ok(Zeroizing::new(p));
+    }
+    let first = rpassword::prompt_password("new identity passphrase: ")
+        .context("reading the passphrase")?;
+    let second = rpassword::prompt_password("confirm passphrase: ").context("reading the passphrase")?;
+    if first != second {
+        bail!("passphrases did not match");
+    }
+    if first.is_empty() {
+        bail!("passphrase must not be empty");
+    }
+    Ok(Zeroizing::new(first))
+}
+
+/// Atomically overwrite `path` with `bytes` at 0600. Shared by
+/// [`Identity::encrypt_at_rest`] and [`Identity::decrypt_at_rest`], both of
+/// which replace an existing seed file rather than refusing to clobber one
+/// the way [`Identity::create`] does.
+fn write_seed_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flushing {}", tmp.display()))?;
+    drop(file);
+    fs::rename(&tmp, path).with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    Ok(())
+}
 
 /// Key-derivation context for the service-discovery key. Frozen: changing it
 /// changes the key every contact has already authorised.
@@ -69,18 +189,58 @@ impl Identity {
             fs::read(path)
                 .with_context(|| format!("reading the identity seed at {}", path.display()))?,
         );
-        let seed: Zeroizing<[u8; SEED_LEN]> = bytes.as_slice().try_into().map(Zeroizing::new).map_err(|_| {
-            anyhow::anyhow!(
-                "{} is {} bytes, expected exactly {SEED_LEN}; \
-                 delete it to generate a fresh identity",
-                path.display(),
-                bytes.len()
-            )
-        })?;
+        let seed: Zeroizing<[u8; SEED_LEN]> = if is_encrypted(&bytes) {
+            let passphrase = read_passphrase("identity passphrase: ")?;
+            decrypt_seed_bytes(&bytes, &passphrase)?
+        } else {
+            bytes.as_slice().try_into().map(Zeroizing::new).map_err(|_| {
+                anyhow::anyhow!(
+                    "{} is {} bytes, expected exactly {SEED_LEN}; \
+                     delete it to generate a fresh identity",
+                    path.display(),
+                    bytes.len()
+                )
+            })?
+        };
         Ok(Self {
             seed,
             path: path.to_path_buf(),
         })
+    }
+
+    /// Encrypt an existing plaintext seed file at rest, under a passphrase.
+    ///
+    /// Prompts for the new passphrase (or reads `MURMURE_SEED_PASSPHRASE`)
+    /// before touching the file, so a mistyped passphrase never destroys the
+    /// original.
+    pub fn encrypt_at_rest(path: &Path) -> Result<()> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("reading the identity seed at {}", path.display()))?;
+        if is_encrypted(&bytes) {
+            bail!(
+                "{} is already passphrase-encrypted; run with MURMURE_DECRYPT_IDENTITY=1 first \
+                 to change or remove the passphrase",
+                path.display()
+            );
+        }
+        let seed: [u8; SEED_LEN] = bytes.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!("{} is {} bytes, expected exactly {SEED_LEN}", path.display(), bytes.len())
+        })?;
+        let passphrase = read_new_passphrase()?;
+        let out = encrypt_seed_bytes(&seed, &passphrase)?;
+        write_seed_bytes(path, &out)
+    }
+
+    /// Decrypt an encrypted seed file back to raw bytes on disk.
+    pub fn decrypt_at_rest(path: &Path) -> Result<()> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("reading the identity seed at {}", path.display()))?;
+        if !is_encrypted(&bytes) {
+            bail!("{} is not passphrase-encrypted", path.display());
+        }
+        let passphrase = read_passphrase("identity passphrase: ")?;
+        let seed = decrypt_seed_bytes(&bytes, &passphrase)?;
+        write_seed_bytes(path, seed.as_slice())
     }
 
     /// Generate a seed from the OS CSPRNG and write it with 0600 permissions.
@@ -302,6 +462,60 @@ mod test {
         let addr = id.onion_address().display_unredacted().to_string();
         assert!(addr.ends_with(".onion"), "{addr}");
         assert_eq!(addr.len(), 56 + ".onion".len(), "{addr}");
+    }
+
+    #[test]
+    fn encrypted_seed_bytes_round_trip_under_the_right_passphrase() {
+        let seed = [5u8; SEED_LEN];
+        let encrypted = encrypt_seed_bytes(&seed, "correct horse battery staple").unwrap();
+        assert!(is_encrypted(&encrypted));
+        let decrypted = decrypt_seed_bytes(&encrypted, "correct horse battery staple").unwrap();
+        assert_eq!(*decrypted, seed);
+    }
+
+    #[test]
+    fn a_wrong_passphrase_cannot_open_an_encrypted_seed() {
+        let seed = [5u8; SEED_LEN];
+        let encrypted = encrypt_seed_bytes(&seed, "right").unwrap();
+        assert!(decrypt_seed_bytes(&encrypted, "wrong").is_err());
+    }
+
+    #[test]
+    fn a_plain_seed_file_is_not_mistaken_for_an_encrypted_one() {
+        assert!(!is_encrypted(&[7u8; SEED_LEN]));
+    }
+
+    #[test]
+    fn encrypt_then_decrypt_at_rest_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("murmure-idcrypt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("identity.seed");
+
+        // SAFETY: this test does not run concurrently with another test that
+        // reads or writes MURMURE_SEED_PASSPHRASE — it is the only one, and
+        // the whole binary's tests run single-process but not necessarily
+        // single-threaded, so this is scoped as tightly as std::env allows.
+        unsafe { std::env::set_var("MURMURE_SEED_PASSPHRASE", "test passphrase") };
+
+        let before = Identity::load_or_create(&path).expect("create");
+        let address_before = before.onion_address();
+        drop(before);
+
+        Identity::encrypt_at_rest(&path).expect("encrypt");
+        assert!(is_encrypted(&fs::read(&path).unwrap()));
+
+        let after_encrypt = Identity::load_or_create(&path).expect("load encrypted");
+        assert_eq!(after_encrypt.onion_address(), address_before);
+        drop(after_encrypt);
+
+        Identity::decrypt_at_rest(&path).expect("decrypt");
+        assert!(!is_encrypted(&fs::read(&path).unwrap()));
+
+        let after_decrypt = Identity::load_or_create(&path).expect("load decrypted");
+        assert_eq!(after_decrypt.onion_address(), address_before);
+
+        unsafe { std::env::remove_var("MURMURE_SEED_PASSPHRASE") };
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
