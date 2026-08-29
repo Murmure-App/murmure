@@ -134,6 +134,7 @@ ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 argon2 = { version = "0.6.0", features = ["zeroize"] }
 rpassword = "7.5.4"
+bip39 = { version = "2.2.2", default-features = false, features = ["zeroize", "std"] }
 
 # A debug build of this tree reached 17 GB, and almost none of it was murmure.
 #

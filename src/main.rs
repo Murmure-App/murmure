@@ -194,6 +194,18 @@ async fn run(run_dir: &Path) -> Result<()> {
         println!("identity seed at {} is now stored in the clear.", seed_path.display());
         return Ok(());
     }
+    if std::env::var_os("MURMURE_EXPORT_MNEMONIC").is_some() {
+        let phrase = Identity::export_mnemonic(&seed_path)?;
+        println!("{}", *phrase);
+        println!();
+        println!("write these 24 words on paper, in order. anyone who has them owns this identity.");
+        return Ok(());
+    }
+    if let Ok(phrase) = std::env::var("MURMURE_RESTORE_MNEMONIC") {
+        Identity::restore_from_mnemonic(&seed_path, &phrase)?;
+        println!("identity restored at {} from the recovery phrase.", seed_path.display());
+        return Ok(());
+    }
 
     let existed = seed_path.exists();
     // Shared rather than owned: a background dial runs in its own task and

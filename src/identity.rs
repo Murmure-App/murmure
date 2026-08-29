@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use argon2::Argon2;
+use bip39::Mnemonic;
 use rand::RngCore as _;
 use tor_hscrypto::pk::{
     HsClientDescEncKey, HsClientDescEncSecretKey, HsId, HsIdKey, HsIdKeypair,
@@ -240,6 +241,68 @@ impl Identity {
         }
         let passphrase = read_passphrase("identity passphrase: ")?;
         let seed = decrypt_seed_bytes(&bytes, &passphrase)?;
+        write_seed_bytes(path, seed.as_slice())
+    }
+
+    /// This identity's seed as a 24-word BIP-39 recovery phrase.
+    ///
+    /// Losing the seed still loses everything it sealed — [`derive_key`]'s doc
+    /// comment already says so, and a paper backup does not change that. What
+    /// it changes is the seed's own durability: 32 raw bytes do not survive a
+    /// dead disk, twenty-four words on paper do.
+    ///
+    /// [`derive_key`]: Identity::derive_key
+    pub fn mnemonic_phrase(&self) -> Result<Zeroizing<String>> {
+        let mnemonic = Mnemonic::from_entropy(self.seed.as_ref())
+            .context("encoding the seed as a recovery phrase")?;
+        Ok(Zeroizing::new(mnemonic.to_string()))
+    }
+
+    /// The seed a 24-word BIP-39 phrase encodes.
+    ///
+    /// Checked, not trusted: `Mnemonic`'s parser verifies the checksum word,
+    /// so a single mistyped word is a parse error here rather than a
+    /// different, silently wrong identity.
+    fn seed_from_mnemonic(phrase: &str) -> Result<Zeroizing<[u8; SEED_LEN]>> {
+        let mnemonic: Mnemonic = phrase
+            .trim()
+            .parse()
+            .context("not a valid BIP-39 recovery phrase")?;
+        let entropy = mnemonic.to_entropy();
+        entropy.as_slice().try_into().map(Zeroizing::new).map_err(|_| {
+            anyhow::anyhow!(
+                "recovery phrase encodes {} bytes, expected {SEED_LEN} (24 words)",
+                entropy.len()
+            )
+        })
+    }
+
+    /// Print the recovery phrase for the seed at `path`.
+    pub fn export_mnemonic(path: &Path) -> Result<Zeroizing<String>> {
+        if !path.exists() {
+            bail!("no identity seed at {}; nothing to export", path.display());
+        }
+        let identity = Self::load(path)?;
+        identity.check_permissions()?;
+        identity.mnemonic_phrase()
+    }
+
+    /// Write a fresh seed file at `path` from a recovery phrase.
+    ///
+    /// Refuses to touch a path that already holds an identity — restoring is
+    /// for a *lost* seed, and silently overwriting a live one would trade one
+    /// lost identity for another.
+    pub fn restore_from_mnemonic(path: &Path, phrase: &str) -> Result<()> {
+        if path.exists() {
+            bail!(
+                "{} already holds an identity; move it aside first if you mean to replace it",
+                path.display()
+            );
+        }
+        let seed = Self::seed_from_mnemonic(phrase)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
         write_seed_bytes(path, seed.as_slice())
     }
 
@@ -515,6 +578,59 @@ mod test {
         assert_eq!(after_decrypt.onion_address(), address_before);
 
         unsafe { std::env::remove_var("MURMURE_SEED_PASSPHRASE") };
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mnemonic_phrase_round_trips_back_to_the_same_seed() {
+        let seed = [5u8; SEED_LEN];
+        let id = Identity::for_test(seed);
+        let phrase = id.mnemonic_phrase().unwrap();
+        assert_eq!(phrase.split_whitespace().count(), 24, "{}", *phrase);
+        assert_eq!(*Identity::seed_from_mnemonic(&phrase).unwrap(), seed);
+    }
+
+    /// "abandon" x24 is the canonical BIP-39 all-zero-entropy phrase, but the
+    /// last word has to be the checksum for *that* entropy — twenty-four
+    /// repeats of the same word is not it.
+    #[test]
+    fn a_phrase_with_a_bad_checksum_is_rejected() {
+        let phrase = vec!["abandon"; 24].join(" ");
+        assert!(Identity::seed_from_mnemonic(&phrase).is_err());
+    }
+
+    #[test]
+    fn restore_from_mnemonic_writes_a_seed_matching_the_original() {
+        let dir = std::env::temp_dir().join(format!("murmure-idmnem-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("identity.seed");
+
+        let original = Identity::load_or_create(&path).expect("create");
+        let address = original.onion_address();
+        let phrase = original.mnemonic_phrase().unwrap();
+        drop(original);
+        fs::remove_file(&path).unwrap();
+
+        Identity::restore_from_mnemonic(&path, &phrase).expect("restore");
+        let restored = Identity::load_or_create(&path).expect("load restored");
+        assert_eq!(restored.onion_address(), address);
+        restored.check_permissions().expect("0600");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_from_mnemonic_refuses_to_clobber_an_existing_seed() {
+        let dir = std::env::temp_dir().join(format!("murmure-idmnem-clobber-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("identity.seed");
+
+        let original = Identity::load_or_create(&path).expect("create");
+        let phrase = original.mnemonic_phrase().unwrap();
+        drop(original);
+
+        assert!(Identity::restore_from_mnemonic(&path, &phrase).is_err());
+
         let _ = fs::remove_dir_all(&dir);
     }
 
