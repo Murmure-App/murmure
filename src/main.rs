@@ -202,6 +202,7 @@ async fn run(run_dir: &Path) -> Result<()> {
         format!("{} ", onion::fingerprint(&my_address)),
     ));
 
+    screen.set_contacts(book.iter().map(|(name, _)| name.to_owned()).collect());
     screen.system(format!(
         "identity {}, {} contact{}",
         if existed { "loaded" } else { "generated" },
@@ -967,6 +968,7 @@ async fn command(
             let first = book.len() == 0;
             book.add(name, address, key)?;
             live.resync(book)?;
+            screen.set_contacts(book.iter().map(|(name, _)| name.to_owned()).collect());
             screen.system(format!("filed {name} as {}", onion::fingerprint(address)));
             if first {
                 screen.system(
@@ -984,6 +986,7 @@ async fn command(
             let address = book.address_of(name).and_then(|a| a.parse::<HsId>().ok());
             if book.remove(name)? {
                 live.resync(book)?;
+                screen.set_contacts(book.iter().map(|(name, _)| name.to_owned()).collect());
                 // Somebody forgotten is somebody we stop holding a connection
                 // to. Leaving one open would keep answering for a name that no
                 // longer exists.
@@ -1469,6 +1472,7 @@ fn help(screen: &Screen) {
         "  Ctrl-E                        jump back to the newest line",
         "  left / right / Home / End     move inside what you are typing",
         "                                a dropped file counts as one step",
+        "  Tab                           complete a command or a contact's name",
         "  Ctrl-V                        paste (no Shift needed)",
         "  Ctrl-U                        clear the input",
         "  Ctrl-C                        leave, from anywhere",

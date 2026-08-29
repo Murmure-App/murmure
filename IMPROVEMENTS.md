@@ -78,11 +78,12 @@ Ce document rassemble l'ensemble des pistes d'amélioration, des axes de recherc
 - **Principe :** Ajouter une commande `/search <terme>` permettant de filtrer rapidement les messages passés dans l'historique chiffré.
 - **Fait :** `History::search()` dans `src/history.rs` — filtre insensible à la casse sur toutes les conversations, plafonné à `SHOWN` comme `/history`. Commande `/search <terme>` ajoutée dans `src/main.rs`, listée dans `/help`. Vérifié que `/search` tapé pendant un appel tombe sur `Typed::UnknownCommand` (`classify()`, `src/chat.rs`) et ne part jamais sur le fil comme message. Testé : `history::tests::search_finds_a_word_case_insensitively_across_conversations`, suite complète 149/150 verte (1 ignoré, réseau Tor réel), clippy propre.
 
-### ⌨️ D. Ergonomie et Autocomplétion
+### ⌨️ D. Ergonomie et Autocomplétion — 🟡 PARTIEL (2026-08-30)
 - **Améliorations :**
-  - Autocomplétion des commandes (`/call`, `/history`, `/forget`, `/send`) et des noms de contacts avec la touche `Tab`.
-  - Indicateur visuel d'état de synchronisation de l'Outbox (messages en attente de remise avec statut `[envoyé]`, `[reçu]`).
-  - Thèmes de couleurs personnalisables pour l'interface TUI (ex: Nord, Gruvbox, Monokai, High Contrast).
+  - Autocomplétion des commandes et des noms de contacts avec `Tab` — ✅ DONE.
+  - Indicateur visuel d'état de synchronisation de l'Outbox (`[envoyé]`, `[reçu]`) — non fait.
+  - Thèmes de couleurs personnalisables pour l'interface TUI — non fait.
+- **Fait :** `src/ui.rs` — `App::complete()` : sur `Tab`, complète le mot courant (commande si premier mot commençant par `/`, sinon nom de contact) ; complétion pleine + espace si un seul candidat, sinon extension au plus long préfixe commun. Liste des contacts poussée depuis `src/main.rs` via `Update::Contacts` au démarrage, après `/add` et après `/forget`. `COMMANDS` est une liste à jour à la main (duplicat volontaire des verbes de `main.rs`/`chat.rs` — dérive possible si un verbe est ajouté sans y penser). Testé : 4 tests unitaires (`tab_completes_a_unique_command`, `tab_extends_to_the_longest_common_prefix_on_ambiguity`, `tab_completes_a_contact_name_after_the_first_word`, `tab_does_nothing_on_no_match_or_an_empty_word`), suite complète 153/154 verte (1 ignoré), clippy `--all-targets -D warnings` propre. Vérifié en conditions réelles (TUI lancée dans tmux, bootstrap Tor complet) : `/he` + `Tab` → `/help ` fonctionne.
 
 ### 📦 E. Sauvegarde et Restauration (Mnémonique BIP-39)
 - **Principe :** Permettre l'exportation et la restauration de la graine d'identité de 32 octets sous forme d'une phrase de passe de 24 mots (format standard BIP-39), facilitant la sauvegarde sur papier.
