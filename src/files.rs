@@ -56,12 +56,18 @@ const HASH_BUF: usize = 64 * 1024;
 pub const DEFAULT_INCOMING_QUOTA: u64 = 10 * 1024 * 1024 * 1024;
 
 /// The configured quota, in bytes: `MURMURE_INCOMING_QUOTA` if set and valid,
-/// else [`DEFAULT_INCOMING_QUOTA`].
+/// else [`DEFAULT_INCOMING_QUOTA`]. There is no "unlimited" value — an
+/// operator writing `0` gets a quota of zero, which refuses every transfer,
+/// not the no-limit some tools use `0` for elsewhere.
 pub fn incoming_quota() -> u64 {
-    std::env::var("MURMURE_INCOMING_QUOTA")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_INCOMING_QUOTA)
+    parse_quota(std::env::var("MURMURE_INCOMING_QUOTA").ok().as_deref())
+}
+
+/// The pure half of [`incoming_quota`], split out so a test can cover the
+/// parse/default logic without mutating the process environment — which every
+/// test in the binary shares, and would race.
+fn parse_quota(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_INCOMING_QUOTA)
 }
 
 /// Bytes already on disk in `dir` — partials and finished downloads alike.
@@ -492,14 +498,8 @@ mod tests {
         assert_eq!(dir_size(&dir), 0, "a missing directory is not an error");
     }
 
-    /// The quota reads from the environment, which every other test also
-    /// touches — so this one asserts the parse/default logic in isolation
-    /// rather than mutating the process environment, which would race.
     #[test]
     fn quota_falls_back_to_the_default_on_garbage_or_absence() {
-        fn parse_quota(raw: Option<&str>) -> u64 {
-            raw.and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_INCOMING_QUOTA)
-        }
         assert_eq!(parse_quota(None), DEFAULT_INCOMING_QUOTA);
         assert_eq!(parse_quota(Some("not a number")), DEFAULT_INCOMING_QUOTA);
         assert_eq!(parse_quota(Some("-5")), DEFAULT_INCOMING_QUOTA);
