@@ -162,6 +162,17 @@ impl History {
         kept[kept.len().saturating_sub(count)..].to_vec()
     }
 
+    /// The last `count` lines whose body contains `term`, oldest first.
+    ///
+    /// Case-insensitive: the operator is recalling a word they remember
+    /// saying or hearing, not grepping their own transcript by exact case.
+    pub fn search(&self, term: &str, count: usize) -> Vec<&Line> {
+        let needle = term.to_lowercase();
+        let matching = self.lines.iter().filter(|l| l.body.to_lowercase().contains(&needle));
+        let kept: Vec<&Line> = matching.collect();
+        kept[kept.len().saturating_sub(count)..].to_vec()
+    }
+
     /// Erase everything kept about one peer, for `/forget`.
     pub fn forget(&mut self, with: &str) -> Result<usize> {
         let before = self.lines.len();
@@ -234,6 +245,28 @@ mod tests {
         assert!(with_alice[0].mine);
         assert!(!with_alice[1].mine);
         assert_eq!(reopened.tail(None, SHOWN).len(), 3, "and everything, together");
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A term is found regardless of case, across every conversation, and only
+    /// lines that actually contain it come back.
+    #[test]
+    fn search_finds_a_word_case_insensitively_across_conversations() {
+        let (path, identity) = scratch("search");
+        let mut history = History::open(&path, &identity).unwrap();
+        history.set(true).unwrap();
+
+        history.note(ALICE, true, "on se voit à la Gare demain ?").unwrap();
+        history.note(ALICE, false, "oui, sous l'horloge").unwrap();
+        history.note(BOB, false, "rien à voir avec la gare").unwrap();
+        history.note(BOB, true, "d'accord pour demain").unwrap();
+
+        let found = history.search("gare", SHOWN);
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|l| l.body.to_lowercase().contains("gare")));
+
+        assert!(history.search("introuvable", SHOWN).is_empty());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

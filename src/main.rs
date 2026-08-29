@@ -1131,6 +1131,30 @@ async fn command(
                 }
             }
         }
+        "/search" => {
+            let term = line.split_once(char::is_whitespace).map(|(_, rest)| rest.trim()).unwrap_or("");
+            if term.is_empty() {
+                bail!("usage: /search <term>");
+            }
+            if !history.on() {
+                screen.system("history is off — nothing is kept to search. /history on");
+            }
+            let lines = history.search(term, history::SHOWN);
+            if lines.is_empty() && history.on() {
+                screen.system("(no match)");
+            }
+            for line in lines {
+                let who = match book.name_of(&line.with) {
+                    Some(name) if line.mine => format!("you → {name}"),
+                    Some(name) => name.to_owned(),
+                    None => onion::fingerprint(&line.with),
+                };
+                screen.say(
+                    if line.mine { Kind::Mine } else { Kind::Theirs },
+                    format!("[{}] {who}> {}", outbox::how_long_ago(line.at), line.body),
+                );
+            }
+        }
         "/tell" => {
             let Some(name) = parts.next() else {
                 bail!("usage: /tell <name> <message>");
@@ -1427,6 +1451,7 @@ fn help(screen: &Screen) {
         "  /history on   /history off    start or stop keeping a record. off by default;",
         "                                'off' erases what is there, and both tell your contacts",
         "  /history no <name>            ask them not to write down what you say",
+        "  /search <term>                find kept lines containing it, across every conversation",
         "  /help                         this",
         "  /quit                         leave, hanging up first if you are in a call",
         "during a call:",

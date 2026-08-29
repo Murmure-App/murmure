@@ -74,8 +74,9 @@ Ce document rassemble l'ensemble des pistes d'amélioration, des axes de recherc
 ### 👥 B. Salons / Groupes Fermés Éphémères
 - **Principe :** Permettre la création d'un salon éphémère à plusieurs pairs sans serveur, où chaque message est diffusé de manière chiffrée à tous les membres connectés du groupe (topologie maillée en étoile ou anneau).
 
-### 🔍 C. Recherche dans l'Historique
+### 🔍 C. Recherche dans l'Historique — ✅ DONE (2026-08-30)
 - **Principe :** Ajouter une commande `/search <terme>` permettant de filtrer rapidement les messages passés dans l'historique chiffré.
+- **Fait :** `History::search()` dans `src/history.rs` — filtre insensible à la casse sur toutes les conversations, plafonné à `SHOWN` comme `/history`. Commande `/search <terme>` ajoutée dans `src/main.rs`, listée dans `/help`. Vérifié que `/search` tapé pendant un appel tombe sur `Typed::UnknownCommand` (`classify()`, `src/chat.rs`) et ne part jamais sur le fil comme message. Testé : `history::tests::search_finds_a_word_case_insensitively_across_conversations`, suite complète 149/150 verte (1 ignoré, réseau Tor réel), clippy propre.
 
 ### ⌨️ D. Ergonomie et Autocomplétion
 - **Améliorations :**
