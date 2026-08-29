@@ -46,6 +46,45 @@ pub const MAX_FILE: u64 = 2 * 1024 * 1024 * 1024;
 /// How many bytes to hash at a time when reading a file from disk.
 const HASH_BUF: usize = 64 * 1024;
 
+/// Cap on the total size of `incoming/`, used unless `MURMURE_INCOMING_QUOTA`
+/// overrides it.
+///
+/// A peer choosing what to send you chooses how much of your disk it costs;
+/// without a ceiling that is an unbounded write. 10 GiB is five transfers at
+/// [`MAX_FILE`], generous for a one-conversation-at-a-time tool without being
+/// no limit at all.
+pub const DEFAULT_INCOMING_QUOTA: u64 = 10 * 1024 * 1024 * 1024;
+
+/// The configured quota, in bytes: `MURMURE_INCOMING_QUOTA` if set and valid,
+/// else [`DEFAULT_INCOMING_QUOTA`].
+pub fn incoming_quota() -> u64 {
+    std::env::var("MURMURE_INCOMING_QUOTA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_INCOMING_QUOTA)
+}
+
+/// Bytes already on disk in `dir` — partials and finished downloads alike.
+///
+/// A missing directory (nothing received yet) counts as empty rather than an
+/// error, since that is the common case for a fresh contact.
+///
+/// ponytail: sums file sizes rather than asking the OS for free space on the
+/// volume, so `MURMURE_INCOMING_QUOTA` bounds *this directory*, not the disk.
+/// Upgrade to a `statvfs`/`GetDiskFreeSpaceEx` check (a new dependency; not in
+/// std) if operators need it to react to a disk that is full for other
+/// reasons too.
+pub fn dir_size(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 /// What a peer needs to know about a file before deciding to take it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
@@ -438,5 +477,32 @@ mod tests {
         assert_eq!(human(999), "999 B");
         assert_eq!(human(1_500), "1.5 kB");
         assert_eq!(human(2_400_000), "2.4 MB");
+    }
+
+    #[test]
+    fn dir_size_counts_files_and_ignores_a_missing_directory() {
+        let dir = scratch("dir-size");
+        assert_eq!(dir_size(&dir), 0, "nothing written yet");
+
+        fs::write(dir.join("a.part"), vec![0u8; 100]).unwrap();
+        fs::write(dir.join("b.part"), vec![0u8; 50]).unwrap();
+        assert_eq!(dir_size(&dir), 150);
+
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(dir_size(&dir), 0, "a missing directory is not an error");
+    }
+
+    /// The quota reads from the environment, which every other test also
+    /// touches — so this one asserts the parse/default logic in isolation
+    /// rather than mutating the process environment, which would race.
+    #[test]
+    fn quota_falls_back_to_the_default_on_garbage_or_absence() {
+        fn parse_quota(raw: Option<&str>) -> u64 {
+            raw.and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_INCOMING_QUOTA)
+        }
+        assert_eq!(parse_quota(None), DEFAULT_INCOMING_QUOTA);
+        assert_eq!(parse_quota(Some("not a number")), DEFAULT_INCOMING_QUOTA);
+        assert_eq!(parse_quota(Some("-5")), DEFAULT_INCOMING_QUOTA);
+        assert_eq!(parse_quota(Some("12345")), 12345);
     }
 }

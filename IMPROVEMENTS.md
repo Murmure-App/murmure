@@ -28,8 +28,10 @@ Ce document rassemble l'ensemble des pistes d'amélioration, des axes de recherc
 - **Bénéfice :** Réduit la signature temporelle identifiable par un nœud de garde Tor ou un FAI observant la connexion.
 - **Fait :** `src/link.rs` — nouveau `JITTER = 15s` à côté de `KEEPALIVE = 60s` ; `keepalive_delay()` tire un délai uniforme dans `[45s, 75s)` à chaque battement. `tokio::time::interval` (grille fixe) remplacé par `tokio::time::sleep` par itération, sinon le jitter n'aurait aucun effet. Padding optionnel non fait — hors scope, pas demandé. Tests `link::tests::*` (8/8) verts, `cargo build` propre.
 
-### 💾 E. Quota de Stockage et Gestion des Fichiers Entrants
+### 💾 E. Quota de Stockage et Gestion des Fichiers Entrants — ✅ DONE (2026-08-30)
 - **Amélioration :** Implémenter une limite de taille globale configurable pour le répertoire `.murmure/incoming/` et alerter l'utilisateur avant acceptation de gros fichiers si l'espace disque restant est insuffisant.
+- **Fait :** `src/files.rs` — `incoming_quota()` lit `MURMURE_INCOMING_QUOTA` (octets, défaut 10 GiB dans `DEFAULT_INCOMING_QUOTA`) ; `dir_size()` totalise les octets déjà présents dans `incoming/`. `src/chat.rs::accept()` refuse (`bail!`) avant d'ouvrir tout fichier, sur les deux chemins (Tor et direct), si `used + remaining > quota`. Testé : `files::tests::dir_size_*`, `files::tests::quota_*`, suite complète 148/148 verte, clippy propre.
+- **Non fait (scope réduit, volontaire) :** pas de vérification de l'espace disque réel de l'OS (`statvfs`/`GetDiskFreeSpaceEx`) — demanderait une nouvelle dépendance pour un gain marginal vu qu'un quota sur `incoming/` couvre déjà le risque principal (un pair qui remplit le disque). Voir le commentaire `ponytail:` dans `dir_size()`.
 
 ---
 
