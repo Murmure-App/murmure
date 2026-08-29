@@ -123,6 +123,11 @@ pub enum Update {
     /// whenever `/add` or `/forget` changes it — the UI has no other way to
     /// know a name exists, since it never sees the book itself.
     Contacts(Vec<String>),
+    /// Raw terminal bytes that draw an inline image (built by
+    /// [`crate::image::encode`]) — leave the alternate screen, write them,
+    /// wait for a key, come back. See `src/image.rs` for why this cannot go
+    /// through [`Self::Line`] like everything else on screen.
+    ShowImage(Vec<u8>),
 }
 
 /// A handle for putting lines on screen from anywhere in the program.
@@ -213,6 +218,12 @@ impl Screen {
     /// Tell the UI the contact book's current names, for Tab completion.
     pub fn set_contacts(&self, names: Vec<String>) {
         let _ = self.0.send(Update::Contacts(names));
+    }
+
+    /// Show an inline image: `escape` is the already-built terminal protocol
+    /// bytes from [`crate::image::encode`].
+    pub fn show_image(&self, escape: Vec<u8>) {
+        let _ = self.0.send(Update::ShowImage(escape));
     }
 }
 
@@ -370,8 +381,8 @@ impl Typed {
 /// the same way an out-of-date `/help` line would be — by reading it.
 const COMMANDS: &[&str] = &[
     "/add", "/tell", "/call", "/cancel", "/answer", "/decline", "/presence", "/contacts",
-    "/forget", "/copy", "/history", "/search", "/help", "/quit", "/send", "/direct", "/accept",
-    "/refuse", "/bye",
+    "/forget", "/copy", "/history", "/search", "/view", "/help", "/quit", "/send", "/direct",
+    "/accept", "/refuse", "/bye",
 ];
 
 /// The longest prefix every string in `of` starts with. Empty if `of` is empty.
@@ -916,6 +927,9 @@ async fn event_loop(
                         app.flash(format!("copied {} chars", text.chars().count()));
                     }
                     Some(Update::Contacts(names)) => app.contacts = names,
+                    Some(Update::ShowImage(escape)) => {
+                        show_image_blocking(terminal, &mut keys, &escape).await?;
+                    }
                     // The program is shutting down.
                     None => return Ok(()),
                 }
@@ -932,6 +946,9 @@ async fn event_loop(
                             app.flash(format!("copied {} chars", text.chars().count()));
                         }
                         Update::Contacts(names) => app.contacts = names,
+                        Update::ShowImage(escape) => {
+                            show_image_blocking(terminal, &mut keys, &escape).await?;
+                        }
                     }
                 }
             }
@@ -964,6 +981,46 @@ async fn event_loop(
 
         terminal.draw(|frame| draw(frame, &mut app)).context("drawing")?;
     }
+}
+
+/// Leave the alternate screen, write `escape` straight to the terminal, wait
+/// for a keypress, then come back.
+///
+/// This is the one place murmure writes to the terminal outside ratatui's own
+/// diffed draw — see the module doc on [`crate::image`] for why an inline
+/// image cannot go through a normal [`Update::Line`] instead. `terminal.clear`
+/// on the way back forces a full redraw next frame: ratatui's diff otherwise
+/// assumes the screen still shows what it last drew, which is not true once
+/// something else has written to it.
+async fn show_image_blocking(
+    terminal: &mut ratatui::DefaultTerminal,
+    keys: &mut EventStream,
+    escape: &[u8],
+) -> Result<()> {
+    use std::io::Write as _;
+
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)
+        .context("leaving the alternate screen")?;
+    crossterm::terminal::disable_raw_mode().context("leaving raw mode")?;
+
+    let mut out = std::io::stdout();
+    out.write_all(escape).context("writing the image")?;
+    write!(out, "\r\n\r\npress any key to return to murmure...").context("writing the image")?;
+    out.flush().context("writing the image")?;
+
+    loop {
+        match keys.next().await {
+            Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => break,
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => return Err(e).context("reading a terminal event"),
+            None => break,
+        }
+    }
+
+    crossterm::terminal::enable_raw_mode().context("re-entering raw mode")?;
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
+        .context("re-entering the alternate screen")?;
+    terminal.clear().context("redrawing after showing an image")
 }
 
 /// Handle one key. Returns `true` when the operator wants out.

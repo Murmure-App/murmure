@@ -57,6 +57,7 @@ mod contacts;
 mod files;
 mod history;
 mod identity;
+mod image;
 mod link;
 mod onion;
 mod outbox;
@@ -1187,6 +1188,25 @@ async fn command(
                 );
             }
         }
+        "/view" => {
+            let arg = line.split_once(char::is_whitespace).map(|(_, rest)| rest.trim()).unwrap_or("");
+            if arg.is_empty() {
+                bail!("usage: /view <path> — the path is printed when a file arrives (\"-- received ... --\")");
+            }
+            let path = std::path::Path::new(arg);
+            if !image::is_image(path) {
+                bail!("{arg} does not look like an image murmure can show (png, jpg, jpeg, gif, bmp)");
+            }
+            let Some(protocol) = image::supported() else {
+                bail!(
+                    "this terminal does not support inline images \
+                     (needs Kitty, WezTerm, Ghostty, or iTerm2)"
+                );
+            };
+            let bytes = std::fs::read(path).with_context(|| format!("reading {arg}"))?;
+            let escape = image::encode(protocol, &bytes).map_err(|e| anyhow::anyhow!(e))?;
+            screen.show_image(escape);
+        }
         "/tell" => {
             let Some(name) = parts.next() else {
                 bail!("usage: /tell <name> <message>");
@@ -1484,6 +1504,8 @@ fn help(screen: &Screen) {
         "                                'off' erases what is there, and both tell your contacts",
         "  /history no <name>            ask them not to write down what you say",
         "  /search <term>                find kept lines containing it, across every conversation",
+        "  /view <path>                  show a received image inline (needs Kitty, WezTerm,",
+        "                                Ghostty or iTerm2) — the path is printed when it arrives",
         "  /help                         this",
         "  /quit                         leave, hanging up first if you are in a call",
         "during a call:",
