@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use futures::io::{AsyncRead, AsyncWrite};
+use rand::Rng as _;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tor_hscrypto::pk::HsId;
@@ -46,13 +47,30 @@ const OUTBOX: usize = 32;
 /// slowed at the socket rather than in memory, and 32 chunks is about 2 MB.
 const INBOX: usize = 32;
 
-/// How often a connection says it is still there.
+/// How often a connection says it is still there, on average.
 ///
 /// Provisional, and the design notes say so: the right number is measured
 /// against real Tor latency, not reasoned about. Sixty seconds is chosen to be
 /// cheap — a `Ping` is two bytes on a circuit that is already built — while
 /// still noticing a peer within a few minutes.
 const KEEPALIVE: Duration = Duration::from_secs(60);
+
+/// How far a single keepalive may drift from [`KEEPALIVE`], each direction.
+///
+/// A fixed sixty-second beat is a fingerprint: a guard node or ISP watching
+/// packet timing on the circuit sees a metronome that says "murmure" as
+/// plainly as the magic bytes would. Picking a fresh, uniformly random delay
+/// in `[45s, 75s)` for every beat keeps the average unchanged — presence still
+/// notices a gone peer inside [`SILENCE`] — while denying the observer a
+/// period to lock onto.
+const JITTER: Duration = Duration::from_secs(15);
+
+/// A fresh, uniformly random delay in `[KEEPALIVE - JITTER, KEEPALIVE + JITTER)`.
+fn keepalive_delay() -> Duration {
+    let low = (KEEPALIVE - JITTER).as_secs_f64();
+    let high = (KEEPALIVE + JITTER).as_secs_f64();
+    Duration::from_secs_f64(rand::thread_rng().gen_range(low..high))
+}
 
 /// How long a connection may say nothing at all before it is declared gone.
 ///
@@ -103,14 +121,11 @@ impl Link {
         let (inbox_tx, inbox) = mpsc::channel::<Result<Message>>(INBOX);
 
         let writing = tokio::spawn(async move {
-            let mut beat = tokio::time::interval(KEEPALIVE);
-            // A tick the moment the timer is made, which we do not want: the
-            // handshake just proved this connection live.
-            beat.tick().await;
-            // A file transfer can hold this task for minutes. The default is to
-            // fire every tick that was missed, back to back, which would send a
-            // burst of keepalives the instant the transfer ended.
-            beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // A fresh sleep, not `interval`: `interval` fires on a fixed grid,
+            // which is exactly the metronome `JITTER` exists to break. Each
+            // iteration draws its own delay, so a burst of traffic (a file
+            // transfer holding this task for minutes) is followed by one
+            // beat at a random offset rather than `interval`'s catch-up burst.
             loop {
                 tokio::select! {
                     msg = queued.recv() => match msg {
@@ -118,7 +133,9 @@ impl Link {
                         // Every sender is gone: the link is closing.
                         None => break,
                     },
-                    _ = beat.tick() => proto::write_frame(&mut writer, &Message::Ping).await?,
+                    _ = tokio::time::sleep(keepalive_delay()) => {
+                        proto::write_frame(&mut writer, &Message::Ping).await?
+                    }
                 }
             }
             Ok(())
