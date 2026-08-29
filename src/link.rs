@@ -115,7 +115,8 @@ impl Link {
     {
         let mut reader = reader;
         let mut writer = writer;
-        let peer = proto::handshake(&mut reader, &mut writer, me).await?;
+        // The root key seeds 1A's future message ratchet; unused until then.
+        let (peer, _root_key) = proto::handshake(&mut reader, &mut writer, me).await?;
 
         let (outbox, mut queued) = mpsc::channel::<Message>(OUTBOX);
         let (inbox_tx, inbox) = mpsc::channel::<Result<Message>>(INBOX);
@@ -278,7 +279,7 @@ mod tests {
         let forged = {
             use futures::io::AsyncWriteExt as _;
             let mut w = aw.compat_write();
-            let mut hello = [0u8; 7 + 2 + 32 + 32];
+            let mut hello = [0u8; 7 + 2 + 32 + 32 + 32];
             hello[..7].copy_from_slice(b"murmure");
             hello[7..9].copy_from_slice(&crate::proto::VERSION.to_le_bytes());
             hello[9..41].copy_from_slice(
