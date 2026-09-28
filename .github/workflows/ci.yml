@@ -94,4 +94,14 @@ jobs:
           # performs no RSA operation of any kind: every key here is ed25519 or
           # x25519. Ignored with a name and a reason rather than silently, so
           # that the day arti drops it this line is what says so.
-          ignore: RUSTSEC-2023-0071
+          #
+          # RUSTSEC-2024-0436 — `paste` is unmaintained. A proc-macro reached
+          # through arti (`pwd-grp` -> `fs-mistrust`): nothing of it runs at
+          # runtime, there is no fixed version, and it goes when arti drops it.
+          #
+          # RUSTSEC-2025-0141 — `bincode` is unmaintained. It sits in
+          # Cargo.lock as an optional dependency of `typed-index-collections`
+          # (via `tor-netdir`), but that feature is off, so it is never
+          # compiled: `cargo tree -i bincode` prints nothing. cargo-audit reads
+          # the lockfile, hence the report.
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2024-0436,RUSTSEC-2025-0141
