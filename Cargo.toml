@@ -32,9 +32,9 @@ description = "Peer-to-peer terminal messaging over Tor onion services"
 #   minute of C compilation and buys one build recipe on all three platforms.
 #
 # default-features is off to drop `native-tls`, which is nonadditive with
-# `rustls`. The three features that come back are the rest of arti's default set
-# (`tokio`, `compression`, `flowctl-cc`) — dropping those would change behaviour
-# for no reason.
+# `rustls`. The two features that come back are the rest of arti's default set
+# (`tokio`, `compression`) — dropping those would change behaviour for no
+# reason. Congestion control (`flowctl-cc`) is always on since arti 0.46.
 #
 # rustls rather than native-tls, for two reasons:
 #
@@ -46,10 +46,9 @@ description = "Peer-to-peer terminal messaging over Tor onion services"
 #  2. It is also the leading suspect for a Windows bootstrap that stalls with
 #     the channel handshake complete and the circuit's CREATE2 never answered.
 #     Unconfirmed — see the field notes in aidd_docs/INSTALL.md.
-arti-client = { version = "=0.44.0", default-features = false, features = [
+arti-client = { version = "=0.46.0", default-features = false, features = [
     "tokio",
     "compression",
-    "flowctl-cc",
     "rustls",
     "experimental-api",
     "onion-service-client",
@@ -60,15 +59,15 @@ arti-client = { version = "=0.44.0", default-features = false, features = [
 
 # Named directly so murmure can build the onion-service config, the nickname,
 # and its own HsIdKeypair instead of letting arti generate one.
-tor-hsservice = "=0.44.0"
-tor-hscrypto = "=0.44.0"
-tor-llcrypto = "=0.44.0"
-tor-keymgr = "=0.44.0"
+tor-hsservice = "=0.46.0"
+tor-hscrypto = "=0.46.0"
+tor-llcrypto = "=0.46.0"
+tor-keymgr = "=0.46.0"
 # CONNECTED / END relay messages, needed to answer a StreamRequest.
-tor-cell = "=0.44.0"
+tor-cell = "=0.46.0"
 # PreferredRuntime, to name the concrete TorClient type. arti-client does not
 # re-export it.
-tor-rtcompat = { version = "=0.44.0", features = ["tokio", "rustls"] }
+tor-rtcompat = { version = "=0.46.0", features = ["tokio", "rustls"] }
 # Not used in murmure's own code: named only to pick rustls' crypto provider.
 # arti pulls rustls in with default features off and selects neither backend, so
 # `CryptoProvider::install_default` would otherwise have to be called by hand —

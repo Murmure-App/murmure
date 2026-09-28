@@ -64,8 +64,8 @@ the comment saying why it is there — this table is only an index to them.
 
 | Layer | Crate / tech | Real version |
 | --- | --- | --- |
-| Control transport & directory | `arti-client` (features `onion-service-service`, `onion-service-client`, `experimental-api`, `restricted-discovery`, `static-sqlite`, `rustls`) | **=0.44.0**, pinned |
-| arti crates named directly | `tor-hsservice`, `tor-hscrypto`, `tor-llcrypto`, `tor-keymgr`, `tor-cell`, `tor-rtcompat` | **=0.44.0**, pinned |
+| Control transport & directory | `arti-client` (features `onion-service-service`, `onion-service-client`, `experimental-api`, `restricted-discovery`, `static-sqlite`, `rustls`) | **=0.46.0**, pinned |
+| arti crates named directly | `tor-hsservice`, `tor-hscrypto`, `tor-llcrypto`, `tor-keymgr`, `tor-cell`, `tor-rtcompat` | **=0.46.0**, pinned |
 | Async runtime | `tokio` | 1.x, `full` feature |
 | Terminal interface | `ratatui` + `crossterm` | ratatui **0.30.2** / crossterm **0.29** (`event-stream`) |
 | Identity | ~~`ed25519-dalek`~~ → `tor-llcrypto` | Never added: arti already re-exports ed25519 and curve25519, and a second copy of dalek in the tree would mean two incompatible types for the same key. |
@@ -76,7 +76,7 @@ the comment saying why it is there — this table is only an index to them.
 | Protocol serialization | `serde` + `postcard` | 1.x / 1.x |
 | Logging | `tracing` + `tracing-subscriber`, `safelog` | to a file, never stdout — the TUI owns the screen |
 | Data transport (v2) | `quinn` + `rcgen` | **0.11 / 0.14**, `ring` feature on both. Shipped 2026-08-02: `/send --direct`, explicit. |
-| Compiler | Rust stable | **≥ 1.91** (MSRV imposed by arti 0.44) |
+| Compiler | Rust stable | **≥ 1.91** (MSRV imposed by arti 0.46) |
 
 > **`static-sqlite` was not planned and is not optional.** `tor-dirmgr` caches
 > the consensus in SQLite; without this feature, linking fails on Windows
@@ -96,7 +96,7 @@ no third-party account, no server to operate.
 
 > ⚠️ **Pin the arti versions strictly.** The arti crates are `0.x` with a
 > **monthly** release cadence and API breaks at every bump. Write
-> `arti-client = "=0.44.0"`, not `"0.44"`. Budget half an evening of migration
+> `arti-client = "=0.46.0"`, not `"0.46"`. Budget half an evening of migration
 > for every deliberate bump.
 
 > ⚠️ **Known migration cost: `experimental-api`.** The keystore milestone forced
