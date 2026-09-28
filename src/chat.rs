@@ -1222,7 +1222,12 @@ async fn pull_direct(
         .await
         .with_context(|| format!("opening {}", partial.display()))?;
 
-    let mut written = 0u64;
+    // A resumed transfer appends, so the cap counts what is already there.
+    let mut written = file
+        .metadata()
+        .await
+        .with_context(|| format!("reading {}", partial.display()))?
+        .len();
     let mut buf = vec![0u8; MAX_CHUNK];
     loop {
         let n = stream
