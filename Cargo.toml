@@ -114,7 +114,9 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 serde = { version = "1.0.229", features = ["derive"] }
-postcard = { version = "1.1.3", features = ["use-std"] }
+# default-features off drops `heapless-cas`, which pulled heapless 0.7 and the
+# unmaintained `atomic-polyfill` (RUSTSEC-2023-0089) for an embedded-only need.
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 # `zeroize` is not on by default: the cipher keeps the expanded key in its own
 # state, and without this that state is left in freed memory on drop. Costs
 # nothing — zeroize is already in the tree below.
