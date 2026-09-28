@@ -1494,9 +1494,12 @@ mod tests {
         W: futures::io::AsyncWrite + Unpin + Send + 'static,
     {
         // A distinct seed per side, so the handshake has two people to tell
-        // apart. Which one is which does not matter here — chat is given the
-        // peer's name by its caller.
-        let mut link = Link::open(reader, writer, &crate::identity::Identity::for_test(seed)).await?;
+        // apart. Seed 1 plays the caller, dialling seed 2: the handshake needs
+        // exactly one side to have dialled.
+        let dialled = (seed == [1u8; 32])
+            .then(|| crate::identity::Identity::for_test([2u8; 32]).onion_address());
+        let mut link =
+            Link::open(reader, writer, &crate::identity::Identity::for_test(seed), dialled).await?;
         let mut objected = false;
         let talked = run(
             &mut link, peer, Vec::new(), incoming_dir, lines, None, &mut objected, screen,
@@ -1627,7 +1630,7 @@ mod tests {
             let mut bob_r = bob_r.compat();
             let mut bob_w = bob_w.compat_write();
             let bob = crate::identity::Identity::for_test([2u8; 32]);
-            let who = proto::handshake(&mut bob_r, &mut bob_w, &bob).await.unwrap();
+            let who = proto::handshake(&mut bob_r, &mut bob_w, &bob, None).await.unwrap();
             // And the hand-rolled side learns who called, from the proof rather
             // than from anything the transport said.
             assert_eq!(who, crate::identity::Identity::for_test([1u8; 32]).onion_address());
@@ -1752,8 +1755,8 @@ mod tests {
             crate::identity::Identity::for_test([2u8; 32]),
         );
         let (mine, theirs) = tokio::join!(
-            Link::open(ar.compat(), aw.compat_write(), &one),
-            Link::open(br.compat(), bw.compat_write(), &two)
+            Link::open(ar.compat(), aw.compat_write(), &one, Some(two.onion_address())),
+            Link::open(br.compat(), bw.compat_write(), &two, None)
         );
         let mut mine = mine.unwrap();
         let theirs = theirs.unwrap();
@@ -1827,8 +1830,8 @@ mod tests {
             crate::identity::Identity::for_test([2u8; 32]),
         );
         let (caller, called) = tokio::join!(
-            Link::open(ar.compat(), aw.compat_write(), &one),
-            Link::open(br.compat(), bw.compat_write(), &two)
+            Link::open(ar.compat(), aw.compat_write(), &one, Some(two.onion_address())),
+            Link::open(br.compat(), bw.compat_write(), &two, None)
         );
         let mut caller = caller.unwrap();
         let called = called.unwrap();
@@ -1872,8 +1875,8 @@ mod tests {
             crate::identity::Identity::for_test([2u8; 32]),
         );
         let (mine, theirs) = tokio::join!(
-            Link::open(ar.compat(), aw.compat_write(), &one),
-            Link::open(br.compat(), bw.compat_write(), &two)
+            Link::open(ar.compat(), aw.compat_write(), &one, Some(two.onion_address())),
+            Link::open(br.compat(), bw.compat_write(), &two, None)
         );
         let mut history = History::open(&dir.join("history.sealed"), &one).unwrap();
         history.set(true).unwrap();

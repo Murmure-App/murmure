@@ -38,7 +38,7 @@ use crate::identity::Identity;
 /// is young enough that maintaining two wire formats would cost more than
 /// telling two people to run the same build, and a version that is refused
 /// loudly is worth more than one that half-works.
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 
 /// Sent before anything else, so that a stream carrying something other than
 /// murmure fails as itself rather than as a nonsensical version number.
@@ -55,7 +55,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Domain separator for the signed challenge. Frozen: changing it invalidates
 /// every signature both sides would compute, which is a version bump.
-const AUTH_CONTEXT: &[u8] = b"murmure-auth-v1";
+const AUTH_CONTEXT: &[u8] = b"murmure-auth-v2";
 
 /// The opening bytes: magic, version, who we claim to be, and a challenge.
 const HELLO_LEN: usize = 7 + 2 + 32 + 32;
@@ -96,7 +96,28 @@ const HELLO_LEN: usize = 7 + 2 + 32 + 32;
 ///
 /// Both sides send before they read, in both rounds, so nobody blocks waiting
 /// for the other to go first.
-pub async fn handshake<R, W>(r: &mut R, w: &mut W, me: &Identity) -> Result<HsId>
+///
+/// # Why the caller says whom it dialled
+///
+/// Sending before reading means each side signs before it has checked
+/// anything, so a signature must be useless anywhere but the connection it
+/// was made for. Without that, a contact of both Alice and Bob could open one
+/// stream to each, claim to be Bob to Alice and Alice to Bob, hand Bob's
+/// challenge to Alice, and pass Alice's answer back: Bob would accept them as
+/// Alice. Two things close it:
+///
+/// - The signer's role (it dialled, or it answered) is signed too, so an
+///   answer given by Alice's onion service cannot pass as Alice calling.
+/// - `dialled` is `Some` when we placed the call, and we refuse to sign for
+///   anyone but the address we dialled — which Tor already guarantees is the
+///   one that answered. So Alice calling is only ever a proof for whom she
+///   meant to call.
+pub async fn handshake<R, W>(
+    r: &mut R,
+    w: &mut W,
+    me: &Identity,
+    dialled: Option<HsId>,
+) -> Result<HsId>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -149,9 +170,17 @@ where
         .map_err(|_| anyhow::anyhow!("the address the other side claims is not a valid key"))?;
     let their_id = HsIdKey::from(their_key).id();
     let their_nonce: [u8; 32] = theirs[32..].try_into().expect("fixed slice");
+    if dialled.is_some_and(|d| d != their_id) {
+        bail!("the far side claims a different key than the one dialled");
+    }
+    let (my_role, their_role) = if dialled.is_some() {
+        (CALLER, ANSWERER)
+    } else {
+        (ANSWERER, CALLER)
+    };
 
     // We sign the challenge they sent; they sign the one we sent.
-    let signed = me.sign(&challenge(&id_bytes(&my_id)?, &their_id_bytes, &their_nonce));
+    let signed = me.sign(&challenge(my_role, &id_bytes(&my_id)?, &their_id_bytes, &their_nonce));
     w.write_all(&signed.to_bytes())
         .await
         .context("proving who we are")?;
@@ -164,7 +193,7 @@ where
     }
     their_key
         .verify(
-            &challenge(&their_id_bytes, &id_bytes(&my_id)?, &my_nonce),
+            &challenge(their_role, &their_id_bytes, &id_bytes(&my_id)?, &my_nonce),
             &ed25519::Signature::from_bytes(&proof),
         )
         .map_err(|_| {
@@ -177,15 +206,20 @@ where
     Ok(their_id)
 }
 
-/// The bytes a signer commits to: who they are, who they are talking to, and
-/// the challenge that side chose.
+/// Signer roles, part of what is signed. See [`handshake`].
+const CALLER: u8 = 1;
+const ANSWERER: u8 = 2;
+
+/// The bytes a signer commits to: whether they dialled or answered, who they
+/// are, who they are talking to, and the challenge that side chose.
 ///
 /// Order is load-bearing. `signer` and `verifier` swap places between the two
 /// sides, so a signature made in one direction cannot be verified in the other
 /// — which is what a reflection attack would need.
-fn challenge(signer: &[u8; 32], verifier: &[u8; 32], nonce: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(AUTH_CONTEXT.len() + 96);
+fn challenge(role: u8, signer: &[u8; 32], verifier: &[u8; 32], nonce: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(AUTH_CONTEXT.len() + 97);
     msg.extend_from_slice(AUTH_CONTEXT);
+    msg.push(role);
     msg.extend_from_slice(signer);
     msg.extend_from_slice(verifier);
     msg.extend_from_slice(nonce);
@@ -762,7 +796,7 @@ mod tests {
             };
 
             let mut sink = Vec::new();
-            let outcome = handshake(&mut wire.as_slice(), &mut sink, &me()).await;
+            let outcome = handshake(&mut wire.as_slice(), &mut sink, &me(), None).await;
             assert!(
                 outcome.is_err() || outcome.is_ok(),
                 "round {round} of seed 0x4861_6E64_7368_616B"
@@ -789,7 +823,7 @@ mod tests {
         let mut sent = Vec::new();
         // No proof follows, so this stops at the signature — which is far
         // enough to prove the version and the identity were both accepted.
-        let _ = handshake(&mut r.as_slice(), &mut sent, &me()).await;
+        let _ = handshake(&mut r.as_slice(), &mut sent, &me(), None).await;
         assert_eq!(
             &sent[..hello(VERSION, &me()).len() - 32],
             &hello(VERSION, &me())[..hello(VERSION, &me()).len() - 32],
@@ -803,7 +837,7 @@ mod tests {
     #[tokio::test]
     async fn a_different_version_is_refused_by_name() {
         let r = hello(VERSION + 1, &Identity::for_test([2u8; 32]));
-        let e = handshake(&mut r.as_slice(), &mut Vec::new(), &me())
+        let e = handshake(&mut r.as_slice(), &mut Vec::new(), &me(), None)
             .await
             .unwrap_err()
             .to_string();
@@ -816,7 +850,7 @@ mod tests {
     #[tokio::test]
     async fn something_that_is_not_murmure_is_told_apart_from_a_version() {
         let r = b"GET / HTTP".to_vec();
-        let e = handshake(&mut r.as_slice(), &mut Vec::new(), &me())
+        let e = handshake(&mut r.as_slice(), &mut Vec::new(), &me(), None)
             .await
             .unwrap_err()
             .to_string();
@@ -831,7 +865,7 @@ mod tests {
         // with nothing to say.
         let (mine, _theirs) = tokio::io::duplex(1024);
         let (r, w) = tokio::io::split(mine);
-        let e = handshake(&mut r.compat(), &mut w.compat_write(), &me())
+        let e = handshake(&mut r.compat(), &mut w.compat_write(), &me(), None)
             .await
             .unwrap_err()
             .to_string();
@@ -855,7 +889,7 @@ mod tests {
             their_w.flush().await.unwrap();
             std::mem::forget(their_w);
         }
-        let e = handshake(&mut r.compat(), &mut w.compat_write(), &me())
+        let e = handshake(&mut r.compat(), &mut w.compat_write(), &me(), None)
             .await
             .unwrap_err()
             .to_string();
@@ -866,7 +900,7 @@ mod tests {
     #[tokio::test]
     async fn a_truncated_header_is_an_error() {
         let mut r = &MAGIC[..4];
-        assert!(handshake(&mut r, &mut Vec::new(), &me()).await.is_err());
+        assert!(handshake(&mut r, &mut Vec::new(), &me(), None).await.is_err());
     }
 
     /// The challenge is what makes a recording useless. Two handshakes from the
@@ -877,13 +911,72 @@ mod tests {
         let mut first = Vec::new();
         let mut second = Vec::new();
         let r = hello(VERSION, &Identity::for_test([2u8; 32]));
-        let _ = handshake(&mut r.as_slice(), &mut first, &me()).await;
-        let _ = handshake(&mut r.as_slice(), &mut second, &me()).await;
+        let _ = handshake(&mut r.as_slice(), &mut first, &me(), None).await;
+        let _ = handshake(&mut r.as_slice(), &mut second, &me(), None).await;
         assert_ne!(
             first[41..HELLO_LEN],
             second[41..HELLO_LEN],
             "a fixed challenge would make every proof replayable"
         );
+    }
+
+    /// A contact of both Alice and Bob must not be able to pass as Alice to
+    /// Bob by relaying Bob's challenge to Alice's own onion service and Alice's
+    /// answer back to Bob.
+    #[tokio::test(start_paused = true)]
+    async fn a_relayed_proof_does_not_impersonate() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let alice = Identity::for_test([2u8; 32]);
+        let bob = Identity::for_test([3u8; 32]);
+        let (bob_side, mut m_to_bob) = tokio::io::duplex(4096);
+        let (alice_side, mut m_to_alice) = tokio::io::duplex(4096);
+
+        let bob_task = async {
+            let (r, w) = tokio::io::split(bob_side);
+            handshake(&mut r.compat(), &mut w.compat_write(), &bob, None).await
+        };
+        let alice_task = async {
+            let (r, w) = tokio::io::split(alice_side);
+            let _ = handshake(&mut r.compat(), &mut w.compat_write(), &alice, None).await;
+        };
+        let mallory = async {
+            let mut bob_hello = [0u8; HELLO_LEN];
+            m_to_bob.read_exact(&mut bob_hello).await.unwrap();
+            // To Bob: "I am Alice". To Alice: "I am Bob", with Bob's challenge.
+            let mut to_bob = hello(VERSION, &alice);
+            to_bob[41..].copy_from_slice(&[9u8; 32]);
+            m_to_bob.write_all(&to_bob).await.unwrap();
+            let mut to_alice = hello(VERSION, &bob);
+            to_alice[41..].copy_from_slice(&bob_hello[41..]);
+            m_to_alice.write_all(&to_alice).await.unwrap();
+
+            let mut alice_hello = [0u8; HELLO_LEN];
+            m_to_alice.read_exact(&mut alice_hello).await.unwrap();
+            let mut proof = [0u8; 64];
+            if m_to_alice.read_exact(&mut proof).await.is_ok() {
+                let _ = m_to_bob.write_all(&proof).await;
+            }
+            // Keep both pipes open until the handshakes have decided.
+            (m_to_bob, m_to_alice)
+        };
+
+        let (bob_saw, (), _pipes) = tokio::join!(bob_task, alice_task, mallory);
+        assert!(bob_saw.is_err(), "Bob accepted Mallory as Alice");
+    }
+
+    /// Dialling Bob and hearing someone else claim the line: refused before
+    /// we sign anything, so there is no proof to carry elsewhere.
+    #[tokio::test]
+    async fn a_caller_signs_nothing_for_someone_it_did_not_dial() {
+        let bob = Identity::for_test([3u8; 32]);
+        let r = hello(VERSION, &Identity::for_test([4u8; 32]));
+        let mut sent = Vec::new();
+        let e = handshake(&mut r.as_slice(), &mut sent, &me(), Some(bob.onion_address()))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("dialled"), "{e}");
+        assert_eq!(sent.len(), HELLO_LEN, "only our opening, no signature");
     }
 
     /// Encode messages back-to-back the way a conversation does, then read them

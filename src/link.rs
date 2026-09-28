@@ -90,14 +90,14 @@ impl Link {
     /// The handshake happens here rather than in the conversation loop because
     /// it belongs to the connection: it is asked once, when the connection is
     /// made, not once per call held over it.
-    pub async fn open<R, W>(reader: R, writer: W, me: &Identity) -> Result<Self>
+    pub async fn open<R, W>(reader: R, writer: W, me: &Identity, dialled: Option<HsId>) -> Result<Self>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let mut reader = reader;
         let mut writer = writer;
-        let peer = proto::handshake(&mut reader, &mut writer, me).await?;
+        let peer = proto::handshake(&mut reader, &mut writer, me, dialled).await?;
 
         let (outbox, mut queued) = mpsc::channel::<Message>(OUTBOX);
         let (inbox_tx, inbox) = mpsc::channel::<Result<Message>>(INBOX);
@@ -221,8 +221,8 @@ mod tests {
         // Both at once: the handshake writes before it reads, so opening them
         // one after the other would deadlock on a duplex with a small buffer.
         let (a, b) = tokio::join!(
-            Link::open(ar.compat(), aw.compat_write(), &alice),
-            Link::open(br.compat(), bw.compat_write(), &bob)
+            Link::open(ar.compat(), aw.compat_write(), &alice, Some(bob.onion_address())),
+            Link::open(br.compat(), bw.compat_write(), &bob, None)
         );
         (a.unwrap(), b.unwrap())
     }
@@ -278,7 +278,7 @@ mod tests {
             })
         };
 
-        let opened = Link::open(br.compat(), bw.compat_write(), &other).await;
+        let opened = Link::open(br.compat(), bw.compat_write(), &other, None).await;
         forged.abort();
         let refused = opened.err().expect("a forged address must not open a link");
         assert!(
@@ -365,13 +365,18 @@ mod tests {
         let mute = tokio::spawn(async move {
             let mut r = br.compat();
             let mut w = bw.compat_write();
-            proto::handshake(&mut r, &mut w, &Identity::for_test([2u8; 32]))
+            proto::handshake(&mut r, &mut w, &Identity::for_test([2u8; 32]), None)
                 .await
                 .unwrap();
             std::future::pending::<()>().await;
         });
 
-        let mut link = Link::open(ar.compat(), aw.compat_write(), &Identity::for_test([1u8; 32]))
+        let mut link = Link::open(
+            ar.compat(),
+            aw.compat_write(),
+            &Identity::for_test([1u8; 32]),
+            Some(Identity::for_test([2u8; 32]).onion_address()),
+        )
             .await
             .unwrap();
 

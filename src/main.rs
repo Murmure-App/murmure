@@ -398,7 +398,7 @@ async fn serve(
             // connection.
             Event::Called(Some(stream)) => {
                 let (reader, writer) = stream.split();
-                match Link::open(reader, writer, identity).await {
+                match Link::open(reader, writer, identity, None).await {
                     Ok(link) => {
                         let peer = link.peer;
                         let name = name_for(book, &peer);
@@ -1362,7 +1362,7 @@ async fn call(
     };
 
     let (reader, writer) = stream.split();
-    let mut link = match Link::open(reader, writer, live.identity).await {
+    let mut link = match Link::open(reader, writer, live.identity, Some(hs_id)).await {
         Ok(link) => link,
         Err(e) => {
             screen.error(format!("-- call dropped: {e:#} --"));

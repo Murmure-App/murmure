@@ -150,7 +150,7 @@ impl Pool {
                 // so nobody should have to read about it failing.
                 let stream = tor::dial_retrying(&client, peer, DIAL_AHEAD, |_, _| {}).await?;
                 let (reader, writer) = stream.split();
-                let link = Link::open(reader, writer, &me).await?;
+                let link = Link::open(reader, writer, &me, Some(peer)).await?;
                 // We dialled an address and something proved a different key.
                 // Refused for the same reason `/call` refuses it: the key is
                 // what was signed for.
@@ -291,8 +291,8 @@ mod tests {
         let (br, bw) = tokio::io::split(b);
         let (one, two) = (Identity::for_test(a_seed), Identity::for_test(b_seed));
         let (a, b) = tokio::join!(
-            Link::open(ar.compat(), aw.compat_write(), &one),
-            Link::open(br.compat(), bw.compat_write(), &two)
+            Link::open(ar.compat(), aw.compat_write(), &one, Some(two.onion_address())),
+            Link::open(br.compat(), bw.compat_write(), &two, None)
         );
         (a.unwrap(), b.unwrap())
     }
