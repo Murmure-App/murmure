@@ -125,28 +125,13 @@ pub fn listen() -> Result<Listener> {
         .expect("freshly built, so not yet shared")
         .max_concurrent_uni_streams(1u8.into());
 
-    // `[::]` rather than `0.0.0.0`, because that is what listens on **both**
-    // families: an IPv4-only socket cannot be reached at an IPv6 address, and
-    // IPv6 is the only candidate that works between two different networks.
-    // Falls back to IPv4 on a machine with the v6 stack switched off.
-    // Tried in order: the fixed port on both families, then an ephemeral one.
-    // The first is what a firewall rule can name; the last is what keeps a
-    // second instance on the same machine running.
-    let wanted = wanted_port();
-    let mut endpoint = None;
-    for address in [
-        format!("[::]:{wanted}"),
-        format!("0.0.0.0:{wanted}"),
-        "[::]:0".to_owned(),
-        "0.0.0.0:0".to_owned(),
-    ] {
-        let Ok(address) = address.parse() else { continue };
-        if let Ok(bound) = Endpoint::server(server.clone(), address) {
-            endpoint = Some(bound);
-            break;
-        }
-    }
-    let endpoint = endpoint.context("binding the QUIC endpoint")?;
+    // Tried in order: the fixed port, then an ephemeral one. The first is what
+    // a firewall rule can name; the second is what keeps a second instance on
+    // the same machine running.
+    let endpoint = bind(wanted_port())
+        .or_else(|_| bind(0))
+        .context("binding the QUIC endpoint")?;
+    endpoint.set_server_config(Some(server));
     let port = endpoint
         .local_addr()
         .context("reading the bound port")?
@@ -157,6 +142,31 @@ pub fn listen() -> Result<Listener> {
         fingerprint,
         candidates: candidates(port),
     })
+}
+
+/// Bind a dual-stack endpoint on `port`, or an IPv4 one where there is no IPv6.
+///
+/// `[::]` rather than `0.0.0.0`, because that is what listens on **both**
+/// families: an IPv4-only socket cannot be reached at an IPv6 address, and IPv6
+/// is the only candidate that works between two different networks.
+///
+/// `Endpoint::client`, not `Endpoint::server`, because only `client` clears
+/// IPV6_V6ONLY. `server` keeps the platform default, and Windows defaults to
+/// v6-only: the listener then ignores every IPv4 packet, and a LAN candidate
+/// times out on Windows while the same code works on Linux. The server config
+/// is set on the endpoint afterwards.
+///
+/// IPv4 is tried only when IPv6 itself is missing, never when the port is
+/// taken. Windows lets `0.0.0.0:port` bind next to a dual-stack `[::]:port`
+/// held by someone else, and then hands it that socket's IPv4 packets: a
+/// second instance would quietly take over the first one's LAN transfers.
+fn bind(port: u16) -> std::io::Result<Endpoint> {
+    match Endpoint::client(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port))) {
+        Err(e) if e.kind() != std::io::ErrorKind::AddrInUse => {
+            Endpoint::client(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)))
+        }
+        bound => bound,
+    }
 }
 
 /// An open direct link, and everything that has to stay alive for it to work.
@@ -527,9 +537,10 @@ mod tests {
     async fn a_taken_port_falls_back_instead_of_failing() {
         // Occupied here rather than by calling `listen` twice: the tests run in
         // parallel, so whether *this* one gets the fixed port is not something
-        // it can assume.
-        let hog = UdpSocket::bind(format!("[::]:{DEFAULT_PORT}"))
-            .or_else(|_| UdpSocket::bind(format!("0.0.0.0:{DEFAULT_PORT}")));
+        // it can assume. And occupied the way `listen` occupies it, dual-stack:
+        // a std socket on `[::]` is v6-only on Windows and would leave the
+        // IPv4 side of the port free.
+        let hog = bind(DEFAULT_PORT);
 
         let listener = listen().expect("a taken port must not be fatal");
         let port = listener.port();

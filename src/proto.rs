@@ -646,7 +646,7 @@ where
     w.write_all(&len.to_le_bytes())
         .await
         .context("writing a frame length")?;
-    w.write_all(&body).await.context("writing a frame body")?;
+    w.write_all(body).await.context("writing a frame body")?;
     w.flush().await.context("flushing a frame")?;
     Ok(())
 }
