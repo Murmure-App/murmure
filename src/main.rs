@@ -10,6 +10,7 @@
 //! /tell <name> <message>        leave a message; it waits until they are up
 //! /history                      what is kept, if anything. off by default
 //! /presence <name>              ask to see when each other is online
+//! /room new <name>              open a room; /room invite, join, send, get
 //! /contacts                     list the book
 //! /forget <name>                drop a contact
 //! /quit                         leave
