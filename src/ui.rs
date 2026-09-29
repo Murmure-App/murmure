@@ -1391,14 +1391,24 @@ fn as_dropped_file(text: &str) -> Option<PathBuf> {
 
     // Backslash escapes. Dropping the backslash is right for `\ ` and `\'`, and
     // for a literal backslash in a name it is the escaped form that arrived.
-    let mut path = String::with_capacity(stripped.len());
-    let mut chars = stripped.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => path.push(chars.next().unwrap_or('\\')),
-            c => path.push(c),
+    //
+    // Not on Windows, where the backslash *is* the separator and Windows
+    // Terminal quotes a path with spaces instead of escaping it. Unescaping
+    // there turned `C:\Users\me\a.png` into `C:Usersmea.png`, which is no
+    // file — so the path went to the peer as a chat line, user name and all.
+    let path = if cfg!(windows) {
+        stripped.to_owned()
+    } else {
+        let mut path = String::with_capacity(stripped.len());
+        let mut chars = stripped.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => path.push(chars.next().unwrap_or('\\')),
+                c => path.push(c),
+            }
         }
-    }
+        path
+    };
 
     let expanded = match path.strip_prefix("~/") {
         Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
@@ -1820,7 +1830,9 @@ mod tests {
         ] {
             assert_eq!(as_dropped_file(&form), Some(plain.clone()), "{form}");
         }
-        // Spaces, escaped the two ways terminals escape them.
+        // Spaces, escaped the two ways terminals escape them. The backslash
+        // form is Unix-only: on Windows a backslash is a separator.
+        #[cfg(not(windows))]
         assert_eq!(
             as_dropped_file(&format!("{d}/mon\\ rapport.pdf")),
             Some(spaced.clone())
