@@ -115,8 +115,12 @@ impl Link {
     {
         let mut reader = reader;
         let mut writer = writer;
-        // The root key seeds 1A's future message ratchet; unused until then.
-        let (peer, _root_key) = proto::handshake(&mut reader, &mut writer, me, dialled).await?;
+        // Every frame after the handshake is sealed by this connection's
+        // ratchet. Both tasks turn it — a received frame can start a new
+        // sending chain — so it is shared, and never held across an await.
+        let (peer, ratchet) = proto::handshake(&mut reader, &mut writer, me, dialled).await?;
+        let ratchet = std::sync::Arc::new(std::sync::Mutex::new(ratchet));
+        let sealing = ratchet.clone();
 
         let (outbox, mut queued) = mpsc::channel::<Message>(OUTBOX);
         let (inbox_tx, inbox) = mpsc::channel::<Result<Message>>(INBOX);
@@ -133,12 +137,12 @@ impl Link {
             loop {
                 tokio::select! {
                     msg = queued.recv() => match msg {
-                        Some(msg) => proto::write_frame(&mut writer, &msg).await?,
+                        Some(msg) => proto::write_sealed(&mut writer, &msg, &sealing).await?,
                         // Every sender is gone: the link is closing.
                         None => break,
                     },
                     _ = tokio::time::sleep(keepalive_delay()) => {
-                        proto::write_frame(&mut writer, &Message::Ping).await?
+                        proto::write_sealed(&mut writer, &Message::Ping, &sealing).await?
                     }
                 }
             }
@@ -154,7 +158,7 @@ impl Link {
                 // network vanished sends nothing and closes nothing. Without a
                 // deadline the connection stays in the pool for ever, and the
                 // instant `/call` it promises goes to a socket nobody is on.
-                let frame = match tokio::time::timeout(SILENCE, proto::read_frame(&mut reader)).await
+                let frame = match tokio::time::timeout(SILENCE, proto::read_sealed(&mut reader, &ratchet)).await
                 {
                     Ok(frame) => frame,
                     Err(_) => {

@@ -27,6 +27,8 @@ use tor_llcrypto::pk::{curve25519, ed25519};
 use zeroize::Zeroizing;
 
 use crate::identity::Identity;
+use crate::ratchet::{self, Ratchet};
+use std::sync::Mutex;
 
 /// What this build speaks.
 ///
@@ -39,7 +41,7 @@ use crate::identity::Identity;
 /// is young enough that maintaining two wire formats would cost more than
 /// telling two people to run the same build, and a version that is refused
 /// loudly is worth more than one that half-works.
-pub const VERSION: u16 = 8;
+pub const VERSION: u16 = 9;
 
 /// Sent before anything else, so that a stream carrying something other than
 /// murmure fails as itself rather than as a nonsensical version number.
@@ -137,7 +139,7 @@ pub async fn handshake<R, W>(
     w: &mut W,
     me: &Identity,
     dialled: Option<HsId>,
-) -> Result<(HsId, Zeroizing<[u8; 32]>)>
+) -> Result<(HsId, Ratchet)>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -250,8 +252,13 @@ where
 
     let shared = my_ephemeral_secret.diffie_hellman(&their_ephemeral_public);
     let root_key = Zeroizing::new(blake3::derive_key(RATCHET_ROOT_CONTEXT, shared.as_bytes()));
+    let ratchet = if dialled.is_some() {
+        Ratchet::caller(root_key, my_ephemeral_secret, their_ephemeral_public)
+    } else {
+        Ratchet::answerer(root_key, my_ephemeral_secret, their_ephemeral_public)
+    };
 
-    Ok((their_id, root_key))
+    Ok((their_id, ratchet))
 }
 
 /// Signer roles, part of what is signed. See [`handshake`].
@@ -597,18 +604,41 @@ impl Message {
 }
 
 /// Encode and send one frame.
+#[cfg(test)]
 pub async fn write_frame<W>(w: &mut W, msg: &Message) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    write_body(w, &encode(msg)?).await
+}
+
+/// Encode, seal with the connection's ratchet, and send one frame. What a
+/// [`crate::link::Link`] sends; [`write_frame`] is the same frame in clear.
+pub async fn write_sealed<W>(w: &mut W, msg: &Message, ratchet: &Mutex<Ratchet>) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let body = encode(msg)?;
+    let sealed = ratchet.lock().expect("never held across a panic").seal(&body)?;
+    write_body(w, &sealed).await
+}
+
+fn encode(msg: &Message) -> Result<Zeroizing<Vec<u8>>> {
     msg.check()?;
-    let body = postcard::to_stdvec(msg).context("encoding a frame")?;
+    let body = Zeroizing::new(postcard::to_stdvec(msg).context("encoding a frame")?);
     // Unreachable while MAX_TEXT is the only variable-length payload and stays
     // well under MAX_FRAME, but the check is cheap and outlives that assumption.
     if body.len() > MAX_FRAME {
         bail!("encoded frame is {} bytes, over MAX_FRAME", body.len());
     }
-    let len = u32::try_from(body.len()).expect("checked against MAX_FRAME above");
+    Ok(body)
+}
+
+async fn write_body<W>(w: &mut W, body: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let len = u32::try_from(body.len()).expect("bounded by MAX_FRAME plus the ratchet overhead");
 
     w.write_all(&len.to_le_bytes())
         .await
@@ -623,7 +653,38 @@ where
 /// A peer that hangs up between frames yields [`None`]; a peer that hangs up
 /// *inside* a frame is an error, because a truncated frame is corruption rather
 /// than a normal end of conversation.
+#[cfg(test)]
 pub async fn read_frame<R>(r: &mut R) -> Result<Option<Message>>
+where
+    R: AsyncRead + Unpin,
+{
+    match read_body(r, MAX_FRAME).await? {
+        None => Ok(None),
+        Some(body) => decode(&body).map(Some),
+    }
+}
+
+/// Read one frame sealed by the peer's ratchet, and open it.
+pub async fn read_sealed<R>(r: &mut R, ratchet: &Mutex<Ratchet>) -> Result<Option<Message>>
+where
+    R: AsyncRead + Unpin,
+{
+    match read_body(r, MAX_FRAME + ratchet::OVERHEAD).await? {
+        None => Ok(None),
+        Some(sealed) => {
+            let body = ratchet.lock().expect("never held across a panic").open(&sealed)?;
+            decode(&body).map(Some)
+        }
+    }
+}
+
+fn decode(body: &[u8]) -> Result<Message> {
+    let msg: Message = postcard::from_bytes(body).context("decoding a frame")?;
+    msg.check()?;
+    Ok(msg)
+}
+
+async fn read_body<R>(r: &mut R, max: usize) -> Result<Option<Vec<u8>>>
 where
     R: AsyncRead + Unpin,
 {
@@ -639,8 +700,8 @@ where
         bail!("peer announced a zero-length frame");
     }
     // Checked *before* allocating: the length came from the network.
-    if len > MAX_FRAME {
-        bail!("peer announced a {len}-byte frame, over the {MAX_FRAME}-byte limit");
+    if len > max {
+        bail!("peer announced a {len}-byte frame, over the {max}-byte limit");
     }
 
     let mut body = vec![0u8; len];
@@ -648,10 +709,7 @@ where
         ReadEnd::Eof => bail!("stream ended inside a {len}-byte frame"),
         ReadEnd::Filled => {}
     }
-
-    let msg: Message = postcard::from_bytes(&body).context("decoding a frame")?;
-    msg.check()?;
-    Ok(Some(msg))
+    Ok(Some(body))
 }
 
 /// Outcome of a fill-this-buffer read.
@@ -860,13 +918,13 @@ mod tests {
         }
     }
 
-    /// Both sides of a real handshake end up with the same root key, and a
-    /// second handshake between the same two identities ends up with a
-    /// different one — which is the entire point of generating the DH keys
+    /// Both sides of a real handshake end up with matching ratchets, and a
+    /// second handshake between the same two identities ends up with
+    /// different ones — which is the entire point of generating the DH keys
     /// fresh instead of deriving them from the seed.
     #[tokio::test]
-    async fn both_sides_derive_the_same_root_key_and_a_fresh_one_next_time() {
-        async fn run_once() -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+    async fn both_sides_agree_on_a_ratchet_and_a_fresh_one_next_time() {
+        async fn run_once() -> (Ratchet, Ratchet) {
             let (a, b) = tokio::io::duplex(4096);
             let (ar, aw) = tokio::io::split(a);
             let (br, bw) = tokio::io::split(b);
@@ -880,11 +938,17 @@ mod tests {
             (alice.unwrap().1, bob.unwrap().1)
         }
 
-        let (a1, b1) = run_once().await;
-        assert_eq!(*a1, *b1, "the same agreement must yield the same root key");
+        let (mut a1, mut b1) = run_once().await;
+        let hello = a1.seal(b"bonjour").unwrap();
+        assert_eq!(&**b1.open(&hello).unwrap(), b"bonjour", "the same agreement must interoperate");
+        let back = b1.seal(b"salut").unwrap();
+        assert_eq!(&**a1.open(&back).unwrap(), b"salut");
 
-        let (a2, _) = run_once().await;
-        assert_ne!(*a1, *a2, "a fresh handshake must not reuse the last root key");
+        let (_, mut b2) = run_once().await;
+        assert!(
+            b2.open(&a1.seal(b"encore").unwrap()).is_err(),
+            "a fresh handshake must not reuse the last keys"
+        );
     }
 
     /// The opening a peer on `version` with this identity would send. The

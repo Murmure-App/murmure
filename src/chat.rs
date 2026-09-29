@@ -1660,12 +1660,14 @@ mod tests {
             let mut bob_r = bob_r.compat();
             let mut bob_w = bob_w.compat_write();
             let bob = crate::identity::Identity::for_test([2u8; 32]);
-            let (who, _root_key) = proto::handshake(&mut bob_r, &mut bob_w, &bob, None).await.unwrap();
+            let (who, ratchet) = proto::handshake(&mut bob_r, &mut bob_w, &bob, None).await.unwrap();
+            let ratchet = std::sync::Mutex::new(ratchet);
             // And the hand-rolled side learns who called, from the proof rather
             // than from anything the transport said.
             assert_eq!(who, crate::identity::Identity::for_test([1u8; 32]).onion_address());
 
-            let got = proto::read_frame(&mut bob_r).await.unwrap();
+            // Sealed by the link's ratchet: in clear, this would not decode.
+            let got = proto::read_sealed(&mut bob_r, &ratchet).await.unwrap();
             assert_eq!(got, Some(Message::Text("bonjour".into())));
 
             assert_eq!(talking.await.unwrap().unwrap(), Ended::WeHungUp);

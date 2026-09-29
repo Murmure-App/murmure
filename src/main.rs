@@ -63,6 +63,7 @@ mod onion;
 mod outbox;
 mod pool;
 mod proto;
+mod ratchet;
 mod store;
 mod transport;
 mod ui;
