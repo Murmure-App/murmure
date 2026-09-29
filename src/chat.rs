@@ -806,6 +806,17 @@ async fn handle(
         | Message::Recording(_)
         | Message::DontRecord => {}
 
+        // A room lives in the idle loop, and a call holds this link away from
+        // it. What the room said over this link during the call is lost —
+        // the limit of one conversation at a time, written down in the README.
+        Message::RoomInvite { .. }
+        | Message::RoomJoin { .. }
+        | Message::RoomDecline { .. }
+        | Message::RoomLeave { .. }
+        | Message::RoomRoster { .. }
+        | Message::RoomHello { .. }
+        | Message::RoomSay { .. } => {}
+
         // Outbox traffic, which belongs to the idle loop: it owns the sealed
         // queue and the delivery marks, and neither is a thing a conversation
         // should be reaching into. Ignored rather than acknowledged, so the

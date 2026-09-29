@@ -409,7 +409,7 @@ impl Typed {
 const COMMANDS: &[&str] = &[
     "/add", "/tell", "/call", "/cancel", "/answer", "/decline", "/presence", "/contacts",
     "/forget", "/copy", "/history", "/search", "/view", "/help", "/quit", "/send", "/direct",
-    "/accept", "/refuse", "/bye",
+    "/accept", "/refuse", "/bye", "/room",
 ];
 
 /// The longest prefix every string in `of` starts with. Empty if `of` is empty.

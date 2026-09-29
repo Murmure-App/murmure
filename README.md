@@ -177,6 +177,7 @@ baked in.
 /tell alice on rentre à 19h                       leave a message for later
 /history                                          what is kept (nothing, by default)
 /presence alice                                   ask to see each other online
+/room new table   /room invite alice              open a room, ask people in
 /send ~/rapport.pdf                               offer a file (during a call)
 /accept   /refuse                                 answer an offer of theirs
 /bye                                              hang up
@@ -271,6 +272,43 @@ mark so a redelivery is never a duplicate on screen.
 Bounded, and bounded out loud: 64 messages per contact. Past that the oldest is
 dropped and you are told which. A message that vanishes without a word is the
 one failure this is built to avoid.
+
+## Rooms
+
+`/room new table` opens a room, `/room invite alice` asks a contact in, and she
+answers with `/room join` or `/room decline`. Once in, anything you type that is
+not a command goes to the room. `/room` lists who is there, `/room leave` goes.
+
+A room lives in memory only. Nothing about it is written down, and it ends when
+its host — whoever opened it — leaves.
+
+**There is no server, and no group key.** Every line travels over the same
+connections a call uses, each under its own ratchet, so somebody leaving leaves
+nothing to re-key. Every line is signed by its author with a key made for that
+room alone, and whoever passes a line on can hold it back but cannot change it
+or write one in somebody else's name.
+
+**Who is connected to whom decides the shape.** Two members who are not each
+other's contacts cannot reach each other at all — friends-only discovery hides
+you from anyone not in your book — so the host relays between them. Members who
+*are* contacts connect directly and hear each other first-hand. Nobody picks:
+a room is a star with the host in the middle, and a mesh wherever friends share
+it.
+
+**Nobody learns an address they did not already have.** The member list carries
+room keys and a tag per member that can only be checked against an address one
+already knows. So you see which of *your* contacts are in the room, by name;
+everyone else shows as `~a1b2c3d4`. A contact's name is shown only once they
+have proved that key over their own connection to you — if the host's list says
+otherwise, you are told the host is lying about them.
+
+What the host can do, and you should know: see every line (it is in the room),
+hold lines back, and vouch for people you do not know — `~a1b2c3d4` is whoever
+the host let in, and nothing more is proved about them.
+
+Limits, for now: text only, 16 people, one room at a time. During a call the
+room waits, and what it says over the connection to the person you are calling
+is lost.
 
 ## Sending a file
 
@@ -428,10 +466,9 @@ Concretely, beta means two things you can plan around. The wire format can
 change between releases and there is no compatibility across them, so both sides
 update together. And the command names are not promises yet.
 
-Text, friends-only discovery and file transfer work, on macOS and Linux. Windows
-does not: arti hangs fetching its first consensus, on two independent machines
-and two networks — see `aidd_docs/arti-windows-hang.md`. Presence does not exist
-yet; see `aidd_docs/INSTALL.md` for the design and what is still open.
+Text, rooms, presence, friends-only discovery and file transfer work, on macOS,
+Linux and Windows. Windows needed a patched copy of one arti dependency — see
+`aidd_docs/arti-windows-hang.md`.
 
 ## Licence
 

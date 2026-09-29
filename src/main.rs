@@ -64,6 +64,7 @@ mod outbox;
 mod pool;
 mod proto;
 mod ratchet;
+mod room;
 mod store;
 mod transport;
 mod ui;
@@ -88,6 +89,7 @@ use crate::link::Link;
 use crate::outbox::Outbox;
 use crate::pool::{Heard, Pool};
 use crate::proto::Message;
+use crate::room::{Rooms, Who};
 use crate::transport::tor::{self, KeyHandover};
 use crate::ui::{Kind, Screen};
 
@@ -405,6 +407,8 @@ async fn serve(
     // Somebody calling, waiting to be answered. One at a time, like the calls
     // themselves.
     let mut ringing: Option<Ringing> = None;
+    // The room we are in, if any. In memory only, like everything about it.
+    let mut rooms = Rooms::new(identity.onion_address());
 
     loop {
         // The select only *picks* the event. Handling it happens after, so that
@@ -453,6 +457,13 @@ async fn serve(
                 }
             }
             Event::Called(None) => bail!("the incoming-stream channel closed"),
+            // A room is not a call: it is settled out here, and a line said in
+            // one never rings.
+            Event::Spoke(Heard::Frame(peer, msg)) if room::is_room(&msg) => {
+                let before = rooms.room.as_ref().map(|r| r.name.clone());
+                let out = rooms.receive(peer, msg, &contact_ids(book));
+                apply_room(out, before, &rooms, book, &mut pool, &live, screen).await;
+            }
             // Agreeing to be seen is not something said during a call, so it is
             // settled out here and opens no conversation.
             Event::Spoke(Heard::Frame(peer, msg)) if said_about_presence(&msg).is_some() => {
@@ -638,6 +649,9 @@ async fn serve(
             // for someone we were watching on purpose; otherwise the next
             // `/call` simply dials again and there is nothing to report.
             Event::Spoke(Heard::Lost(peer)) => {
+                let before = rooms.room.as_ref().map(|r| r.name.clone());
+                let out = rooms.lost(&peer);
+                apply_room(out, before, &rooms, book, &mut pool, &live, screen).await;
                 let name = name_for(book, &peer);
                 if book.presence_of(&name) == Presence::On {
                     screen.system(format!("-- {name} went offline --"));
@@ -653,7 +667,10 @@ async fn serve(
             }
             Event::Sweep => hold_presence(&mut pool, book, &live),
             // The interface is gone: Ctrl-C, or the terminal closed.
-            Event::Typed(None) => break,
+            Event::Typed(None) => {
+                leave_room(&mut rooms, &mut pool).await;
+                break;
+            }
             Event::Typed(Some(line)) => {
                 // A message carrying files only means something during a call:
                 // there is nobody to offer them to out here.
@@ -661,19 +678,31 @@ async fn serve(
                     screen.error("files only go somewhere during a call — /call someone first");
                     continue;
                 };
+                // Inside a room, anything that is not a command is said to it.
+                if rooms.room.is_some() && !line.trim().is_empty() && !line.trim_start().starts_with('/') {
+                    let before = rooms.room.as_ref().map(|r| r.name.clone());
+                    match rooms.say(line.trim()) {
+                        Ok(out) => apply_room(out, before, &rooms, book, &mut pool, &live, screen).await,
+                        Err(e) => screen.error(format!("{e:#}")),
+                    }
+                    continue;
+                }
                 // Echo the command before running it. Without this, pressing
                 // Enter only clears the input box and nothing on screen shows
                 // the line was received — so a `/call` that is working looks
                 // like a `/call` that was swallowed.
                 screen.say(Kind::Mine, format!("> {}", line.trim()));
                 match command(
-                    line, book, &live, &mut pool, outbox, history, &mut ringing, lines, started,
-                    screen,
+                    line, book, &live, &mut pool, outbox, history, &mut ringing, &mut rooms, lines,
+                    started, screen,
                 )
                     .await
                 {
                     Ok(Flow::Continue) => {}
-                    Ok(Flow::Quit) => break,
+                    Ok(Flow::Quit) => {
+                        leave_room(&mut rooms, &mut pool).await;
+                        break;
+                    }
                     // A bad command must not end the program.
                     Err(e) => screen.error(format!("{e:#}")),
                 }
@@ -995,6 +1024,7 @@ async fn command(
     outbox: &mut Outbox,
     history: &mut History,
     ringing: &mut Option<Ringing>,
+    rooms: &mut Rooms,
     lines: &mut mpsc::Receiver<ui::Typed>,
     started: Instant,
     screen: &Screen,
@@ -1359,6 +1389,55 @@ async fn command(
             screen.system("your address and key are on the clipboard — send them both.");
             screen.system("(if nothing was copied, your terminal refuses OSC 52; select and copy)");
         }
+        "/room" => {
+            let before = rooms.room.as_ref().map(|r| r.name.clone());
+            let out = match parts.next() {
+                None => {
+                    show_room(rooms, book, screen);
+                    return Ok(Flow::Continue);
+                }
+                Some("new") => {
+                    let name = parts.collect::<Vec<_>>().join(" ");
+                    rooms.create(&name)?;
+                    screen.system(format!(
+                        "-- #{name} is open. /room invite <name> to ask people in; \
+                         anything you type now goes to the room --"
+                    ));
+                    room::Outcome::default()
+                }
+                Some("invite") => {
+                    let Some(name) = parts.next() else {
+                        bail!("usage: /room invite <name>");
+                    };
+                    let peer: HsId = book
+                        .address_of(name)
+                        .ok_or_else(|| anyhow::anyhow!("no contact called {name} — /add them first"))?
+                        .parse()
+                        .map_err(|e| anyhow::anyhow!("{name}'s address is unusable: {e}"))?;
+                    let invite = rooms.invite(peer)?;
+                    // Somebody we are not connected to is dialled for this:
+                    // asking them in is asking to reach them.
+                    if !pool.holds(&peer) {
+                        pool.reach(live.client, peer, live.identity);
+                        screen.system(format!("-- {name} is not connected yet; the invitation goes out when they are --"));
+                    }
+                    screen.system(format!("-- invited {name} --"));
+                    room::Outcome {
+                        send: vec![(peer, invite)],
+                        ..room::Outcome::default()
+                    }
+                }
+                Some("join") => rooms.join()?,
+                Some("decline") => rooms.decline()?,
+                Some("leave") => {
+                    let out = rooms.leave()?;
+                    screen.system(format!("-- you left #{} --", before.as_deref().unwrap_or_default()));
+                    out
+                }
+                Some(_) => bail!("usage: /room [new <name> | invite <name> | join | decline | leave]"),
+            };
+            apply_room(out, before, rooms, book, pool, live, screen).await;
+        }
         "/help" => help(screen),
         "/quit" => return Ok(Flow::Quit),
         // Reachable by dragging a file onto the window outside a call, which is
@@ -1534,6 +1613,11 @@ fn help(screen: &Screen) {
         "  /search <term>                find kept lines containing it, across every conversation",
         "  /view <path>                  show a received image inline (needs Kitty, WezTerm,",
         "                                Ghostty or iTerm2) — the path is printed when it arrives",
+        "  /room new <name>              open a room; anything you type then goes to it",
+        "  /room invite <name>           ask a contact in (you host: when you leave, it ends)",
+        "  /room join   /room decline    answer an invitation",
+        "  /room                         who is in the room      /room leave to go",
+        "                                people who are not your contacts show as ~a1b2c3d4",
         "  /help                         this",
         "  /quit                         leave, hanging up first if you are in a call",
         "during a call:",
@@ -1562,6 +1646,118 @@ fn help(screen: &Screen) {
         "  Shift-drag                    your terminal's own selection instead",
     ] {
         screen.say(Kind::System, line);
+    }
+}
+
+/// Every contact's address, which is what a room's roster is checked against.
+fn contact_ids(book: &Contacts) -> Vec<HsId> {
+    book.iter().filter_map(|(_, c)| c.address.parse().ok()).collect()
+}
+
+/// How somebody in a room is shown.
+fn room_label(who: Who, book: &Contacts) -> String {
+    match who {
+        Who::Me => "you".to_owned(),
+        Who::Known(peer) => name_for(book, &peer),
+        Who::Stranger(key) => format!("~{}", room::fingerprint(&key)),
+    }
+}
+
+/// Carry out what a room frame or command came to: show it, send it, dial.
+///
+/// `before` is the room's name before the change, for the one event — the
+/// room ending — that happens after there is no room to ask.
+async fn apply_room(
+    out: room::Outcome,
+    before: Option<String>,
+    rooms: &Rooms,
+    book: &Contacts,
+    pool: &mut Pool,
+    live: &Live<'_>,
+    screen: &Screen,
+) {
+    use room::Event;
+    let room = rooms
+        .room
+        .as_ref()
+        .map(|r| r.name.clone())
+        .or(before)
+        .unwrap_or_default();
+    for event in out.events {
+        match event {
+            Event::Invited { from, name } => screen.system(format!(
+                "-- {} invites you to #{name} — /room join or /room decline --",
+                name_for(book, &from)
+            )),
+            Event::Busy { from, name } => screen.system(format!(
+                "-- {} invited you to #{name}; turned down, you are already in a room --",
+                name_for(book, &from)
+            )),
+            Event::Said { who: Who::Me, body } => {
+                screen.say(Kind::Mine, format!("#{room} you> {body}"));
+            }
+            Event::Said { who, body } => {
+                // Straight from the network to the terminal: the same boundary
+                // as a line in a call.
+                let body = files::sanitize_for_display(&body);
+                screen.say(Kind::Theirs, format!("#{room} {}> {body}", room_label(who, book)));
+            }
+            Event::Joined(who) => {
+                screen.system(format!("-- {} joined #{room} --", room_label(who, book)));
+            }
+            Event::Left(who) => {
+                screen.system(format!("-- {} left #{room} --", room_label(who, book)));
+            }
+            Event::Declined(peer) => screen.system(format!(
+                "-- {} declined the invitation --",
+                name_for(book, &peer)
+            )),
+            Event::Recognised { key, peer } => screen.system(format!(
+                "-- ~{} is {} --",
+                room::fingerprint(&key),
+                name_for(book, &peer)
+            )),
+            Event::Mismatch(peer) => screen.error(format!(
+                "-- the host lists {name} in #{room} under a key {name} did not prove. \
+                 somebody in this room may not be who the host says --",
+                name = name_for(book, &peer)
+            )),
+            Event::Ended => screen.system(format!("-- #{room} is over: the host left --")),
+        }
+    }
+    for (peer, msg) in out.send {
+        pool.send(peer, msg).await;
+    }
+    for peer in out.reach {
+        pool.reach(live.client, peer, live.identity);
+    }
+    let title = rooms.room.as_ref().map(|r| format!("#{}", r.name));
+    screen.in_call(title.as_deref());
+}
+
+/// Who is in the room, or what is waiting.
+fn show_room(rooms: &Rooms, book: &Contacts, screen: &Screen) {
+    match (&rooms.room, rooms.pending()) {
+        (Some(room), _) => {
+            let names: Vec<String> = room.members().into_iter().map(|w| room_label(w, book)).collect();
+            let host = if room.hosting() { " (you host it)" } else { "" };
+            screen.system(format!("#{}{host}: {}", room.name, names.join(", ")));
+        }
+        (None, Some((from, name))) => screen.system(format!(
+            "{} invited you to #{name} — /room join or /room decline",
+            name_for(book, &from)
+        )),
+        (None, None) => screen.system("not in a room — /room new <name> to open one"),
+    }
+}
+
+/// Leave the room on the way out, so the others are told rather than left to
+/// notice the connection dropping.
+async fn leave_room(rooms: &mut Rooms, pool: &mut Pool) {
+    if let Ok(out) = rooms.leave() {
+        for (peer, msg) in out.send {
+            pool.send(peer, msg).await;
+        }
     }
 }
 

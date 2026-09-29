@@ -41,7 +41,7 @@ use std::sync::Mutex;
 /// is young enough that maintaining two wire formats would cost more than
 /// telling two people to run the same build, and a version that is refused
 /// loudly is worth more than one that half-works.
-pub const VERSION: u16 = 10;
+pub const VERSION: u16 = 11;
 
 /// Sent before anything else, so that a stream carrying something other than
 /// murmure fails as itself rather than as a nonsensical version number.
@@ -361,6 +361,16 @@ pub struct Direct {
 /// would be a way to bury the screen.
 pub const MAX_FILES: usize = 16;
 
+/// Most people one room may hold, the host included.
+///
+/// Every line is sent once per member, and in a mesh forwarded once more by
+/// each, so the cost grows with the square of this. A room is a table, not a
+/// hall.
+pub const MAX_MEMBERS: usize = 16;
+
+/// Which room a room frame is about. Random, and known only to its members.
+pub type RoomId = [u8; 16];
+
 /// What a file looks like on the wire, before anyone agrees to take it.
 ///
 /// The same three fields as [`crate::files::Offer`], kept separate because that
@@ -513,6 +523,49 @@ pub enum Message {
     /// "I have left this call." The connection stays up — it outlives the
     /// call — so without this the other side goes on typing to nobody.
     HangUp,
+    /// "Come and join this room." Sent by the room's host, to a contact.
+    ///
+    /// Carries no roster: who else is in it is only told to those who say yes.
+    RoomInvite { room: RoomId, name: String },
+    /// "Yes, and this is the key I will sign with in there."
+    ///
+    /// A key made for this room alone, so nothing said in it carries our
+    /// address. The host learns which member it belongs to from the link it
+    /// arrived on — the one piece of the room that is proved, not claimed.
+    RoomJoin { room: RoomId, key: [u8; 32] },
+    /// "No thanks", to an invitation.
+    RoomDecline { room: RoomId },
+    /// "I am leaving." From the host, it means the room is over.
+    RoomLeave { room: RoomId },
+    /// Who is in the room, from the host, sent again at every change.
+    ///
+    /// Each member is their room key and a tag, never an address: the tag is
+    /// [`crate::room::tag`] of their address under this room, which anyone in
+    /// the room can check against addresses *they already know* and nothing
+    /// else. So a member learns which of their own contacts are here, and of
+    /// everybody else only that somebody is.
+    RoomRoster {
+        room: RoomId,
+        members: Vec<([u8; 32], [u8; 32])>,
+    },
+    /// "My key in this room is this one." Contact to contact, over the link
+    /// that proves who is speaking — which is what lets a member put a name to
+    /// a key without taking the host's word for it.
+    RoomHello { room: RoomId, key: [u8; 32] },
+    /// A line said in a room, signed by its author's room key.
+    ///
+    /// Forwarded as is by whoever relays it, and checked by everyone who
+    /// receives it: a relay can hold a line back but cannot change or invent
+    /// one. `seq` rises by one per line from each author, which is what makes a
+    /// replay and a duplicate the same thing to ignore.
+    RoomSay {
+        room: RoomId,
+        key: [u8; 32],
+        seq: u64,
+        body: String,
+        /// 64 bytes. A `Vec` because serde has no impl for arrays that long.
+        sig: Vec<u8>,
+    },
 }
 
 impl Message {
@@ -523,9 +576,24 @@ impl Message {
     /// allocation sizes, so they are checked on the way in as well as out.
     fn check(&self) -> Result<()> {
         match self {
-            Message::Text(body) | Message::Left { body, .. } if body.len() > MAX_TEXT => bail!(
-                "text body is {} bytes, over the {MAX_TEXT}-byte limit",
-                body.len()
+            Message::Text(body) | Message::Left { body, .. } | Message::RoomSay { body, .. }
+                if body.len() > MAX_TEXT =>
+            {
+                bail!(
+                    "text body is {} bytes, over the {MAX_TEXT}-byte limit",
+                    body.len()
+                )
+            }
+            Message::RoomSay { sig, .. } if sig.len() != 64 => {
+                bail!("a room signature is {} bytes, not 64", sig.len())
+            }
+            Message::RoomInvite { name, .. } if name.len() > MAX_NAME => bail!(
+                "room name is {} bytes, over the {MAX_NAME}-byte limit",
+                name.len()
+            ),
+            Message::RoomRoster { members, .. } if members.len() > MAX_MEMBERS => bail!(
+                "a room of {} is over the {MAX_MEMBERS} limit",
+                members.len()
             ),
             Message::FileOffer { name, .. } if name.len() > MAX_NAME => bail!(
                 "filename is {} bytes, over the {MAX_NAME}-byte limit",
