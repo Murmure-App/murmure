@@ -389,7 +389,27 @@ sealed contacts book, received files, Tor's state, and `murmure.log`.
 
 `identity.seed` **is** your identity — 32 bytes, mode 0600, never leaves the
 machine. Lose it and you lose your address and your contacts book, which is
-sealed under a key derived from it. There is no recovery, by design.
+sealed under a key derived from it.
+
+Two optional protections, each a one-shot run that exits before anything
+starts:
+
+- **A recovery phrase.** `MURMURE_EXPORT_MNEMONIC=1 ./murmure` prints your
+  seed as 24 words; write them on paper. On a new machine, with no
+  `identity.seed` yet, they bring back the same address:
+
+  ```sh
+  read -rs MURMURE_RESTORE_MNEMONIC && export MURMURE_RESTORE_MNEMONIC
+  ./murmure
+  unset MURMURE_RESTORE_MNEMONIC
+  ```
+
+  (`read -rs` keeps the words out of your shell history.) The phrase restores
+  the identity only: the contacts book and history are files, and come back
+  only if you copied `.murmure/` too. Anyone holding the words *is* you.
+- **A passphrase.** `MURMURE_ENCRYPT_IDENTITY=1 ./murmure` encrypts the seed
+  with a passphrase (Argon2id), asked at every start from then on;
+  `MURMURE_DECRYPT_IDENTITY=1` undoes it.
 
 Set `MURMURE_DIR` to run a second instance on the same machine:
 
