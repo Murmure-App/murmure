@@ -62,7 +62,17 @@ struct Down {
     /// Members waiting for us to have it, and where each wants it from.
     waiters: Vec<(HsId, u64)>,
     progress: Progress,
+    /// When the last byte came, so a transfer that stopped without a word can
+    /// be told from one that is only slow.
+    heard: std::time::Instant,
 }
+
+/// How long a download may go without a byte before asking again replaces it.
+///
+/// Frames can vanish without anything saying so: a call holds the connection
+/// away from the room, and whatever the room sent over it is dropped. Without
+/// this the file would be "on its way" for ever.
+const STALLED: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Every file in the room we are in, and every transfer running for it.
 pub struct Transfers {
@@ -172,12 +182,23 @@ impl Transfers {
             bail!("{name:?} is yours");
         }
         if let Some(down) = self.down.get_mut(&hash) {
-            if down.mine {
+            if !down.mine {
+                // Already coming, to relay: keep it too when it lands.
+                down.mine = true;
+                return Ok(Vec::new());
+            }
+            if down.heard.elapsed() < STALLED {
                 bail!("{name:?} is already on its way");
             }
-            // Already coming, to relay: keep it too when it lands.
-            down.mine = true;
-            return Ok(Vec::new());
+            // Stalled. Asked again from where the partial stops, which is
+            // safe because a stream that was going to resume would have.
+            let waiters = std::mem::take(&mut down.waiters);
+            self.down.remove(&hash);
+            let ask = self.start(hash, true, None)?;
+            if let Some(down) = self.down.get_mut(&hash) {
+                down.waiters = waiters;
+            }
+            return Ok(vec![ask]);
         }
         if let Some(path) = known.path.clone() {
             // Relayed, so already here and already checked: a copy is all
@@ -240,6 +261,7 @@ impl Transfers {
                 mine,
                 waiters: waiter.into_iter().collect(),
                 progress,
+                heard: std::time::Instant::now(),
             },
         );
         Ok(Action::Send(from, Message::RoomFetch { room, hash, offset }))
@@ -305,6 +327,7 @@ impl Transfers {
         match result {
             Ok(()) => {
                 down.written = written;
+                down.heard = std::time::Instant::now();
                 down.progress.show(written, screen);
                 Vec::new()
             }
@@ -631,6 +654,34 @@ mod tests {
         member.chunk(a, file.hash, b"abc", &screen);
         member.done(a, file.hash, &screen);
         assert_eq!(fs::read(ci.join("x.txt")).unwrap(), b"abc");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_stalled_download_can_be_asked_for_again_and_resumes() {
+        let (screen, _ui) = crate::ui::channel();
+        let a = id(1);
+        let (ci, cr, base) = dirs("stalled");
+        let file = FileRef {
+            name: "long.txt".into(),
+            size: 6,
+            hash: *blake3::hash(b"abcdef").as_bytes(),
+        };
+        let mut member = Transfers::new(ci.clone(), cr);
+        member.reset(Some([1; 16]));
+        member.announced(file.clone(), "alice".into(), a);
+        member.get(1, &screen).unwrap();
+        member.chunk(a, file.hash, b"abc", &screen);
+        // Still moving: asking again is refused.
+        assert!(member.get(1, &screen).is_err());
+        // Nothing for a long while: asking again starts over from the partial.
+        let d = member.down.get_mut(&file.hash).unwrap();
+        d.heard = std::time::Instant::now().checked_sub(STALLED * 2).unwrap();
+        let again = member.get(1, &screen).unwrap();
+        assert!(matches!(&again[..], [Action::Send(to, Message::RoomFetch { offset: 3, .. })] if *to == a));
+        member.chunk(a, file.hash, b"def", &screen);
+        member.done(a, file.hash, &screen);
+        assert_eq!(fs::read(ci.join("long.txt")).unwrap(), b"abcdef");
         let _ = fs::remove_dir_all(&base);
     }
 
