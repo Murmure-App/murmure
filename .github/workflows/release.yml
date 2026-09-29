@@ -18,9 +18,7 @@ on:
 jobs:
   build:
     # Matrix legs run in parallel, so a target costs a runner, not a minute of
-    # anyone's wait. The only platform left out is Windows, and that is not a
-    # packaging decision: arti hangs fetching its first consensus, so there is
-    # no binary to ship.
+    # anyone's wait.
     strategy:
       fail-fast: false
       matrix:
@@ -44,8 +42,19 @@ jobs:
           - os: macos-latest
             name: macos-universal
             targets: aarch64-apple-darwin x86_64-apple-darwin
+          # Possible since the saturating-time patch in Cargo.toml: before it,
+          # arti hung on Windows reading its first consensus
+          # (aidd_docs/arti-windows-hang.md). A zip rather than a tarball,
+          # because that is what Explorer opens.
+          - os: windows-latest
+            name: windows-x86_64
+            targets: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
+    # Git's bash on Windows, so the steps below are one script everywhere.
+    defaults:
+      run:
+        shell: bash
     permissions:
       # Both are for the provenance attestation below, and nothing else.
       id-token: write
@@ -79,13 +88,20 @@ jobs:
           if [ $# -gt 1 ]; then
             lipo -create -output "$dir/murmure" \
               $(for target; do printf 'target/%s/release/murmure ' "$target"; done)
+          elif [ -f "target/$1/release/murmure.exe" ]; then
+            cp "target/$1/release/murmure.exe" "$dir/murmure.exe"
           else
             cp "target/$1/release/murmure" "$dir/murmure"
           fi
 
           cp LICENSE README.md "$dir/"
-          tar czf "$dir.tar.gz" "$dir"
-          echo "archive=$dir.tar.gz" >> "$GITHUB_OUTPUT"
+          if [ -f "$dir/murmure.exe" ]; then
+            7z a -tzip "$dir.zip" "$dir" > /dev/null
+            echo "archive=$dir.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar czf "$dir.tar.gz" "$dir"
+            echo "archive=$dir.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
 
       # What a downloader gets otherwise is a binary from an anonymous account,
       # which is exactly as trustworthy as it sounds. This ties the archive to
@@ -132,7 +148,7 @@ jobs:
 
           # Sorted, so the file is byte-identical for the same set of archives
           # whatever order the matrix jobs happened to finish in.
-          (cd dist && sha256sum *.tar.gz | sort -k2 > SHA256SUMS)
+          (cd dist && sha256sum *.tar.gz *.zip | sort -k2 > SHA256SUMS)
 
           # The notes live in the annotated tag, which is signed. Keeping them
           # there rather than in a file means the text that describes a version
@@ -168,4 +184,4 @@ jobs:
           gh release create "$tag" $prerelease \
             --title "murmure ${tag#v}" \
             --notes-file notes.md \
-            dist/*.tar.gz dist/SHA256SUMS
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS

@@ -24,8 +24,7 @@ disk, until the other person appears.
 > need.
 >
 > Known limits are stated where they apply rather than collected here: search
-> the page for "limit". On Windows there is no release binary yet: build it
-> yourself, or use WSL 2.
+> the page for "limit". Windows support is the newest and the least tried.
 
 ## Install
 
@@ -37,12 +36,13 @@ page](https://github.com/Murmure-App/murmure/releases):
 | `linux-x86_64` | glibc 2.35 or newer, so Ubuntu 22.04 and up |
 | `linux-aarch64` | the same, on ARM — a 64-bit Raspberry Pi, an ARM server |
 | `macos-universal` | any Mac, Apple Silicon or Intel |
+| `windows-x86_64` (zip) | 64-bit Windows 10 and 11 |
 
-There is no Windows binary yet. Until September 2026 arti hung on Windows while
+The Windows binary is new. Until September 2026 arti hung on Windows while
 reading its first consensus (a dependency looped forever on Windows' 100 ns
-clock; see `aidd_docs/arti-windows-hang.md`). murmure now carries the fix, so
-[Build](#build) works natively with the MSVC build tools. WSL 2 remains an
-option.
+clock; see `aidd_docs/arti-windows-hang.md`); murmure now carries the fix.
+Run `murmure.exe` from Windows Terminal. It is not signed, so SmartScreen
+warns before the first run. WSL 2 remains an option.
 
 ### On Windows, through WSL 2
 
@@ -86,7 +86,7 @@ intact; what ties an archive to the source that produced it is its provenance
 attestation:
 
 ```sh
-gh attestation verify murmure-*.tar.gz --repo Murmure-App/murmure
+gh attestation verify murmure-*.tar.gz --repo Murmure-App/murmure   # or the .zip
 ```
 
 On macOS the binary is neither signed nor notarized, so Gatekeeper quarantines
