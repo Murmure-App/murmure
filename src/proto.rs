@@ -517,8 +517,8 @@ impl Message {
                 }
                 for addr in &d.candidates {
                     let ip = addr.ip();
-                    if ip.is_unspecified() || ip.is_multicast() {
-                        bail!("invalid candidate address {addr}: unspecified or multicast");
+                    if ip.is_unspecified() || ip.is_multicast() || ip.is_loopback() {
+                        bail!("invalid candidate address {addr}: unspecified, multicast or loopback");
                     }
                     match ip {
                         std::net::IpAddr::V4(v4) => {
@@ -1248,7 +1248,7 @@ mod tests {
     /// with a timeout, so its size is not the peer's to choose.
     #[test]
     fn a_direct_answer_must_offer_at_least_one_address_and_not_too_many() {
-        let one: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let one: std::net::SocketAddr = "192.168.1.1:1".parse().unwrap();
 
         let empty = Message::FileAccept {
             hash: [0u8; 32],
@@ -1276,6 +1276,18 @@ mod tests {
             );
             assert!(wire.is_empty());
         }
+
+        // Loopback would aim us at our own machine.
+        let home = Message::FileAccept {
+            hash: [0u8; 32],
+            offset: 0,
+            direct: Some(Direct {
+                candidates: vec!["127.0.0.1:22".parse().unwrap()],
+                fingerprint: [0u8; 32],
+                token: [0u8; 32],
+            }),
+        };
+        assert!(futures::executor::block_on(write_frame(&mut Vec::new(), &home)).is_err());
 
         // The plain Tor answer carries no addresses at all, and must stay legal.
         let mut wire = Vec::new();

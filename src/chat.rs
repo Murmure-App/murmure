@@ -1204,30 +1204,37 @@ async fn pull_direct(
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
 
-    let mut stream = listener.accept().await?;
-    let mut auth = [0u8; 32];
-    stream.read_exact(&mut auth).await.context("reading the direct link auth token")?;
+    // The port is public and anyone can reach it first: a connection without
+    // the token is dropped and the wait goes on, so a scanner that gets there
+    // before the peer does not cost the transfer.
+    let mut stream = loop {
+        let mut stream = listener.accept().await?;
+        let mut auth = [0u8; 32];
+        let read = tokio::time::timeout(
+            crate::transport::direct::DIAL_TIMEOUT,
+            stream.read_exact(&mut auth),
+        )
+        .await;
+        // Constant-time token verification
+        let mismatch = auth.iter().zip(token.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        if matches!(read, Ok(Ok(()))) && mismatch == 0 {
+            break stream;
+        }
+    };
 
-    // Constant-time token verification
-    let mismatch = auth.iter().zip(token.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
-    if mismatch != 0 {
-        bail!("the connecting direct peer sent an invalid authentication token");
-    }
-
+    // Never a resume: `accept` sends a direct transfer over Tor as soon as a
+    // partial exists. Truncate, so a stale partial longer than the offer (which
+    // `resume_offset` reports as 0) cannot end up in front of the new bytes.
     let partial = files::partial_path(&incoming_dir, &offer.hash);
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&partial)
         .await
         .with_context(|| format!("opening {}", partial.display()))?;
 
-    // A resumed transfer appends, so the cap counts what is already there.
-    let mut written = file
-        .metadata()
-        .await
-        .with_context(|| format!("reading {}", partial.display()))?
-        .len();
+    let mut written = 0u64;
     let mut buf = vec![0u8; MAX_CHUNK];
     loop {
         let n = stream

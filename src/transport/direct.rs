@@ -186,24 +186,33 @@ impl<S> std::ops::DerefMut for Link<S> {
 }
 
 impl Listener {
-    /// Wait for the peer, and hand back the stream they open.
+    /// The bound port. Tests dial loopback on it, which is never a candidate.
+    #[cfg(test)]
+    fn port(&self) -> u16 {
+        self.endpoint.local_addr().expect("bound").port()
+    }
+
+    /// Wait for someone to connect, and hand back the stream they open.
+    ///
+    /// Whoever it is: the port is public, so a connection that fails half-way
+    /// is skipped rather than ending the wait, and the caller checks the token.
+    /// Fails only once the endpoint itself is gone.
     pub async fn accept(&self) -> Result<Link<RecvStream>> {
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or_else(|| anyhow!("the QUIC endpoint closed before anyone connected"))?;
-        let connection = incoming.await.context("completing the QUIC handshake")?;
-        let stream = connection
-            .accept_uni()
-            .await
-            .context("accepting the file stream")?;
-        Ok(Link {
-            // Ours is owned by the `Listener`, which the caller keeps.
-            _endpoint: None,
-            _connection: connection,
-            stream,
-        })
+        loop {
+            let incoming = self
+                .endpoint
+                .accept()
+                .await
+                .ok_or_else(|| anyhow!("the QUIC endpoint closed before anyone connected"))?;
+            let Ok(connection) = incoming.await else { continue };
+            let Ok(stream) = connection.accept_uni().await else { continue };
+            return Ok(Link {
+                // Ours is owned by the `Listener`, which the caller keeps.
+                _endpoint: None,
+                _connection: connection,
+                stream,
+            });
+        }
     }
 }
 
@@ -269,8 +278,9 @@ fn self_signed() -> Result<(Vec<u8>, Vec<u8>)> {
 /// default route. That is the answer we want, and it costs no dependency and
 /// no platform-specific code.
 ///
-/// Loopback is included last so that two instances on one machine can reach
-/// each other, which is what the tests do.
+/// Loopback is never offered, and a peer offering it is refused (see
+/// `proto::Message::check`): it would make the dialler aim at its own machine.
+/// Two instances on one machine still meet on the LAN address.
 fn candidates(port: u16) -> Vec<SocketAddr> {
     let mut found = Vec::new();
 
@@ -285,7 +295,6 @@ fn candidates(port: u16) -> Vec<SocketAddr> {
     if let Some(ip) = source_address_for("192.0.2.1:9") {
         found.push(SocketAddr::new(ip, port));
     }
-    found.push(SocketAddr::new(IpAddr::from([127, 0, 0, 1]), port));
     found
 }
 
@@ -425,7 +434,7 @@ mod tests {
     async fn a_file_crosses_a_direct_link() {
         let listener = listen().expect("bind");
         let fingerprint = listener.fingerprint;
-        let candidates = listener.candidates.clone();
+        let candidates = [SocketAddr::from(([127, 0, 0, 1], listener.port()))];
 
         let receiving = tokio::spawn(async move {
             let mut stream = listener.accept().await.expect("accept");
@@ -452,17 +461,16 @@ mod tests {
         // One candidate, and the loopback one: with several, a refusal on the
         // first is followed by a timeout on the rest, and the timeout is what
         // the assertion would see.
-        let only = *listener
-            .candidates
-            .iter()
-            .find(|a| a.ip().is_loopback())
-            .expect("loopback is always offered");
+        let one = [SocketAddr::from(([127, 0, 0, 1], listener.port()))];
 
-        // Joined rather than spawned, so the listener outlives the handshake:
+        // Raced rather than spawned, so the listener outlives the handshake:
         // dropping it closes the endpoint, and the dial would then time out
-        // instead of being refused.
-        let one = [only];
-        let (_, dialled) = tokio::join!(listener.accept(), dial(&one, [0u8; 32]));
+        // instead of being refused. `accept` skips the failed connection and
+        // keeps waiting, so the dial is the side that finishes.
+        let dialled = tokio::select! {
+            _ = listener.accept() => panic!("a wrong fingerprint must not connect"),
+            dialled = dial(&one, [0u8; 32]) => dialled,
+        };
 
         let text = match dialled {
             Ok(_) => panic!("a wrong fingerprint must not connect"),
@@ -495,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_crosses_an_ipv6_link() {
         let listener = listen().expect("bind");
-        let port = listener.candidates[0].port();
+        let port = listener.port();
         let v6: SocketAddr = format!("[::1]:{port}").parse().unwrap();
         let fingerprint = listener.fingerprint;
 
@@ -524,7 +532,7 @@ mod tests {
             .or_else(|_| UdpSocket::bind(format!("0.0.0.0:{DEFAULT_PORT}")));
 
         let listener = listen().expect("a taken port must not be fatal");
-        let port = listener.candidates[0].port();
+        let port = listener.port();
         assert_ne!(port, 0, "an unbound port would be advertised to nobody");
         if hog.is_ok() {
             assert_ne!(port, DEFAULT_PORT, "that port was already taken");
@@ -549,14 +557,33 @@ mod tests {
         assert!(is_global_v6(&"2a01:cb11::1".parse::<IpAddr>().unwrap()));
     }
 
+    /// Loopback would point the dialler at its own machine, so it is never
+    /// offered — and `proto` refuses it from a peer.
     #[test]
-    fn candidates_always_include_a_way_back_to_this_machine() {
+    fn candidates_never_include_loopback() {
         let found = candidates(4242);
         assert!(found.iter().all(|a| a.port() == 4242));
-        assert!(
-            found.iter().any(|a| a.ip().is_loopback()),
-            "two instances on one machine must be able to meet: {found:?}"
-        );
+        assert!(!found.iter().any(|a| a.ip().is_loopback()), "{found:?}");
+    }
+
+    /// Someone who reaches the port first, without finishing a handshake,
+    /// must not stop the real peer from getting through.
+    #[tokio::test]
+    async fn a_stranger_first_does_not_block_the_peer() {
+        let listener = listen().expect("bind");
+        let one = [SocketAddr::from(([127, 0, 0, 1], listener.port()))];
+        let fingerprint = listener.fingerprint;
+        let receiving = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept");
+            stream.read_to_end(1024).await.expect("read")
+        });
+
+        assert!(dial(&one, [0u8; 32]).await.is_err(), "the stranger is refused");
+        let mut out = dial(&one, fingerprint).await.expect("the peer still gets in");
+        out.write_all(b"quand meme").await.expect("write");
+        out.finish().expect("finish");
+        out.stopped().await.ok();
+        assert_eq!(receiving.await.unwrap(), b"quand meme");
     }
 }
 
