@@ -1801,8 +1801,15 @@ async fn apply_room(
             ),
             Event::Shared { who, file, from } => {
                 let (name, size) = (files::sanitize_for_display(&file.name), file.size);
+                // Straight from the author whenever we know which link is
+                // theirs: whoever relayed the announcement would only relay
+                // the bytes too, slower.
+                let source = match who {
+                    Who::Known(author) => author,
+                    _ => from,
+                };
                 let who = room_label(who, book);
-                let n = hall.files.announced(file, who.clone(), from);
+                let n = hall.files.announced(file, who.clone(), source);
                 screen.say(
                     Kind::Theirs,
                     format!(
