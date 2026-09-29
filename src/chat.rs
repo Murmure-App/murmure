@@ -112,6 +112,8 @@ fn bar(done: u64, total: u64) -> String {
 pub enum Ended {
     /// The peer closed the stream.
     PeerHungUp,
+    /// The peer typed `/bye`: the call is over, the connection is not.
+    PeerLeft,
     /// We did, with `/bye`.
     WeHungUp,
     /// They would not take the call.
@@ -126,7 +128,7 @@ impl Ended {
     /// What to tell the operator, using the name they know the peer by.
     pub fn describe(self, peer: &str) -> String {
         match self {
-            Ended::PeerHungUp => format!("{peer} hung up"),
+            Ended::PeerHungUp | Ended::PeerLeft => format!("{peer} hung up"),
             Ended::Declined => format!("{peer} is not taking the call"),
             Ended::WeHungUp | Ended::Quit => "you hung up".to_owned(),
             Ended::InputClosed => "input closed".to_owned(),
@@ -552,6 +554,15 @@ pub async fn run(
                     // Not a hang-up: they never picked up. The connection is
                     // untouched and still worth keeping.
                     Some(Ok(Message::CallDecline)) => break Ended::Declined,
+                    // They left. Same as the stream closing below: a direct
+                    // transfer still running on its own socket is waited for.
+                    Some(Ok(Message::HangUp)) => {
+                        if direct_task.as_ref().is_some_and(|t| !t.is_finished()) {
+                            leaving.get_or_insert(Ended::PeerLeft);
+                            continue;
+                        }
+                        break Ended::PeerLeft;
+                    }
                     // Handled here rather than in `handle` because both change
                     // what the loop itself does with the next line. The
                     // bookkeeping below is skipped for this one turn and is
@@ -694,7 +705,11 @@ pub async fn run(
     };
 
     // Nothing is torn down here. The link belongs to the caller and outlives
-    // this call — that is the point of it being borrowed.
+    // this call — that is the point of it being borrowed. Which is exactly why
+    // the other side has to be told: on the link, nothing has ended.
+    if matches!(ended, Ended::WeHungUp | Ended::InputClosed) {
+        let _ = outbox.send(Message::HangUp).await;
+    }
 
     if let Some(r) = receiving {
         screen.system(format!(
@@ -787,6 +802,7 @@ async fn handle(
         | Message::PresenceYes
         | Message::PresenceNo
         | Message::CallDecline
+        | Message::HangUp
         | Message::Recording(_)
         | Message::DontRecord => {}
 
@@ -1535,7 +1551,11 @@ mod tests {
             &mut link, peer, Vec::new(), incoming_dir, lines, None, &mut objected, screen,
         )
         .await;
-        let closed = link.close(matches!(talked, Ok(Ended::PeerHungUp))).await;
+        // Tests close the link after the call, which `main` never does, so the
+        // `HangUp` a `/bye` sends can meet a stream the peer already shut.
+        let closed = link
+            .close(matches!(talked, Ok(Ended::PeerHungUp | Ended::PeerLeft | Ended::WeHungUp | Ended::InputClosed)))
+            .await;
         talked.and_then(|ended| closed.map(|()| ended))
     }
 
@@ -1791,7 +1811,7 @@ mod tests {
             Link::open(br.compat(), bw.compat_write(), &two, None)
         );
         let mut mine = mine.unwrap();
-        let theirs = theirs.unwrap();
+        let mut theirs = theirs.unwrap();
 
         let (keys, mut lines) = mpsc::channel::<crate::ui::Typed>(4);
         let (screen, mut updates) = crate::ui::channel();
@@ -1834,6 +1854,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ended, Ended::WeHungUp);
+        // The link outlives the call, so the other side has to be told.
+        assert!(matches!(theirs.inbox.recv().await, Some(Ok(Message::HangUp))));
 
         drop(screen);
         let seen = collect.await.unwrap();
@@ -1842,6 +1864,39 @@ mod tests {
         assert!(first.is_some(), "the announcing frame must reach the screen");
         assert!(first < then, "and must reach it before anything said after");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Their `/bye` ends our side of the call too, as a hang-up — and leaves
+    /// the connection up, since nothing about it has ended.
+    #[tokio::test]
+    async fn their_bye_ends_the_call_here() {
+        let dir = scratch("their-bye");
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        let (one, two) = (
+            crate::identity::Identity::for_test([1u8; 32]),
+            crate::identity::Identity::for_test([2u8; 32]),
+        );
+        let (mine, theirs) = tokio::join!(
+            Link::open(ar.compat(), aw.compat_write(), &one, Some(two.onion_address())),
+            Link::open(br.compat(), bw.compat_write(), &two, None)
+        );
+        let (mut mine, theirs) = (mine.unwrap(), theirs.unwrap());
+        let (_keys, mut lines) = mpsc::channel::<crate::ui::Typed>(4);
+        let (screen, _updates) = crate::ui::channel();
+
+        theirs.outbox.send(Message::HangUp).await.unwrap();
+        let mut objected = false;
+        let ended = run(
+            &mut mine, "bob", vec![Message::Text("salut".into())], &dir, &mut lines, None,
+            &mut objected, &screen,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ended, Ended::PeerLeft);
+        assert_eq!(ended.describe("bob"), "bob hung up");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

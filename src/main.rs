@@ -564,6 +564,15 @@ async fn serve(
                     Err(e) => screen.error(format!("{e:#}")),
                 }
             }
+            // A caller who gave up before we answered.
+            Event::Spoke(Heard::Frame(peer, Message::HangUp)) => {
+                if ringing.as_ref().is_some_and(|r| r.peer == peer) {
+                    let name = name_for(book, &peer);
+                    ringing = None;
+                    screen.system(format!("-- {name} stopped calling --"));
+                    screen.status("listening");
+                }
+            }
             // Somebody we are already connected to has started talking. The
             // frame *is* the call arriving — there is no dial to notice and
             // nothing else to announce it.

@@ -41,7 +41,7 @@ use std::sync::Mutex;
 /// is young enough that maintaining two wire formats would cost more than
 /// telling two people to run the same build, and a version that is refused
 /// loudly is worth more than one that half-works.
-pub const VERSION: u16 = 9;
+pub const VERSION: u16 = 10;
 
 /// Sent before anything else, so that a stream carrying something other than
 /// murmure fails as itself rather than as a nonsensical version number.
@@ -510,6 +510,9 @@ pub enum Message {
     /// the same as every other request not to repeat something. It is here
     /// because the alternative is that the objection has nowhere to go at all.
     DontRecord,
+    /// "I have left this call." The connection stays up — it outlives the
+    /// call — so without this the other side goes on typing to nobody.
+    HangUp,
 }
 
 impl Message {
