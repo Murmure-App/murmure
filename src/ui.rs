@@ -119,6 +119,15 @@ pub enum Update {
     InCall(Option<String>),
     /// Put this on the system clipboard.
     Clipboard(String),
+    /// The contact book's names, for Tab completion. Sent on startup and
+    /// whenever `/add` or `/forget` changes it — the UI has no other way to
+    /// know a name exists, since it never sees the book itself.
+    Contacts(Vec<String>),
+    /// Raw terminal bytes that draw an inline image (built by
+    /// [`crate::image::encode`]) — leave the alternate screen, write them,
+    /// wait for a key, come back. See `src/image.rs` for why this cannot go
+    /// through [`Self::Line`] like everything else on screen.
+    ShowImage(Vec<u8>),
 }
 
 /// A handle for putting lines on screen from anywhere in the program.
@@ -204,6 +213,17 @@ impl Screen {
     /// reply to wait for, so nothing here can tell whether it worked.
     pub fn copy(&self, text: impl Into<String>) {
         let _ = self.0.send(Update::Clipboard(text.into()));
+    }
+
+    /// Tell the UI the contact book's current names, for Tab completion.
+    pub fn set_contacts(&self, names: Vec<String>) {
+        let _ = self.0.send(Update::Contacts(names));
+    }
+
+    /// Show an inline image: `escape` is the already-built terminal protocol
+    /// bytes from [`crate::image::encode`].
+    pub fn show_image(&self, escape: Vec<u8>) {
+        let _ = self.0.send(Update::ShowImage(escape));
     }
 }
 
@@ -352,6 +372,34 @@ impl Typed {
     }
 }
 
+/// Every verb `/help` documents, for Tab completion.
+///
+/// Kept here rather than derived from the command dispatch in `main.rs` and
+/// `chat.rs`: those match on `&str` literals scattered across two modules and
+/// several `match` arms, and this crate has no macro that would turn that into
+/// a list without adding one. A list that drifts from the real verbs is caught
+/// the same way an out-of-date `/help` line would be — by reading it.
+const COMMANDS: &[&str] = &[
+    "/add", "/tell", "/call", "/cancel", "/answer", "/decline", "/presence", "/contacts",
+    "/forget", "/copy", "/history", "/search", "/view", "/help", "/quit", "/send", "/direct",
+    "/accept", "/refuse", "/bye",
+];
+
+/// The longest prefix every string in `of` starts with. Empty if `of` is empty.
+fn longest_common_prefix(of: &[&str]) -> String {
+    let Some(first) = of.first() else { return String::new() };
+    let mut len = first.chars().count();
+    for other in &of[1..] {
+        len = first
+            .chars()
+            .zip(other.chars())
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(len);
+    }
+    first.chars().take(len).collect()
+}
+
 /// One thing on the input line.
 ///
 /// A dropped file is a single item, not the 60-odd characters of its path: the
@@ -460,6 +508,9 @@ struct App {
     /// box's title, so the question "where does Enter send this" is answered
     /// where the answer is needed, next to the cursor.
     peer: Option<String>,
+    /// The contact book's names, kept only for Tab completion. See
+    /// [`Update::Contacts`] for why the UI is told rather than asking.
+    contacts: Vec<String>,
 }
 
 impl App {
@@ -481,6 +532,7 @@ impl App {
             input_scroll: 0,
             unseen: 0,
             peer: None,
+            contacts: Vec::new(),
         }
     }
 
@@ -581,6 +633,54 @@ impl App {
         } else {
             self.cursor.saturating_sub(1)
         };
+    }
+
+    /// Complete the word the cursor sits at the end of, against commands if it
+    /// is the line's first word and starts with `/`, or against contact names
+    /// otherwise.
+    ///
+    /// Bash-style, not a menu: one unambiguous match completes fully with a
+    /// trailing space; several extend to their longest common prefix and no
+    /// further, so a second Tab after that is "there is more than one" rather
+    /// than silence. Nothing cycles — a dropdown would need its own state
+    /// machine and its own draw code for a line this short.
+    fn complete(&mut self) {
+        let mut start = self.cursor;
+        while start > 0 && matches!(&self.items[start - 1], Item::Char(c) if !c.is_whitespace()) {
+            start -= 1;
+        }
+        let word: String = self.items[start..self.cursor]
+            .iter()
+            .map(|item| match item {
+                Item::Char(c) => *c,
+                Item::File(_) => unreachable!("the scan above stops before a File item"),
+            })
+            .collect();
+        if word.is_empty() {
+            return;
+        }
+
+        let candidates: Vec<&str> = if start == 0 {
+            if !word.starts_with('/') {
+                return;
+            }
+            COMMANDS.iter().copied().filter(|c| c.starts_with(word.as_str())).collect()
+        } else {
+            self.contacts.iter().map(String::as_str).filter(|n| n.starts_with(word.as_str())).collect()
+        };
+
+        let completed = match candidates.len() {
+            0 => return,
+            1 => Some(format!("{} ", candidates[0])),
+            _ => {
+                let prefix = longest_common_prefix(&candidates);
+                (prefix.len() > word.len()).then_some(prefix)
+            }
+        };
+        let Some(completed) = completed else { return };
+
+        self.items.splice(start..self.cursor, completed.chars().map(Item::Char));
+        self.cursor = start + completed.chars().count();
     }
 
     /// What the input box shows, in full.
@@ -826,6 +926,10 @@ async fn event_loop(
                         copy_to_clipboard(&text);
                         app.flash(format!("copied {} chars", text.chars().count()));
                     }
+                    Some(Update::Contacts(names)) => app.contacts = names,
+                    Some(Update::ShowImage(escape)) => {
+                        show_image_blocking(terminal, &mut keys, &escape).await?;
+                    }
                     // The program is shutting down.
                     None => return Ok(()),
                 }
@@ -840,6 +944,10 @@ async fn event_loop(
                         Update::Clipboard(text) => {
                             copy_to_clipboard(&text);
                             app.flash(format!("copied {} chars", text.chars().count()));
+                        }
+                        Update::Contacts(names) => app.contacts = names,
+                        Update::ShowImage(escape) => {
+                            show_image_blocking(terminal, &mut keys, &escape).await?;
                         }
                     }
                 }
@@ -873,6 +981,46 @@ async fn event_loop(
 
         terminal.draw(|frame| draw(frame, &mut app)).context("drawing")?;
     }
+}
+
+/// Leave the alternate screen, write `escape` straight to the terminal, wait
+/// for a keypress, then come back.
+///
+/// This is the one place murmure writes to the terminal outside ratatui's own
+/// diffed draw — see the module doc on [`crate::image`] for why an inline
+/// image cannot go through a normal [`Update::Line`] instead. `terminal.clear`
+/// on the way back forces a full redraw next frame: ratatui's diff otherwise
+/// assumes the screen still shows what it last drew, which is not true once
+/// something else has written to it.
+async fn show_image_blocking(
+    terminal: &mut ratatui::DefaultTerminal,
+    keys: &mut EventStream,
+    escape: &[u8],
+) -> Result<()> {
+    use std::io::Write as _;
+
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)
+        .context("leaving the alternate screen")?;
+    crossterm::terminal::disable_raw_mode().context("leaving raw mode")?;
+
+    let mut out = std::io::stdout();
+    out.write_all(escape).context("writing the image")?;
+    write!(out, "\r\n\r\npress any key to return to murmure...").context("writing the image")?;
+    out.flush().context("writing the image")?;
+
+    loop {
+        match keys.next().await {
+            Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => break,
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => return Err(e).context("reading a terminal event"),
+            None => break,
+        }
+    }
+
+    crossterm::terminal::enable_raw_mode().context("re-entering raw mode")?;
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
+        .context("re-entering the alternate screen")?;
+    terminal.clear().context("redrawing after showing an image")
 }
 
 /// Handle one key. Returns `true` when the operator wants out.
@@ -924,6 +1072,7 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<Typed>) -
         KeyCode::Up => app.scroll(1),
         KeyCode::Down => app.scroll(-1),
         KeyCode::Char(c) => app.insert(c),
+        KeyCode::Tab => app.complete(),
         // Editing inside the line, not just at its end. A 62-character address
         // with one wrong character used to mean clearing the lot and starting
         // over.
@@ -1658,6 +1807,59 @@ mod tests {
             app.insert(c);
         }
         app
+    }
+
+    /// An unambiguous command completes fully, with a trailing space.
+    #[test]
+    fn tab_completes_a_unique_command() {
+        let mut app = typed("/hel");
+        app.complete();
+        assert_eq!(app.input_display(), "/help ");
+        assert_eq!(app.cursor, app.items.len());
+    }
+
+    /// Several commands share a prefix: Tab extends to what they agree on and
+    /// stops, rather than guessing which one was meant.
+    #[test]
+    fn tab_extends_to_the_longest_common_prefix_on_ambiguity() {
+        let mut app = typed("/c");
+        app.complete();
+        // "/call", "/cancel", "/contacts" — agree on "/c" only.
+        assert_eq!(app.input_display(), "/c");
+
+        let mut app = typed("/co");
+        app.complete();
+        // "/contacts" and "/copy" agree up to "/co", nothing further.
+        assert_eq!(app.input_display(), "/co");
+    }
+
+    /// A word that is not the line's first is completed against contact names,
+    /// not commands — `/tell ali<Tab>` is filling in a name, not a verb.
+    #[test]
+    fn tab_completes_a_contact_name_after_the_first_word() {
+        let mut app = typed("/tell ali");
+        app.contacts = vec!["alice".to_owned(), "bob".to_owned()];
+        app.complete();
+        assert_eq!(app.input_display(), "/tell alice ");
+    }
+
+    /// Nothing to complete, or nothing that matches, leaves the line alone —
+    /// Tab is never destructive.
+    #[test]
+    fn tab_does_nothing_on_no_match_or_an_empty_word() {
+        let mut app = typed("/nope");
+        app.complete();
+        assert_eq!(app.input_display(), "/nope");
+
+        let mut app = typed("bonjour ");
+        app.complete();
+        assert_eq!(app.input_display(), "bonjour ");
+
+        // Plain text never completes against commands, even if it looks like
+        // one word could be — only a line starting with '/' does.
+        let mut app = typed("hel");
+        app.complete();
+        assert_eq!(app.input_display(), "hel");
     }
 
     /// The cursor moves inside the line, and edits land where it is.

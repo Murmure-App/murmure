@@ -23,7 +23,8 @@ use futures::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use tor_hscrypto::pk::{HsId, HsIdKey};
-use tor_llcrypto::pk::ed25519;
+use tor_llcrypto::pk::{curve25519, ed25519};
+use zeroize::Zeroizing;
 
 use crate::identity::Identity;
 
@@ -38,7 +39,7 @@ use crate::identity::Identity;
 /// is young enough that maintaining two wire formats would cost more than
 /// telling two people to run the same build, and a version that is refused
 /// loudly is worth more than one that half-works.
-pub const VERSION: u16 = 7;
+pub const VERSION: u16 = 8;
 
 /// Sent before anything else, so that a stream carrying something other than
 /// murmure fails as itself rather than as a nonsensical version number.
@@ -55,16 +56,25 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Domain separator for the signed challenge. Frozen: changing it invalidates
 /// every signature both sides would compute, which is a version bump.
-const AUTH_CONTEXT: &[u8] = b"murmure-auth-v2";
+const AUTH_CONTEXT: &[u8] = b"murmure-auth-v3";
 
-/// The opening bytes: magic, version, who we claim to be, and a challenge.
-const HELLO_LEN: usize = 7 + 2 + 32 + 32;
+/// The opening bytes: magic, version, who we claim to be, a challenge, and a
+/// fresh Diffie-Hellman public key for this connection alone.
+const HELLO_LEN: usize = 7 + 2 + 32 + 32 + 32;
 
-/// Agree on a version, then prove to each other who is on the line.
+/// KDF context for the root key a connection's ephemeral DH agreement seeds.
+///
+/// Frozen for the same reason [`AUTH_CONTEXT`] is: changing it changes every
+/// root key both sides would compute, which is a version bump.
+const RATCHET_ROOT_CONTEXT: &str = "murmure 2026 ratchet root";
+
+/// Agree on a version, prove to each other who is on the line, and seed a
+/// ratchet root key neither of us could have predicted alone.
 ///
 /// Returns the peer's `.onion` identity, **verified** — they signed our
 /// challenge with the key that address is derived from, so it is theirs or
-/// nobody's.
+/// nobody's — and a root key derived from a Diffie-Hellman agreement made
+/// with keys generated fresh for this connection and never written anywhere.
 ///
 /// # Why identity has to be proved here
 ///
@@ -78,13 +88,23 @@ const HELLO_LEN: usize = 7 + 2 + 32 + 32;
 ///
 /// The proof is cheap because the address already *is* an ed25519 public key.
 /// There is no certificate, no third party and no new key: each side signs
-/// `context || signer || verifier || the verifier's nonce` with the seed it
-/// already owns, and the address it claims is the key that check runs against.
+/// `context || signer || verifier || the verifier's nonce || the signer's
+/// ephemeral DH key` with the seed it already owns, and the address it claims
+/// is the key that check runs against.
 ///
 /// The nonce is what stops a recording of yesterday's handshake from being
 /// replayed today. Naming both parties in a fixed order is what stops our own
 /// challenge being reflected back at us: the bytes we would have to verify are
 /// not the bytes we signed.
+///
+/// # Why the ephemeral key rides inside the signature
+///
+/// Without it, a peer's proof of identity and their offered DH key are two
+/// separate claims — an active man in the middle could let the identity proof
+/// through unmodified while substituting their own ephemeral key, and neither
+/// side would notice, because nothing ties one to the other. Folding the
+/// ephemeral key into what gets signed means accepting the proof also accepts
+/// that specific key: there is no room left to swap it in transit.
 ///
 /// # Why the header is written by hand
 ///
@@ -117,7 +137,7 @@ pub async fn handshake<R, W>(
     w: &mut W,
     me: &Identity,
     dialled: Option<HsId>,
-) -> Result<HsId>
+) -> Result<(HsId, Zeroizing<[u8; 32]>)>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -125,18 +145,27 @@ where
     let my_id = me.onion_address();
     let mut my_nonce = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut my_nonce);
+    // A `StaticSecret` used exactly once and dropped at the end of this
+    // function — there is no `EphemeralSecret` here because its RNG bound
+    // wants rand_core 0.10 and the rest of murmure is on rand 0.8. Filling
+    // the bytes ourselves is what `my_nonce` above already does.
+    let mut my_ephemeral_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut my_ephemeral_bytes);
+    let my_ephemeral_secret = curve25519::StaticSecret::from(my_ephemeral_bytes);
+    let my_ephemeral_public = curve25519::PublicKey::from(&my_ephemeral_secret);
 
     let mut ours = [0u8; HELLO_LEN];
     ours[..7].copy_from_slice(MAGIC);
     ours[7..9].copy_from_slice(&VERSION.to_le_bytes());
     ours[9..41].copy_from_slice(&id_bytes(&my_id)?);
-    ours[41..].copy_from_slice(&my_nonce);
+    ours[41..73].copy_from_slice(&my_nonce);
+    ours[73..].copy_from_slice(my_ephemeral_public.as_bytes());
     w.write_all(&ours).await.context("saying who we are")?;
     w.flush().await.context("saying who we are")?;
 
     // Read in two bites, and the split is deliberate. Whatever else connects to
     // this port — a scanner, a browser, an older murmure — nine bytes is enough
-    // to say what it is. Waiting for all seventy-three first would report a
+    // to say what it is. Waiting for the whole hello first would report a
     // short HTTP probe as a truncated read instead of as something that does
     // not speak murmure.
     let mut head = [0u8; 9];
@@ -169,7 +198,9 @@ where
     let their_key = ed25519::PublicKey::from_bytes(&their_id_bytes)
         .map_err(|_| anyhow::anyhow!("the address the other side claims is not a valid key"))?;
     let their_id = HsIdKey::from(their_key).id();
-    let their_nonce: [u8; 32] = theirs[32..].try_into().expect("fixed slice");
+    let their_nonce: [u8; 32] = theirs[32..64].try_into().expect("fixed slice");
+    let their_ephemeral_bytes: [u8; 32] = theirs[64..96].try_into().expect("fixed slice");
+    let their_ephemeral_public = curve25519::PublicKey::from(their_ephemeral_bytes);
     if dialled.is_some_and(|d| d != their_id) {
         bail!("the far side claims a different key than the one dialled");
     }
@@ -179,8 +210,16 @@ where
         (ANSWERER, CALLER)
     };
 
-    // We sign the challenge they sent; they sign the one we sent.
-    let signed = me.sign(&challenge(my_role, &id_bytes(&my_id)?, &their_id_bytes, &their_nonce));
+    // We sign the challenge they sent, with our role and our own ephemeral key
+    // folded in; they sign the one we sent, with theirs. One signed message
+    // covers all of it, so no field can be swapped under a valid proof.
+    let signed = me.sign(&challenge(
+        my_role,
+        &id_bytes(&my_id)?,
+        &their_id_bytes,
+        &their_nonce,
+        my_ephemeral_public.as_bytes(),
+    ));
     w.write_all(&signed.to_bytes())
         .await
         .context("proving who we are")?;
@@ -193,7 +232,13 @@ where
     }
     their_key
         .verify(
-            &challenge(their_role, &their_id_bytes, &id_bytes(&my_id)?, &my_nonce),
+            &challenge(
+                their_role,
+                &their_id_bytes,
+                &id_bytes(&my_id)?,
+                &my_nonce,
+                &their_ephemeral_bytes,
+            ),
             &ed25519::Signature::from_bytes(&proof),
         )
         .map_err(|_| {
@@ -203,7 +248,10 @@ where
             )
         })?;
 
-    Ok(their_id)
+    let shared = my_ephemeral_secret.diffie_hellman(&their_ephemeral_public);
+    let root_key = Zeroizing::new(blake3::derive_key(RATCHET_ROOT_CONTEXT, shared.as_bytes()));
+
+    Ok((their_id, root_key))
 }
 
 /// Signer roles, part of what is signed. See [`handshake`].
@@ -211,18 +259,26 @@ const CALLER: u8 = 1;
 const ANSWERER: u8 = 2;
 
 /// The bytes a signer commits to: whether they dialled or answered, who they
-/// are, who they are talking to, and the challenge that side chose.
+/// are, who they are talking to, the challenge that side chose, and the DH key
+/// the signer is offering for this connection.
 ///
 /// Order is load-bearing. `signer` and `verifier` swap places between the two
 /// sides, so a signature made in one direction cannot be verified in the other
 /// — which is what a reflection attack would need.
-fn challenge(role: u8, signer: &[u8; 32], verifier: &[u8; 32], nonce: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(AUTH_CONTEXT.len() + 97);
+fn challenge(
+    role: u8,
+    signer: &[u8; 32],
+    verifier: &[u8; 32],
+    nonce: &[u8; 32],
+    signer_ephemeral: &[u8; 32],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(AUTH_CONTEXT.len() + 129);
     msg.extend_from_slice(AUTH_CONTEXT);
     msg.push(role);
     msg.extend_from_slice(signer);
     msg.extend_from_slice(verifier);
     msg.extend_from_slice(nonce);
+    msg.extend_from_slice(signer_ephemeral);
     msg
 }
 
@@ -784,13 +840,13 @@ mod tests {
                     noise.bytes(n)
                 }
                 // Correct magic and version, then noise where an identity, a
-                // challenge and a signature should be. This is the path that
-                // reaches key parsing and signature verification with bytes
-                // chosen by somebody else.
+                // challenge, an ephemeral DH key and a signature should be.
+                // This is the path that reaches key parsing and signature
+                // verification with bytes chosen by somebody else.
                 _ => {
                     let mut wire = MAGIC.to_vec();
                     wire.extend_from_slice(&VERSION.to_le_bytes());
-                    wire.extend(noise.bytes(64 + 64));
+                    wire.extend(noise.bytes(96 + 64));
                     wire
                 }
             };
@@ -804,14 +860,41 @@ mod tests {
         }
     }
 
+    /// Both sides of a real handshake end up with the same root key, and a
+    /// second handshake between the same two identities ends up with a
+    /// different one — which is the entire point of generating the DH keys
+    /// fresh instead of deriving them from the seed.
+    #[tokio::test]
+    async fn both_sides_derive_the_same_root_key_and_a_fresh_one_next_time() {
+        async fn run_once() -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+            let (a, b) = tokio::io::duplex(4096);
+            let (ar, aw) = tokio::io::split(a);
+            let (br, bw) = tokio::io::split(b);
+            let (mut ar, mut aw) = (ar.compat(), aw.compat_write());
+            let (mut br, mut bw) = (br.compat(), bw.compat_write());
+            let (alice_id, bob_id) = (me(), Identity::for_test([2u8; 32]));
+            let (alice, bob) = tokio::join!(
+                handshake(&mut ar, &mut aw, &alice_id, Some(bob_id.onion_address())),
+                handshake(&mut br, &mut bw, &bob_id, None)
+            );
+            (alice.unwrap().1, bob.unwrap().1)
+        }
+
+        let (a1, b1) = run_once().await;
+        assert_eq!(*a1, *b1, "the same agreement must yield the same root key");
+
+        let (a2, _) = run_once().await;
+        assert_ne!(*a1, *a2, "a fresh handshake must not reuse the last root key");
+    }
+
     /// The opening a peer on `version` with this identity would send. The
-    /// challenge is left zero: a test that never gets as far as the signature
-    /// does not care what it was.
+    /// nonce and ephemeral DH key are left zero: a test that never gets as
+    /// far as the signature does not care what they were.
     fn hello(version: u16, who: &Identity) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
         out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&id_bytes(&who.onion_address()).unwrap());
-        out.extend_from_slice(&[0u8; 32]);
+        out.extend_from_slice(&[0u8; 64]);
         out
     }
 
@@ -824,9 +907,11 @@ mod tests {
         // No proof follows, so this stops at the signature — which is far
         // enough to prove the version and the identity were both accepted.
         let _ = handshake(&mut r.as_slice(), &mut sent, &me(), None).await;
+        // Trims the nonce and ephemeral DH key: both are random, so only the
+        // fixed prefix — magic, version, address — can be compared.
         assert_eq!(
-            &sent[..hello(VERSION, &me()).len() - 32],
-            &hello(VERSION, &me())[..hello(VERSION, &me()).len() - 32],
+            &sent[..hello(VERSION, &me()).len() - 64],
+            &hello(VERSION, &me())[..hello(VERSION, &me()).len() - 64],
             "we announced our version and our address"
         );
     }
@@ -945,7 +1030,7 @@ mod tests {
             m_to_bob.read_exact(&mut bob_hello).await.unwrap();
             // To Bob: "I am Alice". To Alice: "I am Bob", with Bob's challenge.
             let mut to_bob = hello(VERSION, &alice);
-            to_bob[41..].copy_from_slice(&[9u8; 32]);
+            to_bob[41..73].copy_from_slice(&[9u8; 32]);
             m_to_bob.write_all(&to_bob).await.unwrap();
             let mut to_alice = hello(VERSION, &bob);
             to_alice[41..].copy_from_slice(&bob_hello[41..]);

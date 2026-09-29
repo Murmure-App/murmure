@@ -57,6 +57,7 @@ mod contacts;
 mod files;
 mod history;
 mod identity;
+mod image;
 mod link;
 mod onion;
 mod outbox;
@@ -178,6 +179,35 @@ async fn run(run_dir: &Path) -> Result<()> {
 
     // ---- identity and book ---------------------------------------------
     let seed_path = run_dir.join("identity.seed");
+
+    // A one-shot utility mode rather than a real subcommand: this project has
+    // no argv parser, and env vars are how every other setting works here
+    // (MURMURE_DIR, MURMURE_INCOMING_QUOTA). Runs and exits before Tor, the
+    // TUI, or anything else starts — the terminal is still a plain terminal,
+    // which is what the passphrase prompt needs.
+    if std::env::var_os("MURMURE_ENCRYPT_IDENTITY").is_some() {
+        Identity::encrypt_at_rest(&seed_path)?;
+        println!("identity seed at {} is now passphrase-encrypted.", seed_path.display());
+        return Ok(());
+    }
+    if std::env::var_os("MURMURE_DECRYPT_IDENTITY").is_some() {
+        Identity::decrypt_at_rest(&seed_path)?;
+        println!("identity seed at {} is now stored in the clear.", seed_path.display());
+        return Ok(());
+    }
+    if std::env::var_os("MURMURE_EXPORT_MNEMONIC").is_some() {
+        let phrase = Identity::export_mnemonic(&seed_path)?;
+        println!("{}", *phrase);
+        println!();
+        println!("write these 24 words on paper, in order. anyone who has them owns this identity.");
+        return Ok(());
+    }
+    if let Ok(phrase) = std::env::var("MURMURE_RESTORE_MNEMONIC") {
+        Identity::restore_from_mnemonic(&seed_path, &phrase)?;
+        println!("identity restored at {} from the recovery phrase.", seed_path.display());
+        return Ok(());
+    }
+
     let existed = seed_path.exists();
     // Shared rather than owned: a background dial runs in its own task and
     // needs the seed to prove who it is. One copy, not one per dial.
@@ -202,6 +232,7 @@ async fn run(run_dir: &Path) -> Result<()> {
         format!("{} ", onion::fingerprint(&my_address)),
     ));
 
+    screen.set_contacts(book.iter().map(|(name, _)| name.to_owned()).collect());
     screen.system(format!(
         "identity {}, {} contact{}",
         if existed { "loaded" } else { "generated" },
@@ -967,6 +998,7 @@ async fn command(
             let first = book.len() == 0;
             book.add(name, address, key)?;
             live.resync(book)?;
+            screen.set_contacts(book.iter().map(|(name, _)| name.to_owned()).collect());
             screen.system(format!("filed {name} as {}", onion::fingerprint(address)));
             if first {
                 screen.system(
@@ -984,6 +1016,7 @@ async fn command(
             let address = book.address_of(name).and_then(|a| a.parse::<HsId>().ok());
             if book.remove(name)? {
                 live.resync(book)?;
+                screen.set_contacts(book.iter().map(|(name, _)| name.to_owned()).collect());
                 // Somebody forgotten is somebody we stop holding a connection
                 // to. Leaving one open would keep answering for a name that no
                 // longer exists.
@@ -1130,6 +1163,49 @@ async fn command(
                     bail!("/history {other}? try /history, /history on, /history off, /history no <name>")
                 }
             }
+        }
+        "/search" => {
+            let term = line.split_once(char::is_whitespace).map(|(_, rest)| rest.trim()).unwrap_or("");
+            if term.is_empty() {
+                bail!("usage: /search <term>");
+            }
+            if !history.on() {
+                screen.system("history is off — nothing is kept to search. /history on");
+            }
+            let lines = history.search(term, history::SHOWN);
+            if lines.is_empty() && history.on() {
+                screen.system("(no match)");
+            }
+            for line in lines {
+                let who = match book.name_of(&line.with) {
+                    Some(name) if line.mine => format!("you → {name}"),
+                    Some(name) => name.to_owned(),
+                    None => onion::fingerprint(&line.with),
+                };
+                screen.say(
+                    if line.mine { Kind::Mine } else { Kind::Theirs },
+                    format!("[{}] {who}> {}", outbox::how_long_ago(line.at), line.body),
+                );
+            }
+        }
+        "/view" => {
+            let arg = line.split_once(char::is_whitespace).map(|(_, rest)| rest.trim()).unwrap_or("");
+            if arg.is_empty() {
+                bail!("usage: /view <path> — the path is printed when a file arrives (\"-- received ... --\")");
+            }
+            let path = std::path::Path::new(arg);
+            if !image::is_image(path) {
+                bail!("{arg} does not look like an image murmure can show (png, jpg, jpeg, gif, bmp)");
+            }
+            let Some(protocol) = image::supported() else {
+                bail!(
+                    "this terminal does not support inline images \
+                     (needs Kitty, WezTerm, Ghostty, or iTerm2)"
+                );
+            };
+            let bytes = std::fs::read(path).with_context(|| format!("reading {arg}"))?;
+            let escape = image::encode(protocol, &bytes).map_err(|e| anyhow::anyhow!(e))?;
+            screen.show_image(escape);
         }
         "/tell" => {
             let Some(name) = parts.next() else {
@@ -1427,6 +1503,9 @@ fn help(screen: &Screen) {
         "  /history on   /history off    start or stop keeping a record. off by default;",
         "                                'off' erases what is there, and both tell your contacts",
         "  /history no <name>            ask them not to write down what you say",
+        "  /search <term>                find kept lines containing it, across every conversation",
+        "  /view <path>                  show a received image inline (needs Kitty, WezTerm,",
+        "                                Ghostty or iTerm2) — the path is printed when it arrives",
         "  /help                         this",
         "  /quit                         leave, hanging up first if you are in a call",
         "during a call:",
@@ -1444,6 +1523,7 @@ fn help(screen: &Screen) {
         "  Ctrl-E                        jump back to the newest line",
         "  left / right / Home / End     move inside what you are typing",
         "                                a dropped file counts as one step",
+        "  Tab                           complete a command or a contact's name",
         "  Ctrl-V                        paste (no Shift needed)",
         "  Ctrl-U                        clear the input",
         "  Ctrl-C                        leave, from anywhere",

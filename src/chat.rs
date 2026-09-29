@@ -1285,6 +1285,24 @@ async fn accept(
 
     let offset = files::resume_offset(incoming_dir, &offer.hash, offer.size);
 
+    // Checked once, here, before either transfer path opens a file: a partial
+    // already on disk counts as used space (its remaining bytes are what this
+    // transfer still adds), so gating both branches from one place is what
+    // keeps that arithmetic in a single spot rather than duplicated per path.
+    let used = files::dir_size(incoming_dir);
+    let remaining = offer.size.saturating_sub(offset);
+    let quota = files::incoming_quota();
+    if used.saturating_add(remaining) > quota {
+        bail!(
+            "accepting {:?} would put {} in {}, over the {} quota \
+             (raise it with MURMURE_INCOMING_QUOTA=<bytes>)",
+            offer.name,
+            files::human(used + remaining),
+            incoming_dir.display(),
+            files::human(quota)
+        );
+    }
+
     if wanted_direct {
         // A resumed direct transfer would have to tell the sender where to
         // start *and* stream from there; the stream carries no offsets, so the
@@ -1642,7 +1660,7 @@ mod tests {
             let mut bob_r = bob_r.compat();
             let mut bob_w = bob_w.compat_write();
             let bob = crate::identity::Identity::for_test([2u8; 32]);
-            let who = proto::handshake(&mut bob_r, &mut bob_w, &bob, None).await.unwrap();
+            let (who, _root_key) = proto::handshake(&mut bob_r, &mut bob_w, &bob, None).await.unwrap();
             // And the hand-rolled side learns who called, from the proof rather
             // than from anything the transport said.
             assert_eq!(who, crate::identity::Identity::for_test([1u8; 32]).onion_address());
