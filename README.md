@@ -469,7 +469,7 @@ MURMURE_DIR=.murmure-b ./target/release/murmure
 
 ## Status
 
-**Beta — `0.1.0-beta.1`.** Not a first stable release, and the version will not
+**Beta — `0.1.0-beta.2`.** Not a first stable release, and the version will not
 lose its `-beta` because the code settles down. It loses it when someone other
 than the author has read the parts that matter, which has not happened. Until
 then the label is the honest one: usable, unverified.
