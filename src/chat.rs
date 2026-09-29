@@ -59,7 +59,7 @@ const REFRESH: std::time::Duration = std::time::Duration::from_millis(120);
 ///
 /// Owns the last-drawn instant so callers do not each reinvent the throttle;
 /// the direct tasks and the chunk pump all go through this.
-struct Progress {
+pub(crate) struct Progress {
     name: String,
     total: u64,
     verb: &'static str,
@@ -67,7 +67,7 @@ struct Progress {
 }
 
 impl Progress {
-    fn new(verb: &'static str, name: impl Into<String>, total: u64) -> Self {
+    pub(crate) fn new(verb: &'static str, name: impl Into<String>, total: u64) -> Self {
         Self {
             name: name.into(),
             total,
@@ -78,7 +78,7 @@ impl Progress {
     }
 
     /// Draw the bar if enough time has passed. `done` is bytes so far.
-    fn show(&mut self, done: u64, screen: &Screen) {
+    pub(crate) fn show(&mut self, done: u64, screen: &Screen) {
         if self.last.elapsed() < REFRESH {
             return;
         }
@@ -815,7 +815,12 @@ async fn handle(
         | Message::RoomLeave { .. }
         | Message::RoomRoster { .. }
         | Message::RoomHello { .. }
-        | Message::RoomSay { .. } => {}
+        | Message::RoomSay { .. }
+        | Message::RoomFile { .. }
+        | Message::RoomFetch { .. }
+        | Message::RoomChunk { .. }
+        | Message::RoomDone { .. }
+        | Message::RoomNoFile { .. } => {}
 
         // Outbox traffic, which belongs to the idle loop: it owns the sealed
         // queue and the delivery marks, and neither is a thing a conversation
@@ -1512,7 +1517,7 @@ fn classify(line: &str) -> Typed {
 ///
 /// ponytail: only the leading form, not `~user`. Nobody types the second one at
 /// a chat prompt.
-fn expand_home(path: &str) -> String {
+pub(crate) fn expand_home(path: &str) -> String {
     match path.strip_prefix("~/") {
         Some(rest) => match std::env::var_os("HOME") {
             Some(home) => Path::new(&home).join(rest).to_string_lossy().into_owned(),

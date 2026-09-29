@@ -41,7 +41,7 @@ use std::sync::Mutex;
 /// is young enough that maintaining two wire formats would cost more than
 /// telling two people to run the same build, and a version that is refused
 /// loudly is worth more than one that half-works.
-pub const VERSION: u16 = 11;
+pub const VERSION: u16 = 12;
 
 /// Sent before anything else, so that a stream carrying something other than
 /// murmure fails as itself rather than as a nonsensical version number.
@@ -566,6 +566,36 @@ pub enum Message {
         /// 64 bytes. A `Vec` because serde has no impl for arrays that long.
         sig: Vec<u8>,
     },
+    /// A file put in a room: signed and forwarded exactly like a line, and
+    /// moving no data. Whoever wants it asks whoever told them about it.
+    ///
+    /// The hash is what the author signed, so a file that reaches somebody
+    /// through a relay is checked against the author's word, not the relay's.
+    RoomFile {
+        room: RoomId,
+        key: [u8; 32],
+        seq: u64,
+        file: FileRef,
+        sig: Vec<u8>,
+    },
+    /// "Send me that file, from this byte." To whoever announced it to us —
+    /// its author, or the host that relayed the announcement and will relay
+    /// the bytes too.
+    RoomFetch {
+        room: RoomId,
+        hash: [u8; 32],
+        offset: u64,
+    },
+    /// Room file data, in order, from the offset asked for.
+    RoomChunk {
+        room: RoomId,
+        hash: [u8; 32],
+        data: Vec<u8>,
+    },
+    /// No more data for that file. The recipient checks the hash now.
+    RoomDone { room: RoomId, hash: [u8; 32] },
+    /// "I cannot give you that one" — gone, never had it, or the relay failed.
+    RoomNoFile { room: RoomId, hash: [u8; 32] },
 }
 
 impl Message {
@@ -584,9 +614,20 @@ impl Message {
                     body.len()
                 )
             }
-            Message::RoomSay { sig, .. } if sig.len() != 64 => {
+            Message::RoomSay { sig, .. } | Message::RoomFile { sig, .. } if sig.len() != 64 => {
                 bail!("a room signature is {} bytes, not 64", sig.len())
             }
+            Message::RoomFile { file, .. } if file.name.len() > MAX_NAME => bail!(
+                "filename is {} bytes, over the {MAX_NAME}-byte limit",
+                file.name.len()
+            ),
+            Message::RoomFile { file, .. } if file.size == 0 || file.size > crate::files::MAX_FILE => {
+                bail!("a room file of {} bytes is not one murmure carries", file.size)
+            }
+            Message::RoomChunk { data, .. } if data.is_empty() || data.len() > MAX_CHUNK => bail!(
+                "a room file chunk is {} bytes, outside 1 to {MAX_CHUNK}",
+                data.len()
+            ),
             Message::RoomInvite { name, .. } if name.len() > MAX_NAME => bail!(
                 "room name is {} bytes, over the {MAX_NAME}-byte limit",
                 name.len()

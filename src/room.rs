@@ -44,7 +44,7 @@ use safelog::DisplayRedacted as _;
 use tor_hscrypto::pk::HsId;
 use tor_llcrypto::pk::ed25519;
 
-use crate::proto::{MAX_MEMBERS, MAX_NAME, MAX_TEXT, Message, RoomId};
+use crate::proto::{FileRef, MAX_MEMBERS, MAX_NAME, MAX_TEXT, Message, RoomId};
 
 /// Is this a frame for [`Rooms::receive`]?
 pub fn is_room(msg: &Message) -> bool {
@@ -57,7 +57,31 @@ pub fn is_room(msg: &Message) -> bool {
             | Message::RoomRoster { .. }
             | Message::RoomHello { .. }
             | Message::RoomSay { .. }
+            | Message::RoomFile { .. }
+            | Message::RoomFetch { .. }
+            | Message::RoomChunk { .. }
+            | Message::RoomDone { .. }
+            | Message::RoomNoFile { .. }
     )
+}
+
+/// What a member puts in a room: something said, or a file.
+///
+/// Both are signed, numbered and forwarded the same way — a file announced in
+/// a room is a line that happens to point at bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Line {
+    Say(String),
+    File(FileRef),
+}
+
+impl Line {
+    fn into_message(self, room: RoomId, key: Key, seq: u64, sig: Vec<u8>) -> Message {
+        match self {
+            Line::Say(body) => Message::RoomSay { room, key, seq, body, sig },
+            Line::File(file) => Message::RoomFile { room, key, seq, file, sig },
+        }
+    }
 }
 
 /// A room key: the ed25519 public key a member signs their lines with.
@@ -100,6 +124,9 @@ pub enum Event {
     /// An invitation turned away on our behalf: we are already in a room.
     Busy { from: HsId, name: String },
     Said { who: Who, body: String },
+    /// A file was put in the room. `from` is the link it came over, and so the
+    /// one to ask for it.
+    Shared { who: Who, file: FileRef, from: HsId },
     Joined(Who),
     Left(Who),
     Declined(HsId),
@@ -368,35 +395,54 @@ impl Rooms {
 
     /// Say something to the room.
     pub fn say(&mut self, body: &str) -> anyhow::Result<Outcome> {
-        let Some(room) = self.room.as_mut() else {
-            anyhow::bail!("you are not in a room");
-        };
         if body.len() > MAX_TEXT {
             anyhow::bail!("that is {} bytes; a line is at most {MAX_TEXT}", body.len());
         }
+        self.post(Line::Say(body.to_owned()))
+    }
+
+    /// Put a file in the room: announce it, signed. No data moves until
+    /// somebody asks for it.
+    pub fn share(&mut self, file: FileRef) -> anyhow::Result<Outcome> {
+        self.post(Line::File(file))
+    }
+
+    fn post(&mut self, line: Line) -> anyhow::Result<Outcome> {
+        let me = self.me;
+        let Some(room) = self.room.as_mut() else {
+            anyhow::bail!("you are not in a room");
+        };
         room.next_seq += 1;
         let key = room.key();
         let seq = room.next_seq;
         let sig = room
             .signer
-            .sign(&signed(&room.id, &key, seq, body))
+            .sign(&signed(&room.id, &key, seq, &line))
             .to_bytes()
             .to_vec();
-        let say = Message::RoomSay {
-            room: room.id,
-            key,
-            seq,
-            body: body.to_owned(),
-            sig,
-        };
-        Ok(Outcome {
-            events: vec![Event::Said {
+        let event = match &line {
+            Line::Say(body) => Event::Said {
                 who: Who::Me,
-                body: body.to_owned(),
-            }],
-            send: room.targets().into_iter().map(|p| (p, say.clone())).collect(),
+                body: body.clone(),
+            },
+            Line::File(file) => Event::Shared {
+                who: Who::Me,
+                file: file.clone(),
+                from: me,
+            },
+        };
+        let msg = line.into_message(room.id, key, seq, sig);
+        Ok(Outcome {
+            events: vec![event],
+            send: room.targets().into_iter().map(|p| (p, msg.clone())).collect(),
             reach: Vec::new(),
         })
+    }
+
+    /// Is this peer one we have shown to be in the room we are in? The only
+    /// people a room file is ever sent to.
+    pub fn holds(&self, peer: &HsId) -> bool {
+        self.room.as_ref().is_some_and(|r| r.targets().contains(peer))
     }
 
     /// A connection went away.
@@ -472,7 +518,14 @@ impl Rooms {
                 seq,
                 body,
                 sig,
-            } => self.heard(from, room, key, seq, body, sig),
+            } => self.heard(from, room, key, seq, Line::Say(body), sig),
+            Message::RoomFile {
+                room,
+                key,
+                seq,
+                file,
+                sig,
+            } => self.heard(from, room, key, seq, Line::File(file), sig),
             _ => Outcome::default(),
         }
     }
@@ -606,7 +659,7 @@ impl Rooms {
         room: RoomId,
         key: Key,
         seq: u64,
-        body: String,
+        line: Line,
         sig: Vec<u8>,
     ) -> Outcome {
         let Some(r) = self.room.as_mut() else {
@@ -629,7 +682,7 @@ impl Rooms {
         };
         if author
             .verify(
-                &signed(&room, &key, seq, &body),
+                &signed(&room, &key, seq, &line),
                 &ed25519::Signature::from_bytes(&sig),
             )
             .is_err()
@@ -637,13 +690,19 @@ impl Rooms {
             return Outcome::default();
         }
         r.last.insert(key, seq);
-        let forward = Message::RoomSay {
-            room,
-            key,
-            seq,
-            body: body.clone(),
-            sig: sig.to_vec(),
+        let who = r.who(&key);
+        let event = match &line {
+            Line::Say(body) => Event::Said {
+                who,
+                body: body.clone(),
+            },
+            Line::File(file) => Event::Shared {
+                who,
+                file: file.clone(),
+                from,
+            },
         };
+        let forward = line.into_message(room, key, seq, sig.to_vec());
         // Passed on once, to everyone but whoever it came from and whoever
         // wrote it. A duplicate stops here, on the sequence check above.
         let author_peer = r.bound.get(&key).copied();
@@ -654,10 +713,7 @@ impl Rooms {
             .map(|p| (p, forward.clone()))
             .collect();
         Outcome {
-            events: vec![Event::Said {
-                who: r.who(&key),
-                body,
-            }],
+            events: vec![event],
             send,
             reach: Vec::new(),
         }
@@ -665,13 +721,27 @@ impl Rooms {
 }
 
 /// The bytes a room key signs for one line.
-fn signed(room: &RoomId, key: &Key, seq: u64, body: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(SIGNED.len() + 16 + 32 + 8 + body.len());
+///
+/// A kind byte keeps a file from being read as a line or the other way round:
+/// without it, some body would sign the same bytes as some file.
+fn signed(room: &RoomId, key: &Key, seq: u64, line: &Line) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(SIGNED.len() + 16 + 32 + 8 + 1 + 64);
     bytes.extend_from_slice(SIGNED);
     bytes.extend_from_slice(room);
     bytes.extend_from_slice(key);
     bytes.extend_from_slice(&seq.to_le_bytes());
-    bytes.extend_from_slice(body.as_bytes());
+    match line {
+        Line::Say(body) => {
+            bytes.push(0);
+            bytes.extend_from_slice(body.as_bytes());
+        }
+        Line::File(file) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&file.hash);
+            bytes.extend_from_slice(&file.size.to_le_bytes());
+            bytes.extend_from_slice(file.name.as_bytes());
+        }
+    }
     bytes
 }
 
@@ -786,6 +856,24 @@ mod tests {
         let forged = Message::RoomSay { room, key, seq, body: "faux".into(), sig };
         let out = nodes.get_mut(&c).unwrap().receive(a, forged, &[a]);
         assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn a_file_is_announced_like_a_line_and_its_hash_cannot_be_swapped() {
+        let ((mut nodes, contacts), [a, b, c]) = room(false);
+        let file = FileRef { name: "plan.pdf".into(), size: 10, hash: [1; 32] };
+        let out = nodes.get_mut(&b).unwrap().share(file.clone()).unwrap();
+        let Message::RoomFile { room, key, seq, sig, .. } = out.send[0].1.clone() else {
+            panic!("a shared file is a RoomFile");
+        };
+        // The host, relaying to c, points the announcement at other bytes.
+        let swapped = FileRef { hash: [2; 32], ..file.clone() };
+        let forged = Message::RoomFile { room, key, seq, file: swapped, sig };
+        assert!(nodes.get_mut(&c).unwrap().receive(a, forged, &[a]).events.is_empty());
+        // Relayed honestly, c learns of it, and that the host is the one to ask.
+        let seen = run(&mut nodes, &contacts, b, out);
+        assert!(seen.iter().any(|(at, e)| *at == c
+            && matches!(e, Event::Shared { file: f, from, .. } if *f == file && *from == a)));
     }
 
     #[test]

@@ -123,7 +123,13 @@ impl Pool {
         self.idle.remove(peer)
     }
 
-    /// Is there an open connection to this peer right now?
+    /// A handle to send on the connection to `peer`, for a task that outlives
+    /// this call — a file streaming in the background.
+    pub fn sender(&self, peer: &HsId) -> Option<mpsc::Sender<Message>> {
+        self.idle.get(peer).map(|link| link.outbox.clone())
+    }
+
+        /// Is there an open connection to this peer right now?
     pub fn holds(&self, peer: &HsId) -> bool {
         self.idle.contains_key(peer)
     }

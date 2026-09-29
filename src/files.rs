@@ -292,7 +292,7 @@ pub fn finish(dir: &Path, offer: &Offer) -> Result<PathBuf> {
 ///
 /// Overwriting silently would let a second transfer of a different file with the
 /// same name destroy the first.
-fn free_path(dir: &Path, name: &str) -> PathBuf {
+pub fn free_path(dir: &Path, name: &str) -> PathBuf {
     let first = dir.join(name);
     if !first.exists() {
         return first;

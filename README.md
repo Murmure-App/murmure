@@ -178,6 +178,7 @@ baked in.
 /history                                          what is kept (nothing, by default)
 /presence alice                                   ask to see each other online
 /room new table   /room invite alice              open a room, ask people in
+/room send ~/plan.pdf   /room get 1               put a file in the room, take one
 /send ~/rapport.pdf                               offer a file (during a call)
 /accept   /refuse                                 answer an offer of theirs
 /bye                                              hang up
@@ -306,9 +307,20 @@ What the host can do, and you should know: see every line (it is in the room),
 hold lines back, and vouch for people you do not know — `~a1b2c3d4` is whoever
 the host let in, and nothing more is proved about them.
 
-Limits, for now: text only, 16 people, one room at a time. During a call the
-room waits, and what it says over the connection to the person you are calling
-is lost.
+**Files.** `/room send ~/plan.pdf`, or drop it on the window, puts a file in the
+room: everyone sees `bob shared "plan.pdf" (3.0 MB) — /room get 1`, and nothing
+moves until somebody asks. Whoever asks gets it from whoever told them about
+it: straight from the author when they are contacts, through the host when they
+are not. The host then takes the whole file first and passes it on, so it
+arrives in roughly twice the time — and sits on the host's disk, outside
+`incoming/`, until the room ends. Every copy is checked against the hash its
+author signed, so the host can refuse to pass a file on but cannot pass on a
+different one. It all goes over Tor, and it all counts against the same
+`MURMURE_INCOMING_QUOTA`.
+
+Limits, for now: 16 people, one room at a time. During a call the room waits,
+and what it says over the connection to the person you are calling is lost —
+a file coming over that connection included; ask for it again after the call.
 
 ## Sending a file
 
