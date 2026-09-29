@@ -314,6 +314,18 @@ impl Contacts {
             .map(|(name, _)| name.as_str())
     }
 
+    /// May this proved address open a connection to us?
+    ///
+    /// Once anyone is filed the service runs in restricted discovery, so only
+    /// contacts can read the descriptor. A stranger who still gets through
+    /// held a copy from before a `/forget`: arti cannot rotate the
+    /// introduction points on demand (IMPROVEMENTS.md 3C), so this is where
+    /// the forgetting actually takes effect. An empty book is the open,
+    /// first-contact mode, and admits everyone.
+    pub fn admits(&self, address: &str) -> bool {
+        self.entries.is_empty() || self.name_of(address).is_some()
+    }
+
     /// Where this contact stands on presence. Unknown names are [`Presence::Off`],
     /// which is the right answer: somebody we do not have cannot have agreed.
     pub fn presence_of(&self, name: &str) -> Presence {
@@ -460,6 +472,21 @@ mod tests {
         assert_eq!(alice.discovery, KEY_A);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_forgotten_contact_is_no_longer_admitted() {
+        let (path, identity) = scratch("admits");
+        let mut book = Contacts::open(&path, &identity).unwrap();
+        assert!(book.admits(ADDR_B), "an empty book is the first-contact mode");
+
+        book.add("alice", ADDR_A, KEY_A).unwrap();
+        book.add("bob", ADDR_B, KEY_B).unwrap();
+        assert!(book.admits(ADDR_B));
+
+        book.remove("bob").unwrap();
+        assert!(book.admits(ADDR_A));
+        assert!(!book.admits(ADDR_B), "forgotten, so refused");
     }
 
     #[test]

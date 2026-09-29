@@ -69,8 +69,10 @@ Ce document rassemble l'ensemble des pistes d'amélioration, des axes de recherc
 - **Bénéfice :** Connexions directes quasi-instantanées avec traversée automatique des box/NAT, en conservant l'adressage par clé publique Ed25519.
 - **Pourquoi non appliqué (2026-08-30) :** même famille de conflit que 1B. Iroh route par défaut via des relais DERP publics et établit des chemins hors-Tor — exactement ce que le design du projet évite pour ne jamais exposer l'IP réelle d'un pair à un tiers ou à son interlocuteur. Ajouter Iroh, c'est ajouter un mode de fonctionnement qui affaiblit la propriété d'anonymat pour laquelle Murmure existe. Le transport direct QUIC déjà présent (`src/transport/direct.rs`, voir 3A) couvre le cas "connexion directe" sans ce compromis, à condition que les deux pairs se dévoilent leur IP volontairement (LAN/VPN).
 
-### 🔄 C. Rotation Forcée des Descripteurs après Révocation (`/forget`)
+### 🔄 C. Rotation Forcée des Descripteurs après Révocation (`/forget`) — 🟡 PARTIEL (2026-09-29)
 - **Amélioration :** Forcer la rotation immédiate des points d'introduction et du descripteur de service caché lors de la suppression d'un contact (`/forget`), dès que l'API de rotation sera exposée par Arti.
+- **Fait :** le handshake prouve l'identité de l'appelant, donc un contact oublié qui garde une copie du descripteur est refusé dès la connexion (`Contacts::admits`, tant que le carnet n'est pas vide). Il ne peut plus parler, laisser de message ni proposer de fichier.
+- **Reste :** la rotation elle-même. arti 0.46 n'a toujours pas d'API pour forcer de nouveaux points d'introduction, donc un contact oublié peut encore savoir si on est en ligne jusqu'à la rotation naturelle.
 
 ---
 

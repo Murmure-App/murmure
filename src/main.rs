@@ -430,6 +430,12 @@ async fn serve(
             Event::Called(Some(stream)) => {
                 let (reader, writer) = stream.split();
                 match Link::open(reader, writer, identity, None).await {
+                    // Proved, but not someone we know: see `Contacts::admits`.
+                    Ok(link) if !book.admits(&link.peer.display_unredacted().to_string()) => {
+                        let who = onion::fingerprint(&link.peer.display_unredacted().to_string());
+                        let _ = link.close(false).await;
+                        screen.system(format!("-- refused a connection from someone not in your book ({who}) --"));
+                    }
                     Ok(link) => {
                         let peer = link.peer;
                         let name = name_for(book, &peer);
@@ -1039,9 +1045,20 @@ async fn command(
                 // Upstream is explicit that this is not revocation: the
                 // introduction points are not rotated, so a client that already
                 // read the descriptor can still reach them.
-                screen.system(
-                    "they may still reach you until the introduction points rotate on their own.",
-                );
+                // Upstream cannot rotate the introduction points on demand, so
+                // they can still knock until that happens on its own; the
+                // handshake names them, and the door stays shut.
+                if book.len() > 0 {
+                    screen.system(
+                        "they can no longer talk to you. Until the introduction points rotate on \
+                         their own, they may still tell whether you are online.",
+                    );
+                } else {
+                    screen.system(
+                        "your book is now empty, so your service is open again: anyone with \
+                         your address can reach you, them included.",
+                    );
+                }
             } else {
                 screen.system(format!("no contact called {name}"));
             }
