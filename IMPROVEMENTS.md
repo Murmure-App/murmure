@@ -54,8 +54,9 @@ Ce document rassemble l'ensemble des pistes d'amélioration, des axes de recherc
 ### 🐛 B. Suivi et Contribution au Bug Amont Arti
 - **Action :** Soumettre officiellement le rapport d'anomalie détaillé [`aidd_docs/arti-windows-hang.md`](file:///home/thibault-savenkoff/murmure/aidd_docs/arti-windows-hang.md) à l'équipe du Tor Project sur [gitlab.torproject.org/tpo/core/arti](https://gitlab.torproject.org/tpo/core/arti) et suivre l'avancement de l'intégration CI Windows (#450).
 
-### 🐧 C. Documentation et Profil WSL 2
+### 🐧 C. Documentation et Profil WSL 2 — ✅ DONE (2026-09-29)
 - **Action :** Documenter pour les utilisateurs Windows actuels l'utilisation transparente et sans configuration de Murmure dans WSL 2 avec Windows Terminal.
+- **Fait :** section « On Windows, through WSL 2 » du `README.md` : installation, lancer depuis le home Linux (sur `/mnt/c` le contrôle des permissions de `identity.seed` échoue), fichiers reçus via `\\wsl$`, presse-papier OK, `/view` non (Windows Terminal ne parle que Sixel), `networkingMode=mirrored` pour `/send --direct`, sinon repli sur Tor. Non testé sur une vraie machine Windows.
 
 ---
 

@@ -40,6 +40,42 @@ page](https://github.com/Murmure-App/murmure/releases):
 There is no Windows binary. That is not a packaging decision: arti hangs
 fetching its first consensus there, so there is nothing to ship. Use WSL2.
 
+### On Windows, through WSL 2
+
+murmure runs unchanged in WSL 2: it is the Linux binary, talking to Tor from
+the Linux side. In PowerShell, once:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+Then open **Ubuntu** from Windows Terminal and follow the Linux instructions:
+the `linux-x86_64` archive, or [Build](#build) after
+`sudo apt install build-essential` (SQLite is compiled from source and needs a
+C compiler).
+
+Five things differ from a plain Linux machine:
+
+- **Run it from your Linux home, not from `/mnt/c`.** murmure refuses to start
+  if `identity.seed` is readable by anyone else, and files on the Windows drive
+  cannot hold Unix permissions, so the check fails there — by design.
+- **Received files** land in `.murmure/incoming/` inside Linux. From Windows,
+  open `\\wsl$\Ubuntu\home\<you>\` in Explorer.
+- **Copying your address** works: Windows Terminal honours the clipboard escape
+  murmure uses.
+- **`/view` does not**: Windows Terminal speaks Sixel, and `/view` only speaks
+  the Kitty and iTerm2 protocols.
+- **`/send --direct`** needs to be reached from outside, and WSL 2 sits behind
+  its own NAT by default. On Windows 11 22H2 or later, add this to
+  `%UserProfile%\.wslconfig`, then run `wsl --shutdown`:
+
+  ```ini
+  [wsl2]
+  networkingMode=mirrored
+  ```
+
+  Without it, a direct transfer simply falls back to Tor.
+
 A binary from an anonymous account is worth exactly the trust you place in that
 account, which should be none. `SHA256SUMS` only says the download arrived
 intact; what ties an archive to the source that produced it is its provenance
