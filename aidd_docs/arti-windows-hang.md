@@ -1,5 +1,25 @@
 # Bug report — arti hangs on Windows while fetching the first consensus
 
+> **Solved, 2026-09-29.** Not arti's I/O at all: the consensus download
+> finishes, and the first parse hangs. `tor-netdoc` calls
+> `saturating_time::SaturatingTime::saturating_sub`, whose `find_limit`
+> (saturating-time 0.4.0, `src/internal.rs`) finds `SystemTime`'s minimum by
+> halving a step down to 1 ns and stopping on `None`. Windows counts 100 ns
+> intervals and truncates anything smaller to zero, so below 100 ns
+> `checked_sub` returns `Some(self)` unchanged, the step is never halved again,
+> and the loop never ends. Stack samples of the busy thread, taken with cdb,
+> all ended in `find_limit` → `SystemTime::checked_sub`. Every symptom below
+> fits: one core (other callers wait on the `LazyLock` at 0 %), no log output,
+> a wedged `current_thread` runtime.
+>
+> murmure carries a fixed copy under `patches/saturating-time` via
+> `[patch.crates-io]`: a step that leaves the value unchanged counts as a
+> failure. With it, the bootstrap test passes on Windows in 12.9 s. The report
+> belongs to arti: saturating-time moved into the arti monorepo in September
+> 2026 (the codeberg repository is archived), and `main` still loops. It is already reported there as arti#2678 and
+> arti#2726 (the latter with a patch like ours), so there is nothing to file;
+> what follows is the original investigation, kept as it was.
+
 Draft for <https://gitlab.torproject.org/tpo/core/arti/-/issues>.
 Anonymous filing is possible via <https://anonticket.torproject.org/>.
 

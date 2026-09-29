@@ -45,13 +45,15 @@ Ce document rassemble l'ensemble des pistes d'amélioration, des axes de recherc
 
 ## 2. Compatibilité & Support Plateformes (Windows)
 
-### 🪟 A. Déblocage du Support Windows via Démon Tor Externe
+### 🪟 A. Déblocage du Support Windows via Démon Tor Externe — ⏭️ SKIPPED (2026-09-29) : plus nécessaire, la cause du blocage est trouvée et corrigée (voir 2B).
 - **Constat actuel :** L'amorçage d'Arti (`arti-client`) se fige en boucle CPU lors du téléchargement du consensus sous Windows (`aidd_docs/arti-windows-hang.md`).
 - **Amélioration :** 
   - Ajouter un backend optionnel dans `src/transport/tor.rs` capable de communiquer avec un binaire `tor.exe` local (Tor C / Tor Expert Bundle) via son port de contrôle (`ControlPort` / commande `ADD_ONION`).
   - Permet d'offrir un binaire Windows pleinement fonctionnel immédiatement sans dépendre de la résolution du bug amont d'Arti.
 
-### 🐛 B. Suivi et Contribution au Bug Amont Arti
+### 🐛 B. Suivi et Contribution au Bug Amont Arti — 🟡 PARTIEL (2026-09-29)
+- **Fait :** cause trouvée depuis une session Claude sur une machine Windows : boucle infinie dans `saturating-time` 0.4.0 (dépendance de `tor-netdoc`/`tor-cert`), pas dans arti. Copie corrigée dans `patches/saturating-time` via `[patch.crates-io]` ; bootstrap Tor OK sous Windows en 12,9 s. Détails en tête de `aidd_docs/arti-windows-hang.md`.
+- **Reste :** ~~signaler le bug à arti~~ déjà signalé par d'autres (arti#2678, arti#2726 avec un correctif) ; retirer notre copie dès qu'une release d'arti embarque la correction. Contexte du signalement envisagé : signaler le bug à arti (gitlab.torproject.org/tpo/core/arti) : saturating-time fait désormais partie du monorepo arti, le dépôt codeberg est archivé depuis le 2026-09-24, et `main` boucle toujours — décision de l'utilisateur. Puis un binaire Windows dans la release, et deux soucis de tests propres à Windows (séparateur de chemin dans un test UI, dials loopback QUIC intermittents).
 - **Action :** Soumettre officiellement le rapport d'anomalie détaillé [`aidd_docs/arti-windows-hang.md`](file:///home/thibault-savenkoff/murmure/aidd_docs/arti-windows-hang.md) à l'équipe du Tor Project sur [gitlab.torproject.org/tpo/core/arti](https://gitlab.torproject.org/tpo/core/arti) et suivre l'avancement de l'intégration CI Windows (#450).
 
 ### 🐧 C. Documentation et Profil WSL 2 — ✅ DONE (2026-09-29)

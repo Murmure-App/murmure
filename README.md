@@ -24,7 +24,8 @@ disk, until the other person appears.
 > need.
 >
 > Known limits are stated where they apply rather than collected here: search
-> the page for "limit". Windows does not work at all.
+> the page for "limit". On Windows there is no release binary yet: build it
+> yourself, or use WSL 2.
 
 ## Install
 
@@ -37,8 +38,11 @@ page](https://github.com/Murmure-App/murmure/releases):
 | `linux-aarch64` | the same, on ARM — a 64-bit Raspberry Pi, an ARM server |
 | `macos-universal` | any Mac, Apple Silicon or Intel |
 
-There is no Windows binary. That is not a packaging decision: arti hangs
-fetching its first consensus there, so there is nothing to ship. Use WSL2.
+There is no Windows binary yet. Until September 2026 arti hung on Windows while
+reading its first consensus (a dependency looped forever on Windows' 100 ns
+clock; see `aidd_docs/arti-windows-hang.md`). murmure now carries the fix, so
+[Build](#build) works natively with the MSVC build tools. WSL 2 remains an
+option.
 
 ### On Windows, through WSL 2
 

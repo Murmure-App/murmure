@@ -161,3 +161,13 @@ tokio-util = { version = "0.7.19", features = ["compat"] }
 # the handshake's 30-second timeout can be asserted in no time at all. Tests
 # only: nothing in the program reads a paused clock.
 tokio = { version = "1", features = ["test-util"] }
+
+[patch.crates-io]
+# saturating-time 0.4.0 (pulled in by tor-cert and tor-netdoc) never returns
+# on Windows: it finds SystemTime's minimum by halving a step down to 1ns,
+# but Windows counts 100ns intervals, so any step under 100ns subtracts
+# nothing, returns Some, and the step never shrinks again. That loop is
+# what pegged one core the first time arti parsed a consensus
+# (aidd_docs/arti-windows-hang.md). The copy under patches/ stops when a
+# step no longer changes the value. Drop this once upstream has the fix.
+saturating-time = { path = "patches/saturating-time" }
