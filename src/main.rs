@@ -553,6 +553,7 @@ async fn serve(
                 let address = peer.display_unredacted().to_string();
                 match outbox.delivered(&address, id) {
                     Ok(true) => {
+                        screen.delivered(id);
                         let left = outbox.waiting_for(&address);
                         let name = name_for(book, &peer);
                         if left == 0 {
@@ -1249,7 +1250,7 @@ async fn command(
             // Queued first, always, even when they are connected. One path, so
             // a message is on disk before anything is attempted with it and a
             // failure at any point after this cannot lose it.
-            let dropped = outbox.queue(&address, body.to_owned())?;
+            let (id, dropped) = outbox.queue(&address, body.to_owned())?;
             if dropped > 0 {
                 screen.error(format!(
                     "{dropped} older message{} to {name} dropped — {} were already waiting",
@@ -1257,7 +1258,7 @@ async fn command(
                     outbox.waiting_for(&address)
                 ));
             }
-            screen.say(Kind::Mine, format!("you (to {name})> {body}"));
+            screen.say_waiting(format!("you (to {name})> {body}"), id);
             if let Some(h) = recording(history, book, name)
                 && let Err(e) = h.note(&address, true, body)
             {

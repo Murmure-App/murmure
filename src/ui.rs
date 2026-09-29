@@ -78,7 +78,14 @@ pub struct Entry {
     /// find brackets somebody typed, and clicking them would accept a file that
     /// is not there. The ranges come from whoever built the line and knows.
     chips: Vec<Chip>,
+    /// The outbox id of a `/tell`, so its `[waiting]` can turn into
+    /// `[delivered]` in place when the recipient acknowledges it.
+    tag: Option<u64>,
 }
+
+/// Suffixes of a `/tell` line, before and after the recipient has it.
+pub const WAITING: &str = " [waiting]";
+const DELIVERED: &str = " [delivered]";
 
 /// One clickable file inside a history line.
 #[derive(Debug, Clone, Copy)]
@@ -128,6 +135,8 @@ pub enum Update {
     /// wait for a key, come back. See `src/image.rs` for why this cannot go
     /// through [`Self::Line`] like everything else on screen.
     ShowImage(Vec<u8>),
+    /// The `/tell` with this outbox id arrived: mark its line delivered.
+    Delivered(u64),
 }
 
 /// A handle for putting lines on screen from anywhere in the program.
@@ -140,6 +149,22 @@ pub enum Update {
 pub struct Screen(mpsc::UnboundedSender<Update>);
 
 impl Screen {
+    /// Put a `/tell` line on screen, marked [`WAITING`] until
+    /// [`Self::delivered`] is called with the same outbox id.
+    pub fn say_waiting(&self, text: impl Into<String>, id: u64) {
+        let _ = self.0.send(Update::Line(Entry {
+            kind: Kind::Mine,
+            text: format!("{}{WAITING}", text.into()),
+            chips: Vec::new(),
+            tag: Some(id),
+        }));
+    }
+
+    /// The recipient acknowledged outbox message `id`.
+    pub fn delivered(&self, id: u64) {
+        let _ = self.0.send(Update::Delivered(id));
+    }
+
     /// Put a line on screen.
     pub fn say(&self, kind: Kind, text: impl Into<String>) {
         // A closed channel means the UI is gone, i.e. the program is exiting.
@@ -147,6 +172,7 @@ impl Screen {
             kind,
             text: text.into(),
             chips: Vec::new(),
+            tag: None,
         }));
     }
 
@@ -168,6 +194,7 @@ impl Screen {
                 .into_iter()
                 .map(|(start, end, number)| Chip { start, end, number })
                 .collect(),
+            tag: None,
         }));
     }
 
@@ -810,6 +837,18 @@ impl App {
         vec![Typed::Post { parts, direct }]
     }
 
+    /// Turn the `[waiting]` of the `/tell` line with this outbox id into
+    /// `[delivered]`. Nothing to do if it has scrolled away or was written
+    /// before this run: the "everything arrived" line still says it.
+    fn delivered(&mut self, id: u64) {
+        if let Some(entry) = self.history.iter_mut().find(|e| e.tag == Some(id))
+            && let Some(text) = entry.text.strip_suffix(WAITING)
+        {
+            entry.text = format!("{text}{DELIVERED}");
+            entry.tag = None;
+        }
+    }
+
     fn push(&mut self, entry: Entry) {
         // Reading back through the history is not a request to be dragged
         // forward. The offset is measured from the bottom, so a line arriving
@@ -927,6 +966,7 @@ async fn event_loop(
                         app.flash(format!("copied {} chars", text.chars().count()));
                     }
                     Some(Update::Contacts(names)) => app.contacts = names,
+                    Some(Update::Delivered(id)) => app.delivered(id),
                     Some(Update::ShowImage(escape)) => {
                         show_image_blocking(terminal, &mut keys, &escape).await?;
                     }
@@ -946,6 +986,7 @@ async fn event_loop(
                             app.flash(format!("copied {} chars", text.chars().count()));
                         }
                         Update::Contacts(names) => app.contacts = names,
+                        Update::Delivered(id) => app.delivered(id),
                         Update::ShowImage(escape) => {
                             show_image_blocking(terminal, &mut keys, &escape).await?;
                         }
@@ -1728,6 +1769,7 @@ mod tests {
             kind: Kind::System,
             text: text.to_owned(),
             chips: Vec::new(),
+            tag: None,
         }
     }
 
@@ -1807,6 +1849,20 @@ mod tests {
             app.insert(c);
         }
         app
+    }
+
+    /// A `/tell` shows `[waiting]` until the recipient acknowledges that very
+    /// message, and only that one.
+    #[test]
+    fn a_tell_turns_from_waiting_to_delivered() {
+        let mut app = App::new("t".into());
+        for (id, text) in [(7, "you (to bob)> un"), (8, "you (to bob)> deux")] {
+            app.push(Entry { kind: Kind::Mine, text: format!("{text}{WAITING}"), chips: Vec::new(), tag: Some(id) });
+        }
+        app.delivered(8);
+        app.delivered(99);
+        let texts: Vec<_> = app.history.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["you (to bob)> un [waiting]", "you (to bob)> deux [delivered]"]);
     }
 
     /// An unambiguous command completes fully, with a trailing space.
@@ -2174,6 +2230,7 @@ mod tests {
                 Chip { start: a, end: a + 7, number: 1 },
                 Chip { start: b, end: b + 7, number: 2 },
             ],
+            tag: None,
         });
         app.rows = visible_rows(&app.history, 60, 6, 0);
 
@@ -2204,6 +2261,7 @@ mod tests {
             kind: Kind::Theirs,
             text,
             chips: vec![Chip { start: 6, end: 13, number: 1 }],
+            tag: None,
         });
         app.rows = visible_rows(&app.history, 60, 6, 0);
 
@@ -2295,6 +2353,7 @@ mod tests {
             kind: Kind::Theirs,
             text: "alice> abcdefghijklmnopqrstuvwxyz".to_owned(),
             chips: Vec::new(),
+            tag: None,
         });
         let rows = visible_rows(&history, 20, 6, 0);
 

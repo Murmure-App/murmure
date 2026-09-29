@@ -93,11 +93,11 @@ Ce document rassemble l'ensemble des pistes d'amélioration, des axes de recherc
 - **Principe :** Ajouter une commande `/search <terme>` permettant de filtrer rapidement les messages passés dans l'historique chiffré.
 - **Fait :** `History::search()` dans `src/history.rs` — filtre insensible à la casse sur toutes les conversations, plafonné à `SHOWN` comme `/history`. Commande `/search <terme>` ajoutée dans `src/main.rs`, listée dans `/help`. Vérifié que `/search` tapé pendant un appel tombe sur `Typed::UnknownCommand` (`classify()`, `src/chat.rs`) et ne part jamais sur le fil comme message. Testé : `history::tests::search_finds_a_word_case_insensitively_across_conversations`, suite complète 149/150 verte (1 ignoré, réseau Tor réel), clippy propre.
 
-### ⌨️ D. Ergonomie et Autocomplétion — 🟡 PARTIEL (2026-08-30)
+### ⌨️ D. Ergonomie et Autocomplétion — ✅ DONE (2026-09-29)
 - **Améliorations :**
   - Autocomplétion des commandes et des noms de contacts avec `Tab` — ✅ DONE.
-  - Indicateur visuel d'état de synchronisation de l'Outbox (`[envoyé]`, `[reçu]`) — non fait.
-  - Thèmes de couleurs personnalisables pour l'interface TUI — non fait.
+  - Indicateur visuel d'état de synchronisation de l'Outbox — ✅ DONE (2026-09-29). Une ligne `/tell` finit par `[waiting]`, remplacé sur place par `[delivered]` quand le destinataire accuse réception de ce message précis (`Update::Delivered(id)`, id de l'outbox porté par la ligne). Pas d'état `[envoyé]` intermédiaire : poser une trame sur un lien ne prouve pas qu'elle est arrivée, seul l'accusé de réception le prouve. Test : `ui::tests::a_tell_turns_from_waiting_to_delivered`.
+  - Thèmes de couleurs personnalisables pour l'interface TUI — ⏭️ SKIPPED : aucun besoin concret, les couleurs suivent déjà le thème du terminal.
 - **Fait :** `src/ui.rs` — `App::complete()` : sur `Tab`, complète le mot courant (commande si premier mot commençant par `/`, sinon nom de contact) ; complétion pleine + espace si un seul candidat, sinon extension au plus long préfixe commun. Liste des contacts poussée depuis `src/main.rs` via `Update::Contacts` au démarrage, après `/add` et après `/forget`. `COMMANDS` est une liste à jour à la main (duplicat volontaire des verbes de `main.rs`/`chat.rs` — dérive possible si un verbe est ajouté sans y penser). Testé : 4 tests unitaires (`tab_completes_a_unique_command`, `tab_extends_to_the_longest_common_prefix_on_ambiguity`, `tab_completes_a_contact_name_after_the_first_word`, `tab_does_nothing_on_no_match_or_an_empty_word`), suite complète 153/154 verte (1 ignoré), clippy `--all-targets -D warnings` propre. Vérifié en conditions réelles (TUI lancée dans tmux, bootstrap Tor complet) : `/he` + `Tab` → `/help ` fonctionne.
 
 ### 📦 E. Sauvegarde et Restauration (Mnémonique BIP-39) — ✅ DONE (2026-08-30)

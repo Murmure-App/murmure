@@ -109,14 +109,15 @@ impl Outbox {
         store::write_sealed(&self.path, &self.key, &plaintext)
     }
 
-    /// Put a message by for `address`. Returns the number dropped to make room.
+    /// Put a message by for `address`. Returns its id, and the number of older
+    /// ones dropped to make room.
     ///
     /// Refused here if it is too long to ever travel. [`Message::check`] would
     /// refuse it at the wire instead, which is far worse than it sounds: the
     /// write fails, so no acknowledgement comes back, so it stays at the head
     /// of the queue and kills the writer on every future connection to that
     /// contact — taking everything queued behind it with it.
-    pub fn queue(&mut self, address: &str, body: String) -> Result<usize> {
+    pub fn queue(&mut self, address: &str, body: String) -> Result<(u64, usize)> {
         if body.len() > crate::proto::MAX_TEXT {
             bail!(
                 "that message is {} bytes, over the {}-byte limit. \
@@ -139,7 +140,7 @@ impl Outbox {
         let dropped = queue.len().saturating_sub(MAX_WAITING);
         queue.drain(..dropped);
         self.save()?;
-        Ok(dropped)
+        Ok((id, dropped))
     }
 
     /// Everything waiting for `address`, oldest first, as frames.
@@ -323,12 +324,12 @@ mod tests {
         let mut out = Outbox::open(&path, &identity).unwrap();
 
         for i in 0..MAX_WAITING {
-            assert_eq!(out.queue(ALICE, format!("{i}")).unwrap(), 0);
+            assert_eq!(out.queue(ALICE, format!("{i}")).unwrap().1, 0);
         }
         assert_eq!(out.waiting_for(ALICE), MAX_WAITING);
 
         // One over, and the oldest goes — reported, not silently.
-        assert_eq!(out.queue(ALICE, "the newest".into()).unwrap(), 1);
+        assert_eq!(out.queue(ALICE, "the newest".into()).unwrap().1, 1);
         assert_eq!(out.waiting_for(ALICE), MAX_WAITING);
         let frames = out.frames_for(ALICE);
         assert!(matches!(&frames[0], Message::Left { body, .. } if body == "1"));
