@@ -1,3 +1,8 @@
+// Modified for murmure (2026-09-29): find_limit stops on a step that leaves
+// the value unchanged, so it terminates with Windows' 100 ns SystemTime.
+// See arti#2678 and arti#2726. Original: saturating-time 0.4.0, Clara Engler,
+// MIT OR Apache-2.0.
+
 //! Internal parts used for sealing.
 //!
 //! This module primarily consists of the internal [`SaturatingTime`] trait, an
