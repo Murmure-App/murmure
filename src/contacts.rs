@@ -272,6 +272,11 @@ impl Contacts {
             // free, and both history objections. Silently, on a re-paste.
             return Ok(());
         }
+        // One person, one name: an incoming call is named by looking the
+        // address up, and two names would make that a coin toss.
+        if let Some(other) = self.name_of(&entry.address) {
+            bail!("that address is already filed as {other}. To rename: /forget {other}, then /add again");
+        }
         self.entries.insert(name.to_owned(), entry);
         self.save()
     }
@@ -524,6 +529,10 @@ mod tests {
         // Same name and address, rotated key: also refused. A contact whose key
         // changed has to be forgotten first, so nobody swaps a key in quietly.
         assert!(book.add("alice", ADDR_A, KEY_B).is_err());
+
+        // Same address, another name: refused, naming the entry it clashes with.
+        let clash = book.add("alicia", ADDR_A, KEY_A).unwrap_err().to_string();
+        assert!(clash.contains("alice"), "{clash}");
 
         assert!(book.remove("alice").unwrap());
         assert!(book.add("alice", ADDR_B, KEY_B).is_ok());
