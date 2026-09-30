@@ -412,6 +412,8 @@ async fn serve(
     // Somebody calling, waiting to be answered. One at a time, like the calls
     // themselves.
     let mut ringing: Option<Ringing> = None;
+    // Incoming connections still in their handshake.
+    let mut opening = tokio::task::JoinSet::new();
     // The room we are in, if any. In memory only, like everything about it.
     let mut hall = Hall {
         rooms: Rooms::new(identity.onion_address()),
@@ -427,6 +429,7 @@ async fn serve(
         // the pool.
         let event = tokio::select! {
             stream = incoming.next() => Event::Called(stream.map(Box::new)),
+            Some(opened) = opening.join_next() => Event::Opened(opened),
             line = lines.recv() => Event::Typed(line),
             heard = pool.ready() => Event::Spoke(heard),
             _ = sweep.tick() => Event::Sweep,
@@ -443,8 +446,20 @@ async fn serve(
             // comes out of the handshake, one signature later, and not from the
             // connection.
             Event::Called(Some(stream)) => {
+                // In the background: a handshake takes up to three 30-second
+                // steps, and whoever dialled — a stranger with the address
+                // included — would hold the whole loop for that long.
+                if opening.len() >= MAX_OPENING {
+                    tracing::info!("dropped an incoming connection: {MAX_OPENING} already opening");
+                    continue;
+                }
                 let (reader, writer) = stream.split();
-                match Link::open(reader, writer, identity, None).await {
+                let me = identity.clone();
+                opening.spawn(async move { Link::open(reader, writer, &me, None).await });
+            }
+            Event::Opened(opened) => {
+                let Ok(opened) = opened else { continue };
+                match opened {
                     // Proved, but not someone we know: see `Contacts::admits`.
                     Ok(link) if !book.admits(&link.peer.display_unredacted().to_string()) => {
                         let who = onion::fingerprint(&link.peer.display_unredacted().to_string());
@@ -828,6 +843,8 @@ enum Event {
     /// Boxed: a `DataStream` is ~700 bytes against ~24 for a typed line, and
     /// this enum is built on every loop iteration.
     Called(Option<Box<arti_client::DataStream>>),
+    /// An incoming connection finished its handshake, or failed it.
+    Opened(Result<Result<Link>, tokio::task::JoinError>),
     /// The operator typed a line. [`None`] means the interface closed.
     Typed(Option<ui::Typed>),
     /// Something happened on the pool: a frame, a connection lost, or a
@@ -836,6 +853,11 @@ enum Event {
     /// Time to make sure everyone we agreed presence with is still connected.
     Sweep,
 }
+
+/// How many incoming connections may be in their handshake at once. Past
+/// that, new ones are dropped: a contact whose connection is dropped dials
+/// again, and a flood does not grow without bound.
+const MAX_OPENING: usize = 8;
 
 /// What the idle loop does after a command.
 enum Flow {

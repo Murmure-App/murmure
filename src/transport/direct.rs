@@ -202,28 +202,56 @@ impl Listener {
         self.endpoint.local_addr().expect("bound").port()
     }
 
-    /// Wait for someone to connect, and hand back the stream they open.
+    /// Wait for the peer to connect, and hand back the stream they open.
     ///
-    /// Whoever it is: the port is public, so a connection that fails half-way
-    /// is skipped rather than ending the wait, and the caller checks the token.
+    /// The port is public, so whoever connects must first send `token`, which
+    /// only the peer got, over Tor. Connections are authenticated side by side
+    /// rather than one after the other: a stranger who completes QUIC and then
+    /// says nothing would otherwise hold the door until the real peer's own
+    /// dial gave up. At most [`PENDING`] wait at once; more are refused.
     /// Fails only once the endpoint itself is gone.
-    pub async fn accept(&self) -> Result<Link<RecvStream>> {
+    pub async fn accept(&self, token: [u8; 32]) -> Result<Link<RecvStream>> {
+        let mut pending = tokio::task::JoinSet::new();
         loop {
-            let incoming = self
-                .endpoint
-                .accept()
-                .await
-                .ok_or_else(|| anyhow!("the QUIC endpoint closed before anyone connected"))?;
-            let Ok(connection) = incoming.await else { continue };
-            let Ok(stream) = connection.accept_uni().await else { continue };
-            return Ok(Link {
-                // Ours is owned by the `Listener`, which the caller keeps.
-                _endpoint: None,
-                _connection: connection,
-                stream,
-            });
+            tokio::select! {
+                incoming = self.endpoint.accept() => {
+                    let incoming = incoming
+                        .ok_or_else(|| anyhow!("the QUIC endpoint closed before anyone connected"))?;
+                    if pending.len() >= PENDING {
+                        incoming.refuse();
+                        continue;
+                    }
+                    // Twice the dial timeout: the handshake is in the peer's
+                    // three seconds, the token arrives after it.
+                    pending.spawn(tokio::time::timeout(DIAL_TIMEOUT * 2, authenticate(incoming, token)));
+                }
+                Some(done) = pending.join_next() => {
+                    if let Ok(Ok(Some(link))) = done {
+                        return Ok(link);
+                    }
+                }
+            }
         }
     }
+}
+
+/// How many connections may be proving themselves at once.
+const PENDING: usize = 8;
+
+/// Finish one connection's handshake and check that it knows the token.
+async fn authenticate(incoming: quinn::Incoming, token: [u8; 32]) -> Option<Link<RecvStream>> {
+    let connection = incoming.await.ok()?;
+    let mut stream = connection.accept_uni().await.ok()?;
+    let mut auth = [0u8; 32];
+    stream.read_exact(&mut auth).await.ok()?;
+    // Constant time: the comparison must not say how much of a guess was right.
+    let mismatch = auth.iter().zip(token.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    (mismatch == 0).then_some(Link {
+        // Ours is owned by the `Listener`, which the caller keeps.
+        _endpoint: None,
+        _connection: connection,
+        stream,
+    })
 }
 
 /// Try each candidate in turn; the first one that completes wins.
@@ -438,6 +466,9 @@ impl ConstantTimeEq for [u8; 32] {
 mod tests {
     use super::*;
 
+    /// What the peer learned over Tor.
+    const TOKEN: [u8; 32] = [7u8; 32];
+
     /// The whole path, on one machine: bind, hand the fingerprint over as Tor
     /// would, connect, and move bytes.
     #[tokio::test]
@@ -447,7 +478,7 @@ mod tests {
         let candidates = [SocketAddr::from(([127, 0, 0, 1], listener.port()))];
 
         let receiving = tokio::spawn(async move {
-            let mut stream = listener.accept().await.expect("accept");
+            let mut stream = listener.accept(TOKEN).await.expect("accept");
             stream.read_to_end(1024 * 1024).await.expect("read")
         });
 
@@ -456,6 +487,7 @@ mod tests {
         // connection on the way out, which is the bug it now catches.
         let payload: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
         let mut out = dial(&candidates, fingerprint).await.expect("dial");
+        out.write_all(&TOKEN).await.expect("token");
         out.write_all(&payload).await.expect("write");
         out.finish().expect("finish");
         out.stopped().await.ok();
@@ -478,7 +510,7 @@ mod tests {
         // instead of being refused. `accept` skips the failed connection and
         // keeps waiting, so the dial is the side that finishes.
         let dialled = tokio::select! {
-            _ = listener.accept() => panic!("a wrong fingerprint must not connect"),
+            _ = listener.accept(TOKEN) => panic!("a wrong fingerprint must not connect"),
             dialled = dial(&one, [0u8; 32]) => dialled,
         };
 
@@ -518,12 +550,13 @@ mod tests {
         let fingerprint = listener.fingerprint;
 
         let receiving = tokio::spawn(async move {
-            let mut stream = listener.accept().await.expect("accept over IPv6");
+            let mut stream = listener.accept(TOKEN).await.expect("accept over IPv6");
             stream.read_to_end(1024 * 1024).await.expect("read")
         });
 
         let one = [v6];
         let mut out = dial(&one, fingerprint).await.expect("dial over IPv6");
+        out.write_all(&TOKEN).await.expect("token");
         out.write_all(b"par IPv6").await.expect("write");
         out.finish().expect("finish");
         out.stopped().await.ok();
@@ -585,16 +618,67 @@ mod tests {
         let one = [SocketAddr::from(([127, 0, 0, 1], listener.port()))];
         let fingerprint = listener.fingerprint;
         let receiving = tokio::spawn(async move {
-            let mut stream = listener.accept().await.expect("accept");
+            let mut stream = listener.accept(TOKEN).await.expect("accept");
             stream.read_to_end(1024).await.expect("read")
         });
 
         assert!(dial(&one, [0u8; 32]).await.is_err(), "the stranger is refused");
         let mut out = dial(&one, fingerprint).await.expect("the peer still gets in");
+        out.write_all(&TOKEN).await.expect("token");
         out.write_all(b"quand meme").await.expect("write");
         out.finish().expect("finish");
         out.stopped().await.ok();
         assert_eq!(receiving.await.unwrap(), b"quand meme");
     }
-}
 
+    /// A stranger who finishes the QUIC handshake and then says nothing must
+    /// not hold the door: the listener has no client authentication, so any
+    /// client that skips the certificate check gets that far.
+    #[tokio::test]
+    async fn a_silent_connection_does_not_block_the_peer() {
+        let listener = listen().expect("bind");
+        let one = [SocketAddr::from(([127, 0, 0, 1], listener.port()))];
+        let fingerprint = listener.fingerprint;
+        let receiving = tokio::spawn(async move {
+            let mut stream = listener.accept(TOKEN).await.expect("accept");
+            stream.read_to_end(1024).await.expect("read")
+        });
+
+        // Connected, stream open, not a byte sent — and kept alive.
+        let _squatter = dial(&one, fingerprint).await.expect("the stranger connects");
+
+        let started = std::time::Instant::now();
+        let mut out = dial(&one, fingerprint).await.expect("the peer still gets in");
+        out.write_all(&TOKEN).await.expect("token");
+        out.write_all(b"pas bloque").await.expect("write");
+        out.finish().expect("finish");
+        out.stopped().await.ok();
+        assert_eq!(receiving.await.unwrap(), b"pas bloque");
+        assert!(started.elapsed() < DIAL_TIMEOUT, "took {:?}", started.elapsed());
+    }
+
+    /// Knowing the port and the certificate is not enough: without the token
+    /// the connection is dropped and the wait goes on.
+    #[tokio::test]
+    async fn a_wrong_token_is_not_accepted() {
+        let listener = listen().expect("bind");
+        let one = [SocketAddr::from(([127, 0, 0, 1], listener.port()))];
+        let fingerprint = listener.fingerprint;
+        let receiving = tokio::spawn(async move {
+            let mut stream = listener.accept(TOKEN).await.expect("accept");
+            stream.read_to_end(1024).await.expect("read")
+        });
+
+        let mut guess = dial(&one, fingerprint).await.expect("connects");
+        guess.write_all(&[8u8; 32]).await.expect("token");
+        guess.write_all(b"intrus").await.expect("write");
+        guess.finish().expect("finish");
+
+        let mut out = dial(&one, fingerprint).await.expect("the peer gets in");
+        out.write_all(&TOKEN).await.expect("token");
+        out.write_all(b"le vrai").await.expect("write");
+        out.finish().expect("finish");
+        out.stopped().await.ok();
+        assert_eq!(receiving.await.unwrap(), b"le vrai");
+    }
+}

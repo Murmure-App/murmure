@@ -137,12 +137,12 @@ impl Link {
             loop {
                 tokio::select! {
                     msg = queued.recv() => match msg {
-                        Some(msg) => proto::write_sealed(&mut writer, &msg, &sealing).await?,
+                        Some(msg) => write_or_give_up(&mut writer, &msg, &sealing).await?,
                         // Every sender is gone: the link is closing.
                         None => break,
                     },
                     _ = tokio::time::sleep(keepalive_delay()) => {
-                        proto::write_sealed(&mut writer, &Message::Ping, &sealing).await?
+                        write_or_give_up(&mut writer, &Message::Ping, &sealing).await?
                     }
                 }
             }
@@ -225,6 +225,28 @@ impl Link {
             Ok(Err(e)) => Err(e).context("sending the last of what was queued"),
             Err(e) => bail!("the writer task panicked: {e}"),
         }
+    }
+}
+
+/// Write one frame, or fail once it has been stuck for [`SILENCE`].
+///
+/// A peer that stops reading leaves the write pending for ever: nothing errors,
+/// the queue fills, and `close` waits on a writer that never returns. The same
+/// deadline as the reader's, since it is the same verdict: they are gone.
+async fn write_or_give_up<W>(
+    writer: &mut W,
+    msg: &Message,
+    sealing: &std::sync::Mutex<crate::ratchet::Ratchet>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(SILENCE, proto::write_sealed(writer, msg, sealing)).await {
+        Ok(written) => written,
+        Err(_) => bail!(
+            "nothing could be sent for {} minutes — they are gone",
+            SILENCE.as_secs() / 60
+        ),
     }
 }
 

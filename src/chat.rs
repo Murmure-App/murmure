@@ -1224,6 +1224,9 @@ async fn push_direct(
     Ok(())
 }
 
+/// How long a direct transfer may go without a byte before it is given up.
+const DIRECT_STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Read a whole file off a direct stream into its partial, then hand it back
 /// for verification.
 async fn pull_direct(
@@ -1236,23 +1239,8 @@ async fn pull_direct(
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
 
-    // The port is public and anyone can reach it first: a connection without
-    // the token is dropped and the wait goes on, so a scanner that gets there
-    // before the peer does not cost the transfer.
-    let mut stream = loop {
-        let mut stream = listener.accept().await?;
-        let mut auth = [0u8; 32];
-        let read = tokio::time::timeout(
-            crate::transport::direct::DIAL_TIMEOUT,
-            stream.read_exact(&mut auth),
-        )
-        .await;
-        // Constant-time token verification
-        let mismatch = auth.iter().zip(token.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        if matches!(read, Ok(Ok(()))) && mismatch == 0 {
-            break stream;
-        }
-    };
+    // The port is public: `accept` drops whoever connects without the token.
+    let mut stream = listener.accept(token).await?;
 
     // Never a resume: `accept` sends a direct transfer over Tor as soon as a
     // partial exists. Truncate, so a stale partial longer than the offer (which
@@ -1269,9 +1257,11 @@ async fn pull_direct(
     let mut written = 0u64;
     let mut buf = vec![0u8; MAX_CHUNK];
     loop {
-        let n = stream
-            .read(&mut buf)
+        // The peer is authenticated but can still stall: without a deadline
+        // the transfer, and the call waiting on it, would hang for ever.
+        let n = tokio::time::timeout(DIRECT_STALL, stream.read(&mut buf))
             .await
+            .map_err(|_| anyhow::anyhow!("the direct link sent nothing for {DIRECT_STALL:?}"))?
             .context("reading the direct link")?
             .unwrap_or(0);
         if n == 0 {
