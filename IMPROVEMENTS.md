@@ -145,5 +145,9 @@ Relecture de tout `src/`, faite après la v0.1.0-beta.2. Treize commits, **aucun
 - ✅ **Identité et stockage** (`b17bddf`) : tampon du seed en `Zeroizing`, format `MURM2E` avec le coût Argon2 dans le fichier, fsync du répertoire après rename.
 - ✅ **Répertoire de données de la plateforme** (`e822567`) : `MURMURE_DIR`, sinon `./.murmure` s'il existe, sinon `~/.local/share/murmure` et équivalents.
 
+### Après le plan
+- ✅ **Lignes tapées pendant la composition d'un `/call`** (`038182f`) : gardées (16 au plus) et envoyées à la connexion ; la première fait sonner. Les commandes ne sont pas gardées.
+- ✅ **`/verify <nom>`** (`ff4101b`, P3-1) : numéro de sécurité de 60 chiffres, BLAKE3 sur les deux adresses triées, identique des deux côtés. Vérifié en live.
+
 ### P3 — Proposé, à valider
-`/verify` (numéro de sécurité de 60 chiffres), notifications (`\a` hors focus), messages multi-lignes, salons et réception pendant un appel, MSRV et clippy Windows/macOS en CI.
+Notifications (`\a` hors focus), messages multi-lignes, salons et réception pendant un appel, MSRV et clippy Windows/macOS en CI.
