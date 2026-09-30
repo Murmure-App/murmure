@@ -431,18 +431,29 @@ async fn serve(
     };
     // Whatever a previous run was relaying belongs to a room that is gone.
     hall.files.reset(None);
+    // The call, when there is one. It runs beside this loop, not instead of it.
+    let (aside, mut asides) = mpsc::unbounded_channel();
+    let mut phone = Phone { call: None, aside };
+    // An event one arm produces for another, taken before anything is waited on.
+    let mut next: Option<Event> = None;
 
     loop {
         // The select only *picks* the event. Handling it happens after, so that
-        // no borrow held by a branch future is still alive while a conversation
-        // runs — a conversation needs `lines`, and a call out of the pool needs
-        // the pool.
-        let event = tokio::select! {
-            stream = incoming.next() => Event::Called(stream.map(Box::new)),
-            Some(opened) = opening.join_next() => Event::Opened(opened),
-            line = lines.recv() => Event::Typed(line),
-            heard = pool.ready() => Event::Spoke(heard),
-            _ = sweep.tick() => Event::Sweep,
+        // no borrow held by a branch future is still alive while it is handled.
+        let event = match next.take() {
+            Some(event) => event,
+            None => tokio::select! {
+                stream = incoming.next() => Event::Called(stream.map(Box::new)),
+                Some(opened) = opening.join_next() => Event::Opened(opened),
+                line = lines.recv() => Event::Typed(line),
+                heard = pool.ready() => Event::Spoke(heard),
+                _ = sweep.tick() => Event::Sweep,
+                // The loop holds a sender for as long as it runs, so this
+                // never closes.
+                Some((peer, aside)) = asides.recv() => Event::Aside(peer, aside),
+                ended = async { (&mut phone.call.as_mut().expect("guarded").task).await },
+                    if phone.call.is_some() => Event::CallEnded(ended),
+            },
         };
 
         match event {
@@ -663,6 +674,16 @@ async fn serve(
                     continue;
                 }
                 let name = name_for(book, &peer);
+                // One call at a time. Told at once, like a second caller while
+                // the first is ringing, rather than left to ring through it.
+                if let Some(call) = &phone.call {
+                    if ringing.as_ref().is_some_and(|r| r.peer == peer) {
+                        ringing = None;
+                    }
+                    pool.send(peer, Message::CallDecline).await;
+                    screen.system(format!("-- {name} called while you were in a call with {} --", call.name));
+                    continue;
+                }
                 // Compared by peer, not merely by "is anybody calling". The
                 // caller cannot tell that we have not answered yet, so a second
                 // line typed before we do is the *same* call — and declining it
@@ -729,10 +750,65 @@ async fn serve(
                 tracing::debug!("a held connection ended");
             }
             Event::Sweep => hold_presence(&mut pool, book, &live),
+            // Said over the call's link, but not to the call: handled exactly as
+            // if it had come in on a connection nobody was talking over.
+            Event::Aside(peer, chat::Aside::Frame(msg)) => next = Some(Event::Spoke(Heard::Frame(peer, msg))),
+            // Checked as it is written rather than when the call began, so an
+            // objection made mid-call stops it at the next line.
+            Event::Aside(peer, chat::Aside::Note { mine, body }) => {
+                let name = name_for(book, &peer);
+                if let Some(h) = recording(history, book, &name)
+                    && let Err(e) = h.note(&peer.display_unredacted().to_string(), mine, &body)
+                {
+                    screen.error(format!("could not write to the history: {e:#}"));
+                }
+            }
+            Event::Aside(peer, chat::Aside::Opened(link)) => pool.opened(peer, link).await,
+            Event::CallEnded(ended) => {
+                let Some(call) = phone.call.take() else { continue };
+                pool.give_back();
+                let end = ended.unwrap_or_else(|e| {
+                    screen.error(format!("-- the call failed: {e} --"));
+                    CallEnd { link: None, alive: false, flow: Flow::Continue }
+                });
+                if let Some(link) = end.link {
+                    // Gone with the call: whatever else was said over it — a
+                    // room, presence — learns it the way it would from the pool.
+                    if !end.alive {
+                        next = Some(Event::Spoke(Heard::Lost(call.peer)));
+                    }
+                    shelve(&mut pool, link, end.alive, outbox, screen).await;
+                }
+                if let Flow::Quit = end.flow {
+                    leave_room(&mut hall.rooms, &mut pool).await;
+                    break;
+                }
+                screen.status("listening");
+            }
             // The interface is gone: Ctrl-C, or the terminal closed.
             Event::Typed(None) => {
+                // The call sees its keyboard close and hangs up. Its link goes
+                // back to the pool so that what it said on the way out is
+                // flushed with everything else below.
+                if let Some(call) = phone.call.take() {
+                    drop(call.keys);
+                    if let Ok(Ok(CallEnd { link: Some(link), .. })) =
+                        tokio::time::timeout(Duration::from_secs(2), call.task).await
+                    {
+                        pool.give_back();
+                        pool.keep(link).await;
+                    }
+                }
                 leave_room(&mut hall.rooms, &mut pool).await;
                 break;
+            }
+            // During a call, whatever is the call's goes to it — words, files,
+            // and its own commands. The rest is run out here as ever, so a
+            // room, a `/tell` or `/contacts` still work mid-call.
+            Event::Typed(Some(line)) if phone.call.as_ref().is_some_and(|_| chat::is_for_call(&line)) => {
+                let call = phone.call.as_ref().expect("guarded by the arm");
+                // A task that has just ended: its end is on its way.
+                let _ = call.keys.send(line).await;
             }
             Event::Typed(Some(line)) => {
                 // Files dropped on the window, inside a room: each one is put
@@ -778,7 +854,7 @@ async fn serve(
                 // like a `/call` that was swallowed.
                 screen.say(Kind::Mine, format!("> {}", line.trim()));
                 match command(
-                    line, book, &live, &mut pool, outbox, history, &mut ringing, &mut hall, lines,
+                    line, book, &live, &mut pool, outbox, history, &mut ringing, &mut hall, &mut phone,
                     started, screen,
                 )
                     .await
@@ -866,6 +942,10 @@ enum Event {
     Spoke(Heard),
     /// Time to make sure everyone we agreed presence with is still connected.
     Sweep,
+    /// Something the call running beside the loop handed over.
+    Aside(HsId, chat::Aside),
+    /// The call ended, or its task did.
+    CallEnded(Result<CallEnd, tokio::task::JoinError>),
 }
 
 /// How many incoming connections may be in their handshake at once. Past
@@ -1068,33 +1148,15 @@ async fn converse(
     first: Vec<Message>,
     incoming_dir: &Path,
     lines: &mut mpsc::Receiver<ui::Typed>,
-    history: Option<&mut History>,
-    book: &mut Contacts,
+    aside: &chat::Asides,
     screen: &Screen,
 ) -> (Flow, bool) {
     // The one place both an outgoing and an incoming call pass through, so the
     // input box learns who it is pointed at — and, whatever happens next,
     // learns that it is pointed at nobody again.
     screen.in_call(Some(peer));
-    // Set if they ask, mid-call, not to be written down. Stored below rather
-    // than inside the conversation: a standing objection lives in the contacts
-    // book, and a conversation has no business reaching into it.
-    let mut objected = false;
-    let ended = chat::run(
-        link,
-        peer,
-        first,
-        incoming_dir,
-        lines,
-        history,
-        &mut objected,
-        screen,
-    )
-    .await;
+    let ended = chat::run(link, peer, first, incoming_dir, lines, aside, screen).await;
     screen.in_call(None);
-    if objected && let Err(e) = book.set_objection(peer, true) {
-        screen.error(format!("could not record that {peer} objects: {e:#}"));
-    }
 
     match ended {
         Ok(ended) => {
@@ -1125,7 +1187,7 @@ async fn command(
     history: &mut History,
     ringing: &mut Option<Ringing>,
     hall: &mut Hall,
-    lines: &mut mpsc::Receiver<ui::Typed>,
+    phone: &mut Phone,
     started: Instant,
     screen: &Screen,
 ) -> Result<Flow> {
@@ -1161,6 +1223,9 @@ async fn command(
             // Read before the removal, because after it there is no contact to
             // look the address up on.
             let address = book.address_of(name).and_then(|a| a.parse::<HsId>().ok());
+            if phone.call.as_ref().is_some_and(|c| Some(c.peer) == address) {
+                bail!("you are in a call with {name} — /bye first");
+            }
             if book.remove(name)? {
                 live.resync(book)?;
                 screen.set_contacts(book.iter().map(|(name, _)| name.to_owned()).collect());
@@ -1418,31 +1483,17 @@ async fn command(
             }
         }
         "/answer" => {
+            phone.idle()?;
             let Some(call) = ringing.take() else {
                 bail!("nobody is calling");
             };
-            let Some(mut link) = pool.take(&call.peer) else {
+            if !pool.holds(&call.peer) {
                 // The connection went away between the ring and the answer.
                 bail!("{} is no longer connected", call.name);
-            };
+            }
             screen.system(format!("-- in a call with {} --", call.name));
             screen.status(format!("in a call with {}", call.name));
-            let (flow, alive) = converse(
-                &mut link,
-                &call.name,
-                call.said,
-                live.incoming_dir,
-                lines,
-                recording(history, book, &call.name),
-                book,
-                screen,
-            )
-            .await;
-            shelve(pool, link, alive, outbox, screen).await;
-            if let Flow::Continue = flow {
-                screen.status("listening");
-            }
-            return Ok(flow);
+            phone.start(pool, live, started, call.peer, &call.name, call.said, screen);
         }
         "/decline" => {
             let Some(call) = ringing.take() else {
@@ -1473,9 +1524,24 @@ async fn command(
             };
             let address = book
                 .address_of(name)
-                .ok_or_else(|| anyhow::anyhow!("no contact called {name} — /add them first"))?
-                .to_owned();
-            return call(started, live, pool, book, outbox, history, name, &address, lines, screen).await;
+                .ok_or_else(|| anyhow::anyhow!("no contact called {name} — /add them first"))?;
+            phone.idle()?;
+            let peer: HsId = address
+                .parse()
+                .map_err(|e| anyhow::anyhow!("{address} is not a valid onion address: {e}"))?;
+            // The connection may already be there, in which case there is
+            // nothing to compose. This is what the pool is for, and the only
+            // visible difference is that the seven-to-fifty-second wait does
+            // not happen.
+            if pool.holds(&peer) {
+                screen.system(format!("-- still connected to {name} --"));
+                screen.status(format!("in a call with {name}"));
+            } else {
+                screen.system(format!("calling {name} — fingerprint {}", onion::fingerprint(address)));
+                screen.system("7-50 s is normal. /cancel to give up.");
+                screen.status(format!("calling {name}"));
+            }
+            phone.start(pool, live, started, peer, name, Vec::new(), screen);
         }
         "/verify" => {
             let Some(name) = parts.next() else {
@@ -1548,6 +1614,15 @@ async fn command(
                 }
                 Some("join") => hall.rooms.join()?,
                 Some("decline") => hall.rooms.decline()?,
+                // Words for the room when a plain line would not reach it:
+                // during a call, what is typed goes to the call.
+                Some("say") => {
+                    let text = after_words(line, 2);
+                    if text.is_empty() {
+                        bail!("usage: /room say <text>");
+                    }
+                    hall.rooms.say(text)?
+                }
                 Some("leave") => {
                     let out = hall.rooms.leave()?;
                     screen.system(format!("-- you left #{} --", before.as_deref().unwrap_or_default()));
@@ -1576,7 +1651,7 @@ async fn command(
                 }
                 Some(_) => bail!(
                     "usage: /room [new <name> | invite <name> | join | decline | leave | \
-                     send <path> | files | get <n>]"
+                     say <text> | send <path> | files | get <n>]"
                 ),
             };
             apply_room(out, before, hall, book, pool, live, screen).await;
@@ -1593,61 +1668,123 @@ async fn command(
     Ok(Flow::Continue)
 }
 
-/// Reach a contact — from the pool if we are already connected, by dialling if
-/// not — and hold a conversation.
-#[allow(clippy::too_many_arguments)]
-async fn call(
-    started: Instant,
-    live: &Live<'_>,
-    pool: &mut Pool,
-    book: &mut Contacts,
-    outbox: &Outbox,
-    history: &mut History,
-    name: &str,
-    address: &str,
-    lines: &mut mpsc::Receiver<ui::Typed>,
-    screen: &Screen,
-) -> Result<Flow> {
-    let hs_id: tor_hscrypto::pk::HsId = address
-        .parse()
-        .map_err(|e| anyhow::anyhow!("{address} is not a valid onion address: {e}"))?;
+/// The call, when there is one, and the way back from it to the idle loop.
+struct Phone {
+    call: Option<Calling>,
+    aside: chat::Asides,
+}
 
-    // The connection may already be there, in which case there is nothing to
-    // compose. This is what the pool is for, and the only visible difference is
-    // that the seven-to-fifty-second wait does not happen.
-    if let Some(mut link) = pool.take(&hs_id) {
-        screen.system(format!("-- still connected to {name} --"));
-        screen.status(format!("in a call with {name}"));
-        let (flow, alive) = converse(
-            &mut link,
-            name,
-            Vec::new(),
-            live.incoming_dir,
-            lines,
-            recording(history, book, name),
-            book,
-            screen,
-        )
-        .await;
-        shelve(pool, link, alive, outbox, screen).await;
-        if let Flow::Continue = flow {
-            screen.status("listening");
+/// A call in progress. It runs in a task beside the idle loop rather than
+/// instead of it, so a room, presence and messages left keep going while it
+/// lasts.
+struct Calling {
+    peer: HsId,
+    /// What we know them by, for saying so.
+    name: String,
+    /// The keyboard, for whatever typed is the call's.
+    keys: mpsc::Sender<ui::Typed>,
+    task: tokio::task::JoinHandle<CallEnd>,
+}
+
+/// How a call ended, and the link it leaves behind, if it had one.
+struct CallEnd {
+    link: Option<Link>,
+    /// Whether the link is worth keeping: see [`converse`].
+    alive: bool,
+    flow: Flow,
+}
+
+/// What a call needs to dial, when there is no connection to take.
+struct Dial {
+    client: tor::Client,
+    me: Arc<Identity>,
+    started: Instant,
+}
+
+impl Phone {
+    /// Refuse a second call. One at a time, as ever.
+    fn idle(&self) -> Result<()> {
+        match &self.call {
+            Some(call) => bail!("you are in a call with {} — /bye first", call.name),
+            None => Ok(()),
         }
-        return Ok(flow);
     }
 
-    screen.system(format!(
-        "calling {name} — fingerprint {}",
-        onion::fingerprint(address)
-    ));
-    screen.system("7-50 s is normal. /cancel to give up.");
-    screen.status(format!("calling {name}"));
+    /// Start a call beside the idle loop: over the pool's connection to them if
+    /// there is one, dialled otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        &mut self,
+        pool: &mut Pool,
+        live: &Live<'_>,
+        started: Instant,
+        peer: HsId,
+        name: &str,
+        first: Vec<Message>,
+        screen: &Screen,
+    ) {
+        let link = pool.lend(peer);
+        let (keys, lines) = mpsc::channel(8);
+        let dial = Dial { client: live.client.clone(), me: live.identity.clone(), started };
+        let task = tokio::spawn(call(
+            link,
+            dial,
+            peer,
+            name.to_owned(),
+            first,
+            lines,
+            live.incoming_dir.to_owned(),
+            self.aside.clone(),
+            screen.clone(),
+        ));
+        self.call = Some(Calling { peer, name: name.to_owned(), keys, task });
+    }
+}
 
+/// One call, from the dial if there is one to its end.
+#[allow(clippy::too_many_arguments)]
+async fn call(
+    link: Option<Link>,
+    dial: Dial,
+    peer: HsId,
+    name: String,
+    first: Vec<Message>,
+    mut lines: mpsc::Receiver<ui::Typed>,
+    incoming_dir: PathBuf,
+    aside: chat::Asides,
+    screen: Screen,
+) -> CallEnd {
+    let mut link = match link {
+        Some(link) => link,
+        None => match dial_out(&dial, peer, &name, &mut lines, &screen).await {
+            Ok((link, held)) => {
+                let _ = aside.send((peer, chat::Aside::Opened(link.outbox.clone())));
+                screen.system(format!("-- connected to {name} --"));
+                screen.status(format!("in a call with {name}"));
+                chat::said_ahead(&link, held, &aside, &screen).await;
+                link
+            }
+            Err(flow) => return CallEnd { link: None, alive: false, flow },
+        },
+    };
+    let (flow, alive) = converse(&mut link, &name, first, &incoming_dir, &mut lines, &aside, &screen).await;
+    CallEnd { link: Some(link), alive, flow }
+}
+
+/// Dial them, answering the keyboard while it takes. The link and what was
+/// typed to them meanwhile — or, given up, how the operator wants to carry on.
+async fn dial_out(
+    dial: &Dial,
+    peer: HsId,
+    name: &str,
+    lines: &mut mpsc::Receiver<ui::Typed>,
+    screen: &Screen,
+) -> std::result::Result<(Link, Vec<String>), Flow> {
     // The keyboard has to stay answered while we dial. Without this, typed
     // lines queue silently for up to four minutes and are then delivered to
     // the peer as messages the moment the call connects — which is how a
     // `/add <name> <address>` ends up sent to whoever answered.
-    let dialling = tor::dial_retrying(live.client, hs_id, DIAL_TIMEOUT, |attempt, err| {
+    let dialling = tor::dial_retrying(&dial.client, peer, DIAL_TIMEOUT, |attempt, err| {
         {
             // arti's chain is four nested sentences that repeat themselves and
             // name a truncated address. All of it means one thing, and the log
@@ -1660,7 +1797,7 @@ async fn call(
             } else {
                 "did not connect"
             };
-            stage(screen, started, &format!("attempt {attempt}: {why}, retrying"));
+            stage(screen, dial.started, &format!("attempt {attempt}: {why}, retrying"));
         }
     });
     futures::pin_mut!(dialling);
@@ -1680,14 +1817,14 @@ async fn call(
             outcome = &mut dialling => match outcome {
                 Ok(stream) => break stream,
                 Err(e) => {
+                    screen.error(format!("{e:#}"));
                     unsent(&held);
-                    screen.status("listening");
-                    return Err(e);
+                    return Err(Flow::Continue);
                 }
             },
             line = lines.recv() => match line {
                 // The interface is gone.
-                None => return Ok(Flow::Quit),
+                None => return Err(Flow::Quit),
                 Some(ui::Typed::Post { .. }) => screen.error(format!(
                     "-- not sent: files go once {name} answers; drop them again then --"
                 )),
@@ -1695,15 +1832,14 @@ async fn call(
                     "/cancel" => {
                         unsent(&held);
                         screen.system(format!("gave up calling {name}"));
-                        screen.status("listening");
-                        return Ok(Flow::Continue);
+                        return Err(Flow::Continue);
                     }
                     // Giving up on a call that has not connected is the one
                     // place where `/quit` needs no hang-up: there is nothing
                     // to hang up.
                     "/quit" => {
                         screen.system(format!("gave up calling {name}"));
-                        return Ok(Flow::Quit);
+                        return Err(Flow::Quit);
                     }
                     "" => {}
                     // `//` escapes a line that opens with a slash, as in a call.
@@ -1728,13 +1864,12 @@ async fn call(
     };
 
     let (reader, writer) = stream.split();
-    let mut link = match Link::open(reader, writer, live.identity, Some(hs_id)).await {
+    let link = match Link::open(reader, writer, &dial.me, Some(peer)).await {
         Ok(link) => link,
         Err(e) => {
             screen.error(format!("-- call dropped: {e:#} --"));
             unsent(&held);
-            screen.status("listening");
-            return Ok(Flow::Continue);
+            return Err(Flow::Continue);
         }
     };
 
@@ -1742,36 +1877,17 @@ async fn call(
     // something between us answered for them — so this is refused rather than
     // answered, and it is checked here rather than by name, because the key is
     // what was signed for.
-    if link.peer != hs_id {
+    if link.peer != peer {
         screen.error(format!(
             "-- refused: you called {name}, but the far side proved a different key ({}) --",
             onion::fingerprint(&link.peer.display_unredacted().to_string())
         ));
         let _ = link.close(false).await;
         unsent(&held);
-        screen.status("listening");
-        return Ok(Flow::Continue);
+        return Err(Flow::Continue);
     }
 
-    screen.system(format!("-- connected to {name} --"));
-    screen.status(format!("in a call with {name}"));
-    chat::said_ahead(&link, held, recording(history, book, name), screen).await;
-    let (flow, alive) = converse(
-        &mut link,
-        name,
-        Vec::new(),
-        live.incoming_dir,
-        lines,
-        recording(history, book, name),
-        book,
-        screen,
-    )
-    .await;
-    shelve(pool, link, alive, outbox, screen).await;
-    if let Flow::Continue = flow {
-        screen.status("listening");
-    }
-    Ok(flow)
+    Ok((link, held))
 }
 
 fn help(screen: &Screen) {
@@ -1807,6 +1923,7 @@ fn help(screen: &Screen) {
         "  /room invite <name>           ask a contact in (you host: when you leave, it ends)",
         "  /room join   /room decline    answer an invitation",
         "  /room                         who is in the room      /room leave to go",
+        "  /room say <text>              talk to the room during a call, which takes plain lines",
         "  /room send <path>             put a file in the room (or drop it on the window)",
         "  /room files   /room get <n>   list the files, take one — it may come through the host",
         "                                people who are not your contacts show as ~a1b2c3d4",

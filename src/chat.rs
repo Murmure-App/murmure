@@ -40,9 +40,7 @@ use anyhow::{Context as _, Result, bail};
 use tokio::sync::mpsc;
 
 use crate::files::{self, Offer};
-use safelog::DisplayRedacted as _;
 
-use crate::history::History;
 use crate::link::Link;
 use crate::proto::{self, MAX_CHUNK, MAX_TEXT, Message};
 use crate::ui::{Kind, Screen};
@@ -304,6 +302,25 @@ fn take_pending(pending: &mut Vec<Offered>, which: Which) -> Result<Offered> {
     Ok(pending.remove(index))
 }
 
+/// What a call hands to the idle loop, which runs beside it and owns what a
+/// conversation does not: the record, the rooms, the outbox.
+#[derive(Debug)]
+pub enum Aside {
+    /// A frame that came over the call's link but is not part of the call — a
+    /// room, presence, a message left. The connection is shared; the call is
+    /// only one thing said over it.
+    Frame(Message),
+    /// A line of the conversation, to be kept if anything is kept. Decided out
+    /// there, where whether this contact objects is known at the moment it is
+    /// written rather than when the call began.
+    Note { mine: bool, body: String },
+    /// The call's link is open: how to reach the peer while the call has it.
+    Opened(mpsc::Sender<Message>),
+}
+
+/// Where a call sends its [`Aside`]s, each with who it is about.
+pub type Asides = mpsc::UnboundedSender<(tor_hscrypto::pk::HsId, Aside)>;
+
 /// A file coming in, and how far it has got.
 struct Receiving {
     file: std::fs::File,
@@ -330,9 +347,8 @@ struct Receiving {
 /// start it — so they arrive here rather than on the wire. A caller cannot tell
 /// that nobody has answered yet, so there may be several. See [`crate::pool`].
 ///
-/// `objected` is set if the peer asks mid-call not to be written down. A
-/// conversation cannot reach the contacts book itself, and the request is a
-/// standing one rather than an event — so it has to leave here to be stored.
+/// What is said is noted, and what is not the call's is passed on, through
+/// `aside` — see [`Aside`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     link: &mut Link,
@@ -340,17 +356,10 @@ pub async fn run(
     first: Vec<Message>,
     incoming_dir: &Path,
     lines: &mut mpsc::Receiver<crate::ui::Typed>,
-    history: Option<&mut History>,
-    objected: &mut bool,
+    aside: &Asides,
     screen: &Screen,
 ) -> Result<Ended> {
-    // Filed under the address, never the name: a name is ours to change, and a
-    // record split in two by a `/forget` and a re-`/add` is a record nobody can
-    // read back.
-    let with = link.peer.display_unredacted().to_string();
-    // Reassigned to `None` if they ask not to be written down, which stops it
-    // for the rest of this call without waiting for anything to be stored.
-    let mut history = history;
+    let with = link.peer;
     // Borrowed as separate fields, because the loop needs to send a reply while
     // waiting on the next frame.
     let outbox = &link.outbox;
@@ -399,11 +408,11 @@ pub async fn run(
         // other one so the conversation starts where the peer thinks it does.
         if let Some(msg) = first.pop_front() {
             let outcome = handle(
-                msg, peer, &with, incoming_dir,
+                msg, peer, with, incoming_dir,
                 &mut pending, &mut next_number, &mut next_batch,
                 &mut receiving, &mut sending, &mut offered,
                 &mut direct_task, &direct_done_tx,
-                outbox, &mut history, screen,
+                outbox, aside, screen,
             ).await;
             match outcome {
                 Err(e) => {
@@ -442,7 +451,7 @@ pub async fn run(
                 // it goes out as a Post, with the files where they were put.
                 let line = match line {
                     crate::ui::Typed::Post { parts, direct } => {
-                        match post(parts, direct, &mut offered, outbox, &with, &mut history, screen)
+                        match post(parts, direct, &mut offered, outbox, with, aside, screen)
                             .await
                         {
                             Ok(()) => {}
@@ -565,7 +574,7 @@ pub async fn run(
                         // one-sided on screen, and there is no way to tell a
                         // sent message from a swallowed one.
                         screen.say(Kind::Mine, format!("you> {text}"));
-                        note(&mut history, &with, true, &text, screen);
+                        note(aside, with, true, &text);
                         if outbox.send(Message::Text(text)).await.is_err() {
                             break Ended::PeerHungUp;
                         }
@@ -625,32 +634,11 @@ pub async fn run(
                         });
                         continue;
                     }
+                    // Settled out in the idle loop, which owns the record
+                    // and the book. Through the same queue as the notes, so
+                    // whatever is noted after this is noted after it.
                     Some(Ok(Message::DontRecord)) => {
-                        // Backwards as well as forwards. The conversation the
-                        // request is made *during* is the only one the person
-                        // making it can see, so stopping at the next line would
-                        // keep exactly the part they were objecting to.
-                        let erased = match history.as_mut() {
-                            None => 0,
-                            Some(h) => match h.forget(&with) {
-                                Ok(gone) => gone,
-                                Err(e) => {
-                                    screen.error(format!("{e:#}"));
-                                    0
-                                }
-                            },
-                        };
-                        if history.is_some() {
-                            screen.system(format!(
-                                "-- {peer} asked not to be written down; nothing of theirs \
-                                 is kept, and {erased} line(s) were erased --"
-                            ));
-                        }
-                        history = None;
-                        // Reported up so it reaches the contacts book. Without
-                        // that it is an event, and the next call would start
-                        // recording them again.
-                        *objected = true;
+                        let _ = aside.send((with, Aside::Frame(Message::DontRecord)));
                         continue;
                     }
                     Some(Ok(msg)) => msg,
@@ -676,11 +664,11 @@ pub async fn run(
                     }
                 };
                 let outcome = handle(
-                    msg, peer, &with, incoming_dir,
+                    msg, peer, with, incoming_dir,
                     &mut pending, &mut next_number, &mut next_batch,
                     &mut receiving, &mut sending, &mut offered,
                     &mut direct_task, &direct_done_tx,
-                    outbox, &mut history, screen,
+                    outbox, aside, screen,
                 ).await;
                 match outcome {
                     // A protocol fault ends the conversation rather than being
@@ -777,12 +765,11 @@ pub async fn run(
 ///
 /// Echoed, written down and sent exactly as [`run`] does a line typed during
 /// the call — so the first of them is what rings at the other end.
-pub async fn said_ahead(link: &Link, lines: Vec<String>, history: Option<&mut History>, screen: &Screen) {
-    let with = link.peer.display_unredacted().to_string();
-    let mut history = history;
+pub async fn said_ahead(link: &Link, lines: Vec<String>, aside: &Asides, screen: &Screen) {
+    let with = link.peer;
     for text in lines {
         screen.say(Kind::Mine, format!("you> {text}"));
-        note(&mut history, &with, true, &text, screen);
+        note(aside, with, true, &text);
         // A peer gone already: the conversation loop sees the same and says so.
         if link.outbox.send(Message::Text(text)).await.is_err() {
             break;
@@ -790,26 +777,13 @@ pub async fn said_ahead(link: &Link, lines: Vec<String>, history: Option<&mut Hi
     }
 }
 
-/// Write one line down, if anything is being written down.
+/// Hand one line over to be written down, if anything is being written down.
 ///
-/// One helper rather than a check at each site, because "what is recorded" has
+/// One helper rather than a note at each site, because "what is recorded" has
 /// to mean exactly "what appeared on screen as a line of the conversation" —
 /// and the way that stays true is for there to be one place that decides.
-///
-/// A failure to write is shown and swallowed. Losing a line of the record is
-/// bad; ending a call over it is worse.
-fn note(
-    history: &mut Option<&mut History>,
-    with: &str,
-    mine: bool,
-    body: &str,
-    screen: &Screen,
-) {
-    if let Some(h) = history.as_mut()
-        && let Err(e) = h.note(with, mine, body)
-    {
-        screen.error(format!("could not write to the history: {e:#}"));
-    }
+fn note(aside: &Asides, with: tor_hscrypto::pk::HsId, mine: bool, body: &str) {
+    let _ = aside.send((with, Aside::Note { mine, body: body.to_owned() }));
 }
 
 /// Is there file business we should not walk out on?
@@ -835,7 +809,7 @@ fn busy(
 async fn handle(
     msg: Message,
     peer: &str,
-    with: &str,
+    with: tor_hscrypto::pk::HsId,
     incoming_dir: &Path,
     pending: &mut Vec<Offered>,
     next_number: &mut usize,
@@ -846,7 +820,7 @@ async fn handle(
     direct_task: &mut Option<DirectTask>,
     direct_done: &mpsc::Sender<DirectDone>,
     outbox: &mpsc::Sender<Message>,
-    history: &mut Option<&mut History>,
+    aside: &Asides,
     screen: &Screen,
 ) -> Result<bool> {
     match msg {
@@ -856,28 +830,23 @@ async fn handle(
             // dangerous as a filename here.
             let body = files::sanitize_message(&body);
             screen.say(Kind::Theirs, format!("{peer}> {body}"));
-            note(history, with, false, &body, screen);
+            note(aside, with, false, &body);
         }
         // Keepalives never get here — [`crate::link`] drops them where they
-        // arrive, because a conversation is not the thing that keeps a
-        // connection alive. Presence is answered out in the idle loop for the
-        // same reason: agreeing to be seen is not something said during a call.
-        // A decline is caught by the loop, which has to *end* on it rather
-        // than absorb it. Reaching here means it arrived mid-conversation,
-        // where it says nothing.
-        Message::Ping
-        | Message::PresenceAsk
+        // arrive. A decline is caught by the loop, which has to *end* on it
+        // rather than absorb it; reaching here means it arrived
+        // mid-conversation, where it says nothing.
+        Message::Ping | Message::CallDecline | Message::HangUp | Message::Recording(_) => {}
+
+        // Not part of the call, only said over the same connection: presence,
+        // a room, a message left, and an objection to the record. All of it
+        // belongs to the idle loop, which runs beside the call and owns the
+        // book, the rooms and the outbox.
+        msg @ (Message::PresenceAsk
         | Message::PresenceYes
         | Message::PresenceNo
-        | Message::CallDecline
-        | Message::HangUp
-        | Message::Recording(_)
-        | Message::DontRecord => {}
-
-        // A room lives in the idle loop, and a call holds this link away from
-        // it. What the room said over this link during the call is lost —
-        // the limit of one conversation at a time, written down in the README.
-        Message::RoomInvite { .. }
+        | Message::DontRecord
+        | Message::RoomInvite { .. }
         | Message::RoomJoin { .. }
         | Message::RoomDecline { .. }
         | Message::RoomLeave { .. }
@@ -888,13 +857,11 @@ async fn handle(
         | Message::RoomFetch { .. }
         | Message::RoomChunk { .. }
         | Message::RoomDone { .. }
-        | Message::RoomNoFile { .. } => {}
-
-        // Outbox traffic, which belongs to the idle loop: it owns the sealed
-        // queue and the delivery marks, and neither is a thing a conversation
-        // should be reaching into. Ignored rather than acknowledged, so the
-        // sender redelivers once the call is over and nothing is lost.
-        Message::Left { .. } | Message::Got(_) => {}
+        | Message::RoomNoFile { .. }
+        | Message::Left { .. }
+        | Message::Got(_)) => {
+            let _ = aside.send((with, Aside::Frame(msg)));
+        }
 
         // The old one-file-per-conversation offer. Kept so a peer running the
         // previous version is still understood: it is the same thing as a Post
@@ -957,7 +924,7 @@ async fn handle(
             screen.say_with_files(Kind::Theirs, shown.trim_end().to_owned(), chips);
             // Without the "alice> " lead: the record stores what was said, and
             // who said it is already a field.
-            note(history, with, false, shown[lead.len()..].trim_end(), screen);
+            note(aside, with, false, shown[lead.len()..].trim_end());
 
             for (number, f) in files {
                 let hash = f.hash;
@@ -1188,8 +1155,8 @@ async fn post(
     direct: bool,
     offered: &mut Vec<Outgoing>,
     outbox: &mpsc::Sender<Message>,
-    with: &str,
-    history: &mut Option<&mut History>,
+    with: tor_hscrypto::pk::HsId,
+    aside: &Asides,
     screen: &Screen,
 ) -> Result<()> {
     let mut pieces = Vec::new();
@@ -1231,7 +1198,7 @@ async fn post(
     }
 
     screen.say(Kind::Mine, format!("you> {}", shown.trim()));
-    note(history, with, true, shown.trim(), screen);
+    note(aside, with, true, shown.trim());
     if !fresh.is_empty() {
         screen.system(format!(
             "-- offered {} file{}; waiting for them to accept --",
@@ -1606,6 +1573,16 @@ enum Typed {
     Message(String),
 }
 
+/// Whether a typed line is the call's, rather than the idle loop's that runs
+/// beside it: words, files, and the commands a call understands. The rest — a
+/// room, `/tell`, `/contacts` — still works mid-call, out there.
+pub fn is_for_call(typed: &crate::ui::Typed) -> bool {
+    match typed {
+        crate::ui::Typed::Post { .. } => true,
+        crate::ui::Typed::Line(line) => !matches!(classify(line), Typed::UnknownCommand(_)),
+    }
+}
+
 /// Decide what a typed line is.
 ///
 /// A leading `/` means "command" during a call, and the set is closed: hang up,
@@ -1701,9 +1678,8 @@ mod tests {
             .then(|| crate::identity::Identity::for_test([2u8; 32]).onion_address());
         let mut link =
             Link::open(reader, writer, &crate::identity::Identity::for_test(seed), dialled).await?;
-        let mut objected = false;
         let talked = run(
-            &mut link, peer, Vec::new(), incoming_dir, lines, None, &mut objected, screen,
+            &mut link, peer, Vec::new(), incoming_dir, lines, &mpsc::unbounded_channel().0, screen,
         )
         .await;
         // Tests close the link after the call, which `main` never does, so the
@@ -1967,7 +1943,7 @@ mod tests {
         let (mine, mut theirs) = (mine.unwrap(), theirs.unwrap());
         let (screen, mut updates) = crate::ui::channel();
 
-        said_ahead(&mine, vec!["salut".into(), "/pas une commande".into()], None, &screen).await;
+        said_ahead(&mine, vec!["salut".into(), "/pas une commande".into()], &mpsc::unbounded_channel().0, &screen).await;
 
         for want in ["salut", "/pas une commande"] {
             let got = theirs.inbox.recv().await.unwrap().unwrap();
@@ -2021,15 +1997,13 @@ mod tests {
         });
 
         let announced = Message::Text("said before you looked".into());
-        let mut objected = false;
         let ended = run(
             &mut mine,
             "bob",
             vec![announced],
             &dir,
             &mut lines,
-            None,
-            &mut objected,
+            &mpsc::unbounded_channel().0,
             &screen,
         )
         .await
@@ -2069,10 +2043,9 @@ mod tests {
         let (screen, _updates) = crate::ui::channel();
 
         theirs.outbox.send(Message::HangUp).await.unwrap();
-        let mut objected = false;
         let ended = run(
-            &mut mine, "bob", vec![Message::Text("salut".into())], &dir, &mut lines, None,
-            &mut objected, &screen,
+            &mut mine, "bob", vec![Message::Text("salut".into())], &dir, &mut lines,
+            &mpsc::unbounded_channel().0, &screen,
         )
         .await
         .unwrap();
@@ -2108,15 +2081,13 @@ mod tests {
 
         let (_keys, mut lines) = mpsc::channel::<crate::ui::Typed>(1);
         let (screen, _updates) = crate::ui::channel();
-        let mut objected = false;
         let ended = run(
             &mut caller,
             "bob",
             Vec::new(),
             &dir,
             &mut lines,
-            None,
-            &mut objected,
+            &mpsc::unbounded_channel().0,
             &screen,
         )
         .await
@@ -2133,8 +2104,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Two links over one duplex, and a record for the first one's side.
-    async fn recorded(dir: &Path) -> (Link, Link, History) {
+    /// Two links over one duplex.
+    async fn paired() -> (Link, Link) {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (ar, aw) = tokio::io::split(a);
         let (br, bw) = tokio::io::split(b);
@@ -2146,73 +2117,78 @@ mod tests {
             Link::open(ar.compat(), aw.compat_write(), &one, Some(two.onion_address())),
             Link::open(br.compat(), bw.compat_write(), &two, None)
         );
-        let mut history = History::open(&dir.join("history.sealed"), &one).unwrap();
-        history.set(true).unwrap();
-        (mine.unwrap(), theirs.unwrap(), history)
+        (mine.unwrap(), theirs.unwrap())
     }
 
-    /// What is kept is what appeared on screen, from both sides.
+    /// Everything handed aside, in the order it was handed.
+    fn drained(mut asides: mpsc::UnboundedReceiver<(tor_hscrypto::pk::HsId, Aside)>) -> Vec<Aside> {
+        let mut out = Vec::new();
+        while let Ok((_, aside)) = asides.try_recv() {
+            out.push(aside);
+        }
+        out
+    }
+
+    /// What is noted is what appeared on screen, from both sides.
     #[tokio::test]
-    async fn a_recorded_conversation_keeps_both_halves() {
+    async fn a_conversation_notes_both_halves() {
         let dir = scratch("recorded");
-        let (mut mine, _theirs, mut history) = recorded(&dir).await;
-        let with = mine.peer.display_unredacted().to_string();
+        let (mut mine, _theirs) = paired().await;
 
         let (keys, mut lines) = mpsc::channel::<crate::ui::Typed>(4);
         keys.send(line("ok")).await.unwrap();
         keys.send(line("/bye")).await.unwrap();
         let (screen, _updates) = crate::ui::channel();
+        let (aside, asides) = mpsc::unbounded_channel();
 
         let announced = Message::Text("salut".into());
-        run(
-            &mut mine,
-            "bob",
-            vec![announced],
-            &dir,
-            &mut lines,
-            Some(&mut history),
-            &mut false,
-            &screen,
-        )
-        .await
-        .unwrap();
+        run(&mut mine, "bob", vec![announced], &dir, &mut lines, &aside, &screen)
+            .await
+            .unwrap();
 
-        let kept = history.tail(Some(&with), 10);
-        assert_eq!(kept.len(), 2, "both halves, or it is not a conversation");
-        assert_eq!(kept[0].body, "salut");
-        assert!(!kept[0].mine);
-        assert_eq!(kept[1].body, "ok");
-        assert!(kept[1].mine, "and it has to know which one you said");
+        let noted: Vec<(bool, String)> = drained(asides)
+            .into_iter()
+            .filter_map(|a| match a {
+                Aside::Note { mine, body } => Some((mine, body)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            noted,
+            [(false, "salut".to_owned()), (true, "ok".to_owned())],
+            "both halves, and which one you said"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Asking not to be written down stops it at once, and reaches backwards.
+    /// What is not the call's goes to the idle loop, in order with the notes.
     ///
-    /// The conversation the request is made *during* is the only one the person
-    /// making it can see. An earlier version of this test asserted that what
-    /// came before the request was kept — which is what the code did, and the
-    /// opposite of what the design says. The test was wrong, and it is what let
-    /// the code stay wrong.
+    /// Before this, a room or a message left said over a call's link was lost
+    /// or waited for the call to end.
+    ///
+    /// The order is what makes an objection reach backwards and forwards at
+    /// once: the loop erases what was noted before it, and drops what is noted
+    /// after it, because it reads them in the order they were said.
     #[tokio::test]
-    async fn asking_not_to_be_written_down_takes_effect_immediately() {
+    async fn what_is_not_the_calls_is_handed_aside_in_order() {
         let dir = scratch("dontrecord");
-        let (mut mine, theirs, mut history) = recorded(&dir).await;
-        let with = mine.peer.display_unredacted().to_string();
+        let (mut mine, theirs) = paired().await;
 
         // Nothing typed yet, so the loop reads these in order rather than
         // taking a queued keystroke first.
-        theirs.outbox.send(Message::DontRecord).await.unwrap();
-        theirs
-            .outbox
-            .send(Message::Text("après la demande".into()))
-            .await
-            .unwrap();
+        for msg in [
+            Message::DontRecord,
+            Message::Got(5),
+            Message::Text("après la demande".into()),
+        ] {
+            theirs.outbox.send(msg).await.unwrap();
+        }
 
         let (keys, mut lines) = mpsc::channel::<crate::ui::Typed>(4);
         let (screen, updates) = crate::ui::channel();
         let watch = tokio::spawn(react(updates, keys, &["après la demande"], "/bye".to_owned()));
-        let mut objected = false;
+        let (aside, asides) = mpsc::unbounded_channel();
 
         run(
             &mut mine,
@@ -2220,24 +2196,26 @@ mod tests {
             vec![Message::Text("avant la demande".into())],
             &dir,
             &mut lines,
-            Some(&mut history),
-            &mut objected,
+            &aside,
             &screen,
         )
         .await
         .unwrap();
         watch.abort();
 
-        let kept: Vec<&str> = history
-            .tail(Some(&with), 10)
-            .iter()
-            .map(|l| l.body.as_str())
-            .collect();
+        let got = drained(asides);
         assert!(
-            kept.is_empty(),
-            "neither what came after the request nor what came before it: {kept:?}"
+            matches!(
+                got.as_slice(),
+                [
+                    Aside::Note { mine: false, body: a },
+                    Aside::Frame(Message::DontRecord),
+                    Aside::Frame(Message::Got(5)),
+                    Aside::Note { mine: false, body: b },
+                ] if a == "avant la demande" && b == "après la demande"
+            ),
+            "{got:?}"
         );
-        assert!(objected, "and the objection has to leave here to be stored");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2610,11 +2588,11 @@ mod tests {
         async fn feed(&mut self, msg: Message) -> Result<bool> {
             let dir = self.dir.clone();
             handle(
-                msg, "alice", "alice-address", &dir,
+                msg, "alice", crate::identity::Identity::for_test([1u8; 32]).onion_address(), &dir,
                 &mut self.pending, &mut self.next_number, &mut self.next_batch,
                 &mut self.receiving, &mut self.sending, &mut self.offered,
                 &mut self.direct_task, &self.done,
-                &self.outbox, &mut None, &self.screen,
+                &self.outbox, &mpsc::unbounded_channel().0, &self.screen,
             )
             .await
         }

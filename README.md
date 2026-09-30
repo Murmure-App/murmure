@@ -182,6 +182,7 @@ baked in.
 /presence alice                                   ask to see each other online
 /room new table   /room invite alice              open a room, ask people in
 /room send ~/plan.pdf   /room get 1               put a file in the room, take one
+/room say à tout de suite                         talk to the room during a call
 /send ~/rapport.pdf                               offer a file (during a call)
 /accept   /refuse                                 answer an offer of theirs
 /cancel                                           stop a file coming in
@@ -344,9 +345,13 @@ author signed, so the host can refuse to pass a file on but cannot pass on a
 different one. It all goes over Tor, and it all counts against the same
 `MURMURE_INCOMING_QUOTA`.
 
-Limits, for now: 16 people, one room at a time. During a call the room waits,
-and what it says over the connection to the person you are calling is lost —
-a file coming over that connection included; ask for it again after the call.
+**During a call** the room carries on — with the person you are calling too,
+over the same connection. What you type goes to the call, so talk to the room
+with `/room say <text>`; every other `/room` command works as ever, and so do
+`/tell`, `/contacts` and `/presence`. A second caller is turned down and you
+are told who it was.
+
+Limits, for now: 16 people, one room at a time.
 
 ## Sending a file
 

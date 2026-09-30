@@ -83,6 +83,10 @@ pub struct Pool {
     /// Frames with nowhere to go yet, per peer. Drained the moment a
     /// connection to that peer exists.
     waiting: HashMap<HsId, Vec<Message>>,
+    /// The peer a call is with. Their connection is out of `idle` for the
+    /// call, but they are still reachable — through this, once the call has a
+    /// link — and never dialled a second time meanwhile.
+    lent: Option<(HsId, Option<mpsc::Sender<Message>>)>,
     landed: mpsc::Receiver<(HsId, Result<Link>)>,
     lands: mpsc::Sender<(HsId, Result<Link>)>,
 }
@@ -96,6 +100,7 @@ impl Pool {
             idle: HashMap::new(),
             dialling: HashMap::new(),
             waiting: HashMap::new(),
+            lent: None,
             landed,
             lands,
         }
@@ -138,20 +143,54 @@ impl Pool {
         }
     }
 
-    /// Take the open connection to `peer`, if there is one.
-    pub fn take(&mut self, peer: &HsId) -> Option<Link> {
-        self.idle.remove(peer)
+    /// Take the connection to `peer` out for a call, and remember that the
+    /// call has them. `None` if there is none yet: the call dials, and says
+    /// so with [`Pool::opened`].
+    pub fn lend(&mut self, peer: HsId) -> Option<Link> {
+        let link = self.idle.remove(&peer);
+        self.lent = Some((peer, link.as_ref().map(|l| l.outbox.clone())));
+        link
+    }
+
+    /// The call's own dial landed: what waited for them goes now, on it.
+    ///
+    /// Nothing if the call is already over: its link came back through
+    /// [`Pool::keep`], which drained the queue itself.
+    pub async fn opened(&mut self, peer: HsId, outbox: mpsc::Sender<Message>) {
+        let Some((lent, sender)) = &mut self.lent else { return };
+        if *lent != peer {
+            return;
+        }
+        *sender = Some(outbox.clone());
+        if let Some(queued) = self.waiting.remove(&peer) {
+            for msg in queued {
+                if outbox.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The call is over. Its link, if still good, comes back through
+    /// [`Pool::keep`].
+    pub fn give_back(&mut self) {
+        self.lent = None;
+    }
+
+    /// The call's link, when `peer` is who the call is with.
+    fn lent_to(&self, peer: &HsId) -> Option<&mpsc::Sender<Message>> {
+        self.lent.as_ref().filter(|(p, _)| p == peer).and_then(|(_, s)| s.as_ref())
     }
 
     /// A handle to send on the connection to `peer`, for a task that outlives
     /// this call — a file streaming in the background.
     pub fn sender(&self, peer: &HsId) -> Option<mpsc::Sender<Message>> {
-        self.idle.get(peer).map(|link| link.outbox.clone())
+        self.idle.get(peer).map(|link| &link.outbox).or(self.lent_to(peer)).cloned()
     }
 
-        /// Is there an open connection to this peer right now?
+    /// Is there an open connection to this peer right now?
     pub fn holds(&self, peer: &HsId) -> bool {
-        self.idle.contains_key(peer)
+        self.idle.contains_key(peer) || self.lent_to(peer).is_some()
     }
 
     /// Open a connection to `peer` in the background, unless one already exists
@@ -166,7 +205,10 @@ impl Pool {
     /// the reason this is a method someone calls rather than something the pool
     /// does on its own.
     pub fn reach(&mut self, client: &tor::Client, peer: HsId, me: &Arc<Identity>) {
-        if self.idle.contains_key(&peer) || self.dialling.contains_key(&peer) {
+        if self.idle.contains_key(&peer)
+            || self.dialling.contains_key(&peer)
+            || self.lent.as_ref().is_some_and(|(p, _)| *p == peer)
+        {
             return;
         }
         let (client, me, lands) = (client.clone(), me.clone(), self.lands.clone());
@@ -197,6 +239,17 @@ impl Pool {
     /// A presence request is the thing this exists for: it is asked of somebody
     /// who is, by definition, not yet someone we hold a connection to.
     pub async fn send(&mut self, peer: HsId, msg: Message) {
+        // During a call with them, on the call's link. A frame the call does
+        // not know is handed back out to the idle loop at the other end.
+        let msg = match self.lent_to(&peer) {
+            Some(call) => match call.send_timeout(msg, STUCK).await {
+                Ok(()) => return,
+                // The call is ending; its link comes back or is gone, and
+                // either way the frame waits for what follows.
+                Err(SendTimeoutError::Closed(msg) | SendTimeoutError::Timeout(msg)) => msg,
+            },
+            None => msg,
+        };
         let msg = match self.idle.get(&peer) {
             Some(link) => match link.outbox.send_timeout(msg, STUCK).await {
                 Ok(()) => return,
@@ -364,8 +417,45 @@ mod tests {
 
         let mut pool = Pool::new();
         pool.keep(alice_side).await;
-        assert!(pool.take(&bob).is_some(), "the link should still be open");
-        assert!(pool.take(&bob).is_none(), "and only handed out once");
+        assert!(pool.lend(bob).is_some(), "the link should still be open");
+        assert!(pool.lend(bob).is_none(), "and only handed out once");
+    }
+
+    /// A call has the link, and the pool still reaches the peer through it —
+    /// which is what lets a room carry on with somebody we are talking to.
+    #[tokio::test]
+    async fn a_lent_link_still_carries_what_the_pool_sends() {
+        let (alice_side, mut bob_side) = pair([1u8; 32], [2u8; 32]).await;
+        let bob = alice_side.peer;
+
+        let mut pool = Pool::new();
+        pool.keep(alice_side).await;
+        let call = pool.lend(bob).expect("the link goes to the call");
+        assert!(pool.holds(&bob), "still connected, through the call");
+        pool.send(bob, Message::Got(7)).await;
+        assert_eq!(bob_side.inbox.recv().await.unwrap().unwrap(), Message::Got(7));
+
+        pool.give_back();
+        assert!(!pool.holds(&bob), "the call took it, and has not given it back");
+        pool.keep(call).await;
+        assert!(pool.holds(&bob));
+    }
+
+    /// A call that had to dial hands its link over once open, and what waited
+    /// for the peer meanwhile goes out on it, first.
+    #[tokio::test]
+    async fn a_call_that_dialled_carries_what_waited() {
+        let (alice_side, mut bob_side) = pair([1u8; 32], [2u8; 32]).await;
+        let bob = alice_side.peer;
+
+        let mut pool = Pool::new();
+        assert!(pool.lend(bob).is_none(), "nothing to take: the call dials");
+        pool.send(bob, Message::Got(1)).await;
+        pool.opened(bob, alice_side.outbox.clone()).await;
+        pool.send(bob, Message::Got(2)).await;
+        for want in [1, 2] {
+            assert_eq!(bob_side.inbox.recv().await.unwrap().unwrap(), Message::Got(want));
+        }
     }
 
     /// A peer who starts talking on a connection nobody is using is heard.
