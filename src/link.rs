@@ -204,6 +204,14 @@ impl Link {
         })
     }
 
+    /// Drop the connection at once, queue and all, for a peer that stopped
+    /// reading. The inbox ends, so whoever watches it sees the link go the
+    /// usual way.
+    pub fn cut(&self) {
+        self.reading.abort();
+        self.writing.abort();
+    }
+
     /// Close the connection and report whether everything we queued got out.
     ///
     /// Order matters. The reader holds the inbox sender, and the writer outlives

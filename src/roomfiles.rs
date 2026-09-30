@@ -484,6 +484,16 @@ async fn send_file(
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     let mut buf = vec![0u8; MAX_CHUNK];
     loop {
+        // Half the connection's queue stays free for everything else on it: a
+        // line said in the room, a presence frame. Without this the upload
+        // fills it and those wait behind the whole file.
+        // ponytail: polled, since a channel cannot be awaited for n free slots.
+        while outbox.capacity() <= outbox.max_capacity() / 2 {
+            if outbox.is_closed() {
+                bail!("the connection closed");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         let n = file.read(&mut buf).await?;
         if n == 0 {
             break;

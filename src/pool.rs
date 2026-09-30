@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::SendTimeoutError;
 use tokio::task::JoinHandle;
 use tor_hscrypto::pk::HsId;
 
@@ -49,6 +50,13 @@ const DIAL_AHEAD: Duration = Duration::from_secs(120);
 /// disk. This is a handful of presence frames waiting for a dial to land, and
 /// the cap is here so that a contact who never answers cannot make it grow.
 const WAITING: usize = 4;
+
+/// How long [`Pool::send`] waits for room on a connection's queue.
+///
+/// The queue is full only when the peer has stopped reading, or a room upload
+/// took it all. Waiting longer would freeze the idle loop, keyboard included,
+/// on one peer.
+const STUCK: Duration = Duration::from_secs(5);
 
 /// What one turn of [`Pool::ready`] found.
 pub enum Heard {
@@ -115,7 +123,19 @@ impl Pool {
                 }
             }
         }
-        self.idle.insert(link.peer, link).is_none()
+        match self.idle.insert(link.peer, link) {
+            // Closed rather than dropped, off the loop: whatever was queued on
+            // it still goes out, and a stuck one cannot hold us up.
+            Some(stale) => {
+                tokio::spawn(async move {
+                    if let Err(e) = stale.close(false).await {
+                        tracing::debug!("closing a replaced connection: {e:#}");
+                    }
+                });
+                false
+            }
+            None => true,
+        }
     }
 
     /// Take the open connection to `peer`, if there is one.
@@ -178,11 +198,18 @@ impl Pool {
     /// who is, by definition, not yet someone we hold a connection to.
     pub async fn send(&mut self, peer: HsId, msg: Message) {
         let msg = match self.idle.get(&peer) {
-            Some(link) => match link.outbox.send(msg).await {
+            Some(link) => match link.outbox.send_timeout(msg, STUCK).await {
                 Ok(()) => return,
                 // The link is on its way out and the reader has not noticed
                 // yet. Queue it for the connection that replaces this one.
-                Err(returned) => returned.0,
+                Err(SendTimeoutError::Closed(msg)) => msg,
+                // They stopped reading. Cut the link: `ready` reports it lost
+                // like any other, and the frame waits for the next one.
+                Err(SendTimeoutError::Timeout(msg)) => {
+                    tracing::debug!("a held connection stopped taking frames; dropping it");
+                    link.cut();
+                    msg
+                }
             },
             None => msg,
         };
@@ -377,6 +404,26 @@ mod tests {
         assert_eq!(who, carol_id);
         assert_eq!(msg, Message::Text("it is me".into()));
         drop(bob);
+    }
+
+    /// A peer that stops reading costs one link, not the idle loop.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_stops_reading_is_cut_rather_than_waited_on() {
+        let (to_bob, _bob) = pair([1u8; 32], [2u8; 32]).await;
+        let bob_id = to_bob.peer;
+        let mut pool = Pool::new();
+        pool.keep(to_bob).await;
+
+        let line = "x".repeat(16 * 1024);
+        let sending = async {
+            for _ in 0..200 {
+                pool.send(bob_id, Message::Text(line.clone())).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), sending)
+            .await
+            .expect("the pool waited on a peer that stopped reading");
+        assert!(matches!(pool.ready().await, Heard::Lost(who) if who == bob_id));
     }
 
     /// A presence request is asked of somebody we are not connected to yet —
