@@ -691,6 +691,7 @@ async fn serve(
                     "-- {name} is calling — /answer to take it, /decline to refuse --"
                 ));
                 screen.status(format!("{name} is calling"));
+                screen.alert();
                 ringing = Some(Ringing {
                     peer,
                     name,
@@ -1790,6 +1791,8 @@ fn help(screen: &Screen) {
         "                                and either of you can stop it with /presence <name> off",
         "  /contacts                     list the book, and who is online",
         "  /forget <name>                drop a contact",
+        "  /notify off   /notify on      a bell when a message or a call arrives while the window",
+        "                                is not in front. on by default (MURMURE_NOTIFY=off)",
         "  /verify <name>                a 60-digit safety number: read it out loud together.",
         "                                it covers both whole addresses, the fingerprint 40 bits",
         "  /copy                         your address and key, to the clipboard",
@@ -1881,10 +1884,13 @@ async fn apply_room(
         .unwrap_or_default();
     for event in out.events {
         match event {
-            Event::Invited { from, name } => screen.system(format!(
-                "-- {} invites you to #{name} — /room join or /room decline --",
-                name_for(book, &from)
-            )),
+            Event::Invited { from, name } => {
+                screen.system(format!(
+                    "-- {} invites you to #{name} — /room join or /room decline --",
+                    name_for(book, &from)
+                ));
+                screen.alert();
+            }
             Event::Busy { from, name } => screen.system(format!(
                 "-- {} invited you to #{name}; turned down, you are already in a room --",
                 name_for(book, &from)

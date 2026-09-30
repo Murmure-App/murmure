@@ -175,6 +175,7 @@ baked in.
 /add alice xxxx….onion descriptor:x25519:XXXX…    file them under a name
 /call alice                                       dial (7–50 s, /cancel to stop)
 /verify alice                                     a safety number to read out together
+/notify off                                       no bell (on by default)
 /answer   /decline                                take, or turn down, a call
 /tell alice on rentre à 19h                       leave a message for later
 /history                                          what is kept (nothing, by default)
@@ -212,6 +213,12 @@ there is a call.
 talk over it, so a call coming in shows `-- alice is calling --` and waits for
 `/answer`. What she said first is held unread until then; `/decline` tells her
 you are not taking it, and you never see it.
+
+When a message, a call or a room invitation arrives while the terminal is not
+the window in front, murmure rings the terminal bell — a sound, a flash or a
+taskbar mark, as your terminal sees fit. `/notify off` stops it for the session,
+`MURMURE_NOTIFY=off` from the start. It relies on the terminal reporting focus:
+most do; inside tmux, `set -g focus-events on`.
 
 `/help` lists the rest, including the scroll keys.
 

@@ -149,5 +149,7 @@ Relecture de tout `src/`, faite après la v0.1.0-beta.2. Treize commits, **aucun
 - ✅ **Lignes tapées pendant la composition d'un `/call`** (`038182f`) : gardées (16 au plus) et envoyées à la connexion ; la première fait sonner. Les commandes ne sont pas gardées.
 - ✅ **`/verify <nom>`** (`ff4101b`, P3-1) : numéro de sécurité de 60 chiffres, BLAKE3 sur les deux adresses triées, identique des deux côtés. Vérifié en live.
 
+- ✅ **Notifications** (P3-2) : bip du terminal quand un message, un appel ou une invitation de salon arrive alors que la fenêtre n'est pas au premier plan (rapports de focus de crossterm). `/notify on|off`, `MURMURE_NOTIFY=off`. Vérifié en live via tmux (drapeau de cloche levé à la sonnerie).
+
 ### P3 — Proposé, à valider
-Notifications (`\a` hors focus), messages multi-lignes, salons et réception pendant un appel, MSRV et clippy Windows/macOS en CI.
+Messages multi-lignes, salons et réception pendant un appel, MSRV et clippy Windows/macOS en CI.

@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
@@ -138,6 +139,9 @@ pub enum Update {
     ShowImage(Vec<u8>),
     /// The `/tell` with this outbox id arrived: mark its line delivered.
     Delivered(u64),
+    /// Something the operator should hear about even from another window: a
+    /// call ringing. A line from somebody else rings on its own.
+    Alert,
 }
 
 /// A handle for putting lines on screen from anywhere in the program.
@@ -164,6 +168,12 @@ impl Screen {
     /// The recipient acknowledged outbox message `id`.
     pub fn delivered(&self, id: u64) {
         let _ = self.0.send(Update::Delivered(id));
+    }
+
+    /// Ring the bell, if the terminal is not the window in front. See
+    /// [`Update::Alert`].
+    pub fn alert(&self) {
+        let _ = self.0.send(Update::Alert);
     }
 
     /// Put a line on screen.
@@ -409,7 +419,7 @@ impl Typed {
 /// the same way an out-of-date `/help` line would be — by reading it.
 const COMMANDS: &[&str] = &[
     "/add", "/tell", "/call", "/cancel", "/answer", "/decline", "/presence", "/contacts",
-    "/forget", "/verify", "/copy", "/history", "/search", "/view", "/help", "/quit", "/send", "/direct",
+    "/forget", "/verify", "/notify", "/copy", "/history", "/search", "/view", "/help", "/quit", "/send", "/direct",
     "/accept", "/refuse", "/bye", "/room",
 ];
 
@@ -545,6 +555,14 @@ struct App {
     /// The contact book's names, kept only for Tab completion. See
     /// [`Update::Contacts`] for why the UI is told rather than asking.
     contacts: Vec<String>,
+    /// Whether the terminal is the window in front, as its focus reports say.
+    /// Assumed so until told otherwise: a terminal that never reports focus
+    /// then never rings, rather than ringing at every line under your eyes.
+    focused: bool,
+    /// `/notify off` turns the bell off; `MURMURE_NOTIFY=off` starts that way.
+    notify: bool,
+    /// A bell is owed, and goes out with the next frame.
+    bell: bool,
 }
 
 impl App {
@@ -568,7 +586,38 @@ impl App {
             unseen: 0,
             peer: None,
             contacts: Vec::new(),
+            focused: true,
+            notify: std::env::var("MURMURE_NOTIFY").map_or(true, |v| v != "off"),
+            bell: false,
         }
+    }
+
+    /// Owe a bell, if anyone would want it.
+    fn alert(&mut self) {
+        self.bell |= self.notify && !self.focused;
+    }
+
+    /// `/notify`, `/notify on`, `/notify off`: answered here, since the bell
+    /// is the interface's own business and works the same in a call or out.
+    /// `None` for every other line.
+    fn notify_command(&mut self, line: &str) -> Option<String> {
+        let mut words = line.split_whitespace();
+        if words.next() != Some("/notify") {
+            return None;
+        }
+        match (words.next(), words.next()) {
+            (Some("on"), None) => self.notify = true,
+            (Some("off"), None) => self.notify = false,
+            (None, _) => {}
+            _ => return Some("usage: /notify [on | off]".to_owned()),
+        }
+        Some(if self.notify {
+            "notifications on: a bell when a message, a call or an invitation arrives \
+             while this window is not in front"
+                .to_owned()
+        } else {
+            "notifications off — /notify on to hear about them again".to_owned()
+        })
     }
 
     /// Show a note in the header for [`FLASH_FOR`].
@@ -892,6 +941,9 @@ impl App {
     }
 
     fn push(&mut self, entry: Entry) {
+        if entry.kind == Kind::Theirs {
+            self.alert();
+        }
         // Reading back through the history is not a request to be dragged
         // forward. The offset is measured from the bottom, so a line arriving
         // underneath moves the window unless the offset grows by exactly the
@@ -965,11 +1017,17 @@ pub async fn run(
     // instead. Shift-drag is every terminal's escape hatch back to its own
     // selection, for selecting scrollback murmure itself does not keep.
     let mouse = crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
+    // Focus reports tell a window in front from one behind, which is the
+    // whole difference between a bell worth ringing and noise.
+    let focus = crossterm::execute!(std::io::stdout(), EnableFocusChange).is_ok();
 
     let result = event_loop(&mut terminal, &mut updates, typed, title).await;
 
     if mouse {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    }
+    if focus {
+        let _ = crossterm::execute!(std::io::stdout(), DisableFocusChange);
     }
     if bracketed {
         // Leaving it on would make the shell after us receive pastes wrapped in
@@ -1027,6 +1085,7 @@ async fn event_loop(
                     }
                     Some(Update::Contacts(names)) => app.contacts = names,
                     Some(Update::Delivered(id)) => app.delivered(id),
+                    Some(Update::Alert) => app.alert(),
                     Some(Update::ShowImage(escape)) => {
                         show_image_blocking(terminal, &mut keys, &escape).await?;
                     }
@@ -1047,6 +1106,7 @@ async fn event_loop(
                         }
                         Update::Contacts(names) => app.contacts = names,
                         Update::Delivered(id) => app.delivered(id),
+                        Update::Alert => app.alert(),
                         Update::ShowImage(escape) => {
                             show_image_blocking(terminal, &mut keys, &escape).await?;
                         }
@@ -1062,6 +1122,8 @@ async fn event_loop(
                         }
                     }
                     Some(Ok(Event::Paste(text))) => app.paste(&text),
+                    Some(Ok(Event::FocusGained)) => app.focused = true,
+                    Some(Ok(Event::FocusLost)) => app.focused = false,
                     Some(Ok(Event::Mouse(m))) => {
                         // A click on a file becomes the command the operator
                         // would have typed. The interface's only output stays a
@@ -1081,6 +1143,13 @@ async fn event_loop(
         }
 
         terminal.draw(|frame| draw(frame, &mut app)).context("drawing")?;
+        if std::mem::take(&mut app.bell) {
+            // BEL: the terminal decides what it means — a sound, a flash, an
+            // urgent taskbar entry. Written after the frame, never inside one.
+            use std::io::Write as _;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(b"\x07").and_then(|()| out.flush());
+        }
     }
 }
 
@@ -1194,7 +1263,13 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<Typed>) -
             }
         }
         KeyCode::Enter => {
-            let lines = app.submit();
+            let mut lines = app.submit();
+            if let [Typed::Line(line)] = &lines[..]
+                && let Some(answer) = app.notify_command(line)
+            {
+                app.push(Entry { kind: Kind::System, text: answer, chips: Vec::new(), tag: None });
+                lines.clear();
+            }
             if !lines.is_empty() {
                 // Back to following the tail: you sent something, you want to
                 // see the answer.
@@ -2630,6 +2705,31 @@ mod tests {
         }
         assert_eq!(app.history.len(), SCROLLBACK);
         assert_eq!(app.history.front().unwrap().text, "10");
+    }
+
+    /// A bell only for somebody else's line, only with the window behind,
+    /// and never once turned off.
+    #[test]
+    fn the_bell_rings_for_them_only_when_nobody_is_looking() {
+        let theirs = |text: &str| Entry { kind: Kind::Theirs, text: text.into(), chips: Vec::new(), tag: None };
+        let mut app = App::new("t".into());
+        app.notify = true;
+        app.push(theirs("vu"));
+        assert!(!app.bell, "the window is in front");
+        app.focused = false;
+        app.push(entry("-- a system line --"));
+        assert!(!app.bell, "only their lines ring");
+        app.push(theirs("pas vu"));
+        assert!(app.bell);
+
+        app.bell = false;
+        assert!(app.notify_command("/notify off").is_some());
+        app.push(theirs("coupé"));
+        assert!(!app.bell);
+        assert!(app.notify_command("/notify on").is_some());
+        assert!(app.notify_command("/notify maybe").unwrap().starts_with("usage"));
+        assert!(app.notify_command("/notifyx").is_none() && app.notify_command("bonjour").is_none());
+        assert!(app.notify);
     }
 
     /// Wide characters wrap by the columns they take, and a click on either
