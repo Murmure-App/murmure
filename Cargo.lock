@@ -2503,6 +2503,7 @@ dependencies = [
  "tor-rtcompat",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "zeroize",
 ]
 

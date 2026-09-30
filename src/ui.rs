@@ -29,6 +29,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc;
+use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 /// How many lines of history are kept.
 ///
@@ -453,8 +454,8 @@ impl Item {
     /// Columns it occupies, which is what the cursor's position is counted in.
     fn width(&self) -> usize {
         match self {
-            Item::Char(_) => 1,
-            Item::File(_) => self.shown().chars().count(),
+            Item::Char(c) => c.width().unwrap_or(0),
+            Item::File(_) => self.shown().width(),
         }
     }
 }
@@ -468,6 +469,12 @@ struct App {
     title: String,
     /// Scrollback, oldest first.
     history: VecDeque<Entry>,
+    /// Rows the whole history wraps to, and at which width.
+    ///
+    /// Scrolling needs the total, and rewrapping 2000 entries for it on every
+    /// frame is the one thing a redraw does that grows with the scrollback.
+    /// Kept current by [`App::push`]; recomputed when the width changes.
+    wrapped: Option<(usize, usize)>,
     /// The input line: typed characters and dropped files, in the order they
     /// were put there.
     ///
@@ -546,6 +553,7 @@ impl App {
             status: "starting".to_owned(),
             title,
             history: VecDeque::new(),
+            wrapped: None,
             items: Vec::new(),
             cursor: 0,
             scroll_back: 0,
@@ -569,11 +577,16 @@ impl App {
     }
 
     /// Every row the history occupies at the current width.
-    fn total_rows(&self) -> usize {
-        self.history
-            .iter()
-            .map(|e| rows_for(&e.text, self.viewport.0))
-            .sum()
+    fn total_rows(&mut self) -> usize {
+        let width = self.viewport.0;
+        match self.wrapped {
+            Some((w, rows)) if w == width => rows,
+            _ => {
+                let rows = self.history.iter().map(|e| rows_for(&e.text, width)).sum();
+                self.wrapped = Some((width, rows));
+                rows
+            }
+        }
     }
 
     /// How far a page key moves: a screenful, less one row of overlap so the
@@ -729,8 +742,9 @@ impl App {
     /// was reading it.
     fn input_window(&mut self, width: usize) -> (String, usize) {
         let width = width.max(1);
-        let shown: Vec<char> = self.input_display().chars().collect();
-        let cursor = self.cursor_column().min(shown.len());
+        let shown = self.input_display();
+        let total = shown.width();
+        let cursor = self.cursor_column().min(total);
 
         // Two constraints, and the second wins where they disagree: the cursor
         // must be at or right of the window's start, and inside its last
@@ -741,24 +755,38 @@ impl App {
             .min(cursor)
             .max((cursor + 1).saturating_sub(width));
 
-        let start = self.input_scroll;
-        let end = (start + width).min(shown.len());
-        let mut window = shown[start.min(shown.len())..end].to_vec();
-
-        // One character to say there is more off that edge — overwriting the
-        // character it covers rather than shifting the line, so the cursor
-        // column stays a plain index into this window. Never over the cursor
-        // itself: hiding the character being edited is worse than not knowing
-        // there is text ahead.
-        let last = window.len().saturating_sub(1);
-        if start > 0 && !window.is_empty() && cursor > start {
-            window[0] = '…';
+        // Every character that fits whole between the window's edges, by the
+        // column it starts at. A wide one cut by an edge is a blank instead,
+        // so each column stays where the cursor arithmetic puts it.
+        let (start, end) = (self.input_scroll, self.input_scroll + width);
+        let mut cells: Vec<(usize, String)> = Vec::new();
+        let mut at = 0;
+        for c in shown.chars() {
+            let w = c.width().unwrap_or(0);
+            if at + w > start && at < end {
+                let whole = at >= start && at + w <= end;
+                let blank = || " ".repeat((at + w).min(end) - at.max(start));
+                cells.push((at.max(start), if whole { c.to_string() } else { blank() }));
+            }
+            at += w;
         }
-        if end < shown.len() && !window.is_empty() && cursor - start < last {
-            window[last] = '…';
+
+        // One mark to say there is more off that edge, over the cell it
+        // covers and padded to that cell's width, so nothing after it moves.
+        // Never over the cursor itself: hiding the character being edited is
+        // worse than not knowing there is text ahead.
+        let mark = |cell: &mut (usize, String)| {
+            let w = cell.1.width();
+            cell.1 = format!("…{}", " ".repeat(w.saturating_sub(1)));
+        };
+        if start > 0 && cursor > start && let Some(first) = cells.first_mut() {
+            mark(first);
+        }
+        if end < total && let Some(last) = cells.last_mut() && cursor < last.0 {
+            mark(last);
         }
 
-        (window.into_iter().collect(), cursor - start)
+        (cells.into_iter().map(|(_, s)| s).collect(), cursor - start)
     }
 
     /// Which column the cursor is drawn in, counted over what is displayed —
@@ -846,6 +874,7 @@ impl App {
         {
             entry.text = format!("{text}{DELIVERED}");
             entry.tag = None;
+            self.wrapped = None;
         }
     }
 
@@ -868,9 +897,13 @@ impl App {
         // underneath moves the window unless the offset grows by exactly the
         // rows it added — the same correction the scrollback trim makes at the
         // other end, for the same reason.
+        let rows = rows_for(&entry.text, self.viewport.0);
         if self.scroll_back > 0 {
-            self.scroll_back += rows_for(&entry.text, self.viewport.0);
+            self.scroll_back += rows;
             self.unseen += 1;
+        }
+        if let Some((width, total)) = &mut self.wrapped {
+            *total += if *width == self.viewport.0 { rows } else { rows_for(&entry.text, *width) };
         }
 
         self.history.push_back(entry);
@@ -886,8 +919,22 @@ impl App {
             // What an eviction can do is leave the offset pointing past the
             // oldest row that is left. `visible_rows` pins to the top rather
             // than blanking the box, and the next `scroll` clamps it for good.
-            if self.history.pop_front().is_none() {
+            let Some(gone) = self.history.pop_front() else {
                 break;
+            };
+            if let Some((width, total)) = &mut self.wrapped {
+                *total -= rows_for(&gone.text, *width);
+            }
+            // A selection is anchored to entry indices, and every index just
+            // moved down by one. An end inside the line that left moves to the
+            // start of what is now the oldest.
+            if let Some(sel) = &mut self.selection {
+                for end in [&mut sel.anchor, &mut sel.current] {
+                    *end = match end.entry.checked_sub(1) {
+                        Some(entry) => Anchor { entry, ..*end },
+                        None => Anchor { entry: 0, offset: 0 },
+                    };
+                }
             }
         }
     }
@@ -1440,8 +1487,8 @@ fn as_dropped_file(text: &str) -> Option<PathBuf> {
 /// find the row under a mouse click by arithmetic instead of by re-running a
 /// word-wrap algorithm and hoping it agrees with what was drawn.
 ///
-/// Counts characters, not grapheme clusters or display width. Close enough for
-/// the accented Latin text this carries.
+/// Measures columns, so a CJK character or an emoji counts for the two it
+/// takes. Offsets stay in characters: that is what a click resolves to.
 fn wrap(text: &str, width: usize, indent: usize) -> Vec<(usize, &str)> {
     let width = width.max(1);
     // Continuation rows pay for their alignment: what the indent takes on the
@@ -1455,12 +1502,20 @@ fn wrap(text: &str, width: usize, indent: usize) -> Vec<(usize, &str)> {
     // landing in the middle of a multi-byte character.
     let bounds: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
     let chars: Vec<char> = text.chars().collect();
+    let columns: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(0)).collect();
 
     let mut rows = Vec::with_capacity(bounds.len().div_ceil(rest) + 1);
     let mut i = 0;
     let mut take = width;
     while i < bounds.len() {
-        let hard = (i + take).min(bounds.len());
+        // As many characters as fit in `take` columns, and always one: a
+        // wide character on a one-column terminal still has to go somewhere.
+        let mut hard = i;
+        let mut used = 0;
+        while hard < chars.len() && (hard == i || used + columns[hard] <= take) {
+            used += columns[hard];
+            hard += 1;
+        }
         let end_i = if hard == bounds.len() {
             // The rest fits; there is nothing to break.
             hard
@@ -1655,7 +1710,16 @@ fn anchor_at(app: &App, column: u16, row: u16) -> Option<Anchor> {
     // The indent is blank, not text. A click inside it is a click on the first
     // character of the row, the same as a click left of the box.
     let c = (column.saturating_sub(origin_x) as usize).saturating_sub(line.indent);
-    let local = c.min(line.text.chars().count());
+    // Columns to characters: a wide character is two columns and one offset.
+    let mut used = 0;
+    let local = line
+        .text
+        .chars()
+        .take_while(|ch| {
+            used += ch.width().unwrap_or(0);
+            used <= c
+        })
+        .count();
     Some(Anchor {
         entry: line.entry,
         offset: line.offset + local,
@@ -2566,6 +2630,60 @@ mod tests {
         }
         assert_eq!(app.history.len(), SCROLLBACK);
         assert_eq!(app.history.front().unwrap().text, "10");
+    }
+
+    /// Wide characters wrap by the columns they take, and a click on either
+    /// half of one lands on it.
+    #[test]
+    fn wide_characters_wrap_and_click_by_their_width() {
+        let rows = wrap("日本語テキスト", 6, 0);
+        assert_eq!(rows, vec![(0, "日本語"), (3, "テキス"), (6, "ト")]);
+
+        let mut app = App::new("t".into());
+        app.rows = vec![Row { entry: 0, offset: 0, indent: 0, kind: Kind::Theirs, text: "a日b".into() }];
+        let at = |col| anchor_at(&app, col, 0).unwrap().offset;
+        assert_eq!((at(0), at(1), at(2), at(3)), (0, 1, 1, 2));
+    }
+
+    #[test]
+    fn the_input_line_counts_an_emoji_as_two_columns() {
+        let mut app = App::new("t".into());
+        app.paste("a😀b");
+        assert_eq!(app.input_window(10), ("a😀b".to_owned(), 4));
+        // Scrolled so the emoji is cut by the left edge: a blank holds its
+        // place, and the cursor stays over the right column.
+        app.paste(&"c".repeat(7));
+        assert_eq!(app.input_window(10), ("…bccccccc".to_owned(), 9));
+    }
+
+    /// The cached total is the total, through arrivals and evictions.
+    #[test]
+    fn the_row_count_follows_the_history() {
+        let mut app = App::new("t".into());
+        app.viewport = (10, 5);
+        for i in 0..SCROLLBACK + 30 {
+            app.push(entry(&"x".repeat(i % 25)));
+            if i == 3 {
+                app.total_rows(); // start caching early
+            }
+        }
+        let cached = app.total_rows();
+        app.wrapped = None;
+        assert_eq!(cached, app.total_rows());
+    }
+
+    /// A line leaving the top must not move a selection onto other text.
+    #[test]
+    fn a_selection_stays_on_its_text_when_the_oldest_line_goes() {
+        let mut app = App::new("t".into());
+        for i in 0..SCROLLBACK {
+            app.push(entry(&format!("line {i}")));
+        }
+        let on = |entry| Anchor { entry, offset: 5 };
+        app.selection = Some(Selection { anchor: on(7), current: on(8) });
+        let before = selected_text(&app.history, app.selection.unwrap());
+        app.push(entry("new"));
+        assert_eq!(selected_text(&app.history, app.selection.unwrap()), before);
     }
 
     /// A line arriving at the bottom and an old one falling off the top must
