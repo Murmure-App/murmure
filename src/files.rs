@@ -264,6 +264,36 @@ pub fn sanitize_for_display(raw: &str) -> String {
     raw.chars().filter(|c| !has_display_spoofing_chars(*c)).collect()
 }
 
+/// Lines a message may take on screen. Past this its line breaks become
+/// spaces: one message of empty lines must not scroll the conversation away.
+const MAX_LINES: usize = 50;
+
+/// [`sanitize_for_display`] for a message body, which keeps its line breaks:
+/// up to [`MAX_LINES`] lines, never more than one blank line in a row, none at
+/// either end.
+///
+/// A client before 0.1.0-beta.4 drops the breaks with every other control
+/// character, so to it the lines of a message run together.
+pub fn sanitize_message(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let (mut lines, mut run) = (1, 0);
+    for c in raw.chars() {
+        if c == '\n' {
+            run += 1;
+            if run <= 2 && lines < MAX_LINES {
+                out.push('\n');
+                lines += 1;
+            } else if run == 1 {
+                out.push(' ');
+            }
+        } else if !has_display_spoofing_chars(c) {
+            run = 0;
+            out.push(c);
+        }
+    }
+    out.trim_matches('\n').to_owned()
+}
+
 /// Where an incoming file is written while it is still incomplete.
 ///
 /// Named after the hash, not the filename: see the module docs.
@@ -353,6 +383,17 @@ pub fn human(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_message_keeps_its_line_breaks_within_bounds() {
+        assert_eq!(sanitize_message("un\ndeux"), "un\ndeux");
+        assert_eq!(sanitize_message("\n\nun\n\n\n\n\ndeux\n"), "un\n\ndeux", "one blank line at most, none at the ends");
+        assert_eq!(sanitize_message("a\r\nb\x1b[31m"), "a\nb[31m", "every other control character still goes");
+        let flood = "x\n".repeat(500);
+        assert_eq!(sanitize_message(&flood).lines().count(), MAX_LINES);
+        // A file name is not a message: no break survives there.
+        assert_eq!(sanitize_for_display("a\nb"), "ab");
+    }
     use super::*;
 
     fn scratch(tag: &str) -> PathBuf {

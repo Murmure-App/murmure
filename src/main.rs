@@ -595,7 +595,7 @@ async fn serve(
                                 // OSC 52 sequence in a `/tell` — and if history
                                 // is on, the sequence is kept and fires again
                                 // on every `/history`.
-                                let body = files::sanitize_for_display(&body);
+                                let body = files::sanitize_message(&body);
                                 screen.say(
                                     Kind::Theirs,
                                     format!("{name} ({})> {body}", outbox::how_long_ago(at)),
@@ -1828,6 +1828,7 @@ fn help(screen: &Screen) {
         "  Ctrl-E                        jump back to the newest line",
         "  left / right / Home / End     move inside what you are typing",
         "                                a dropped file counts as one step",
+        "  Alt-Enter                     a new line inside the message (shown as ↵)",
         "  Tab                           complete a command or a contact's name",
         "  Ctrl-V                        paste (no Shift needed)",
         "  Ctrl-U                        clear the input",
@@ -1928,7 +1929,7 @@ async fn apply_room(
             Event::Said { who, body } => {
                 // Straight from the network to the terminal: the same boundary
                 // as a line in a call.
-                let body = files::sanitize_for_display(&body);
+                let body = files::sanitize_message(&body);
                 screen.say(Kind::Theirs, format!("#{room} {}> {body}", room_label(who, book)));
             }
             Event::Joined(who) => {

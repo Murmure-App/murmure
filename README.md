@@ -214,6 +214,10 @@ talk over it, so a call coming in shows `-- alice is calling --` and waits for
 `/answer`. What she said first is held unread until then; `/decline` tells her
 you are not taking it, and you never see it.
 
+**Several lines in one message:** Alt-Enter starts a new line inside it
+(shown `↵` in the input), and a pasted paragraph keeps its lines. A peer on
+0.1.0-beta.3 or older sees the lines run together.
+
 When a message, a call or a room invitation arrives while the terminal is not
 the window in front, murmure rings the terminal bell — a sound, a flash or a
 taskbar mark, as your terminal sees fit. `/notify off` stops it for the session,

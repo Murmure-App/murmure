@@ -153,5 +153,7 @@ Relecture de tout `src/`, faite après la v0.1.0-beta.2. Treize commits, **aucun
 
 - ✅ **MSRV et clippy multi-plateformes** (P3-5) : `rust-version = "1.91"` (le minimum d'arti 0.46), job CI `msrv` qui fait `cargo +1.91 check`, clippy sur Linux, macOS et Windows. Vérifié en local : build en 1.91, clippy en cible Windows.
 
+- ✅ **Messages multi-lignes** (P3-3) : Alt-Entrée (ou Maj-Entrée) insère un saut de ligne, affiché `↵` dans la saisie ; un collage garde ses lignes. À l'affichage : un saut commence une rangée alignée sous le nom. `files::sanitize_message` garde les `\n` : 50 lignes au plus, une seule ligne vide d'affilée, aucune aux extrémités. Un pair en beta.3 ou avant voit les lignes collées. Vérifié en live.
+
 ### P3 — Proposé, à valider
-Messages multi-lignes, salons et réception pendant un appel.
+Salons et réception pendant un appel.

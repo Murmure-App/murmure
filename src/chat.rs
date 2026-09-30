@@ -854,7 +854,7 @@ async fn handle(
             // The peer's raw bytes must not reach the terminal: see
             // `files::sanitize_for_display` for why a chat line is exactly as
             // dangerous as a filename here.
-            let body = files::sanitize_for_display(&body);
+            let body = files::sanitize_message(&body);
             screen.say(Kind::Theirs, format!("{peer}> {body}"));
             note(history, with, false, &body, screen);
         }

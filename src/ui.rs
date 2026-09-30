@@ -453,6 +453,8 @@ impl Item {
     /// How the item reads on screen.
     fn shown(&self) -> String {
         match self {
+            // A line break, shown rather than taken: the input is one row.
+            Item::Char('\n') => "↵".to_owned(),
             Item::Char(c) => c.to_string(),
             Item::File(p) => format!(
                 "[{}]",
@@ -464,6 +466,7 @@ impl Item {
     /// Columns it occupies, which is what the cursor's position is counted in.
     fn width(&self) -> usize {
         match self {
+            Item::Char('\n') => 1,
             Item::Char(c) => c.width().unwrap_or(0),
             Item::File(_) => self.shown().width(),
         }
@@ -671,11 +674,12 @@ impl App {
             self.attach(path);
             return;
         }
-        // Newlines would submit several lines at once from a source that is not
-        // the keyboard; a pasted paragraph becomes one line instead.
-        for c in text.chars() {
+        // A pasted paragraph stays one message, its line breaks kept inside
+        // it rather than each submitting a line of its own. Terminals send a
+        // break in a paste as `\r`, `\n` or both.
+        for c in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
             match c {
-                '\n' | '\r' => self.insert(' '),
+                '\n' => self.insert('\n'),
                 c if c.is_control() => {}
                 c => self.insert(c),
             }
@@ -1262,6 +1266,11 @@ async fn handle_key(key: KeyEvent, app: &mut App, typed: &mpsc::Sender<Typed>) -
                 app.items.remove(app.cursor);
             }
         }
+        // A line break inside the message. Alt, because it is what every
+        // terminal can report; Shift too, for the ones that tell it apart.
+        KeyCode::Enter if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) => {
+            app.insert('\n');
+        }
         KeyCode::Enter => {
             let mut lines = app.submit();
             if let [Typed::Line(line)] = &lines[..]
@@ -1587,9 +1596,22 @@ fn wrap(text: &str, width: usize, indent: usize) -> Vec<(usize, &str)> {
         // wide character on a one-column terminal still has to go somewhere.
         let mut hard = i;
         let mut used = 0;
+        let mut broken = false;
         while hard < chars.len() && (hard == i || used + columns[hard] <= take) {
+            // A line break in the text ends the row wherever it is. The break
+            // itself belongs to no row: it is not drawn, only obeyed.
+            if chars[hard] == '\n' {
+                broken = true;
+                break;
+            }
             used += columns[hard];
             hard += 1;
+        }
+        if broken {
+            rows.push((i, &text[bounds[i]..bounds[hard]]));
+            i = hard + 1;
+            take = rest;
+            continue;
         }
         let end_i = if hard == bounds.len() {
             // The rest fits; there is nothing to break.
@@ -2299,16 +2321,33 @@ mod tests {
         );
     }
 
-    /// A pasted paragraph is one line, not several submissions.
+    /// A pasted paragraph is one message with its breaks, not several
+    /// submissions, whichever way the terminal wrote the breaks.
     #[test]
-    fn a_multi_line_paste_stays_one_line() {
+    fn a_multi_line_paste_stays_one_message() {
         let mut app = App::new("t".into());
-        app.paste("deux\nlignes\r\ncollees");
-        assert_eq!(app.input_display(), "deux lignes  collees");
+        app.paste("trois\nlignes\r\nici\rfin");
+        assert_eq!(app.input_display(), "trois↵lignes↵ici↵fin");
         assert!(
             app.items.iter().all(|i| matches!(i, Item::Char(_))),
             "a paste is text, never an attachment"
         );
+        assert_eq!(app.submit(), vec![Typed::Line("trois\nlignes\nici\nfin".into())]);
+    }
+
+    /// A break in the text ends the row there, and the next row lines up
+    /// under the message, as a wrapped one does.
+    #[test]
+    fn a_line_break_starts_a_new_row() {
+        assert_eq!(wrap("un\ndeux", 20, 0), vec![(0, "un"), (3, "deux")]);
+        assert_eq!(wrap("a\n\nb", 20, 0), vec![(0, "a"), (2, ""), (3, "b")]);
+        let text = "bob> salut\nça va ?";
+        let rows = visible_rows(&VecDeque::from([Entry { kind: Kind::Theirs, text: text.into(), chips: Vec::new(), tag: None }]), 40, 5, 0);
+        assert_eq!(rows.iter().map(|r| (r.indent, r.text.as_str())).collect::<Vec<_>>(), vec![(0, "bob> salut"), (5, "ça va ?")]);
+        // Copied, the break comes back.
+        let sel = Selection { anchor: Anchor { entry: 0, offset: 5 }, current: Anchor { entry: 0, offset: 16 } };
+        let history = VecDeque::from([Entry { kind: Kind::Theirs, text: text.into(), chips: Vec::new(), tag: None }]);
+        assert_eq!(selected_text(&history, sel).unwrap(), "salut\nça va");
     }
 
     #[test]
