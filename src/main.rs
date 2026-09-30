@@ -1644,25 +1644,64 @@ async fn call(
     });
     futures::pin_mut!(dialling);
 
+    // What was typed to them while dialling, sent once they are there. Only
+    // plain lines: a command is never held, since a held command would go out
+    // as a message — the accident the keyboard is answered here to prevent.
+    let mut held: Vec<String> = Vec::new();
+    let unsent = |held: &[String]| {
+        if !held.is_empty() {
+            screen.error(format!("-- not sent to {name}: {} line(s) typed while calling --", held.len()));
+        }
+    };
+
     let stream = loop {
         tokio::select! {
-            outcome = &mut dialling => break outcome.inspect_err(|_| screen.status("listening"))?,
-            line = lines.recv() => match line.as_ref().map(|l| l.as_line().unwrap_or("").trim()) {
+            outcome = &mut dialling => match outcome {
+                Ok(stream) => break stream,
+                Err(e) => {
+                    unsent(&held);
+                    screen.status("listening");
+                    return Err(e);
+                }
+            },
+            line = lines.recv() => match line {
                 // The interface is gone.
                 None => return Ok(Flow::Quit),
-                Some("/cancel") => {
-                    screen.system(format!("gave up calling {name}"));
-                    screen.status("listening");
-                    return Ok(Flow::Continue);
-                }
-                // Giving up on a call that has not connected is the one place
-                // where `/quit` needs no hang-up: there is nothing to hang up.
-                Some("/quit") => {
-                    screen.system(format!("gave up calling {name}"));
-                    return Ok(Flow::Quit);
-                }
-                Some("") => {}
-                Some(_) => screen.system(format!("still calling {name} — /cancel to give up")),
+                Some(ui::Typed::Post { .. }) => screen.error(format!(
+                    "-- not sent: files go once {name} answers; drop them again then --"
+                )),
+                Some(ui::Typed::Line(line)) => match line.trim() {
+                    "/cancel" => {
+                        unsent(&held);
+                        screen.system(format!("gave up calling {name}"));
+                        screen.status("listening");
+                        return Ok(Flow::Continue);
+                    }
+                    // Giving up on a call that has not connected is the one
+                    // place where `/quit` needs no hang-up: there is nothing
+                    // to hang up.
+                    "/quit" => {
+                        screen.system(format!("gave up calling {name}"));
+                        return Ok(Flow::Quit);
+                    }
+                    "" => {}
+                    // `//` escapes a line that opens with a slash, as in a call.
+                    typed if typed.starts_with('/') && !typed.starts_with("//") => {
+                        screen.system(format!("still calling {name} — /cancel to give up"));
+                    }
+                    typed => {
+                        let text = match typed.strip_prefix("//") {
+                            Some(rest) => format!("/{rest}"),
+                            None => line.clone(),
+                        };
+                        if text.len() > proto::MAX_TEXT || held.len() >= RINGING_LINES {
+                            screen.error("-- not sent: too much to hold before they answer --");
+                        } else {
+                            screen.system(format!("-- held: goes to {name} once connected --"));
+                            held.push(text);
+                        }
+                    }
+                },
             },
         }
     };
@@ -1672,6 +1711,7 @@ async fn call(
         Ok(link) => link,
         Err(e) => {
             screen.error(format!("-- call dropped: {e:#} --"));
+            unsent(&held);
             screen.status("listening");
             return Ok(Flow::Continue);
         }
@@ -1687,12 +1727,14 @@ async fn call(
             onion::fingerprint(&link.peer.display_unredacted().to_string())
         ));
         let _ = link.close(false).await;
+        unsent(&held);
         screen.status("listening");
         return Ok(Flow::Continue);
     }
 
     screen.system(format!("-- connected to {name} --"));
     screen.status(format!("in a call with {name}"));
+    chat::said_ahead(&link, held, recording(history, book, name), screen).await;
     let (flow, alive) = converse(
         &mut link,
         name,

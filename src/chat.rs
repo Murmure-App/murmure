@@ -773,6 +773,23 @@ pub async fn run(
     Ok(ended)
 }
 
+/// Lines typed while the call was still being placed, now that it connected.
+///
+/// Echoed, written down and sent exactly as [`run`] does a line typed during
+/// the call — so the first of them is what rings at the other end.
+pub async fn said_ahead(link: &Link, lines: Vec<String>, history: Option<&mut History>, screen: &Screen) {
+    let with = link.peer.display_unredacted().to_string();
+    let mut history = history;
+    for text in lines {
+        screen.say(Kind::Mine, format!("you> {text}"));
+        note(&mut history, &with, true, &text, screen);
+        // A peer gone already: the conversation loop sees the same and says so.
+        if link.outbox.send(Message::Text(text)).await.is_err() {
+            break;
+        }
+    }
+}
+
 /// Write one line down, if anything is being written down.
 ///
 /// One helper rather than a check at each site, because "what is recorded" has
@@ -1934,6 +1951,32 @@ mod tests {
     /// it. That frame is off the wire before the conversation exists, and if it
     /// were dropped the peer's opening line would vanish — worse, silently, and
     /// only for the side that had kept the connection.
+    #[tokio::test]
+    async fn lines_typed_while_calling_go_out_first_and_in_order() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        let (one, two) = (
+            crate::identity::Identity::for_test([1u8; 32]),
+            crate::identity::Identity::for_test([2u8; 32]),
+        );
+        let (mine, theirs) = tokio::join!(
+            Link::open(ar.compat(), aw.compat_write(), &one, Some(two.onion_address())),
+            Link::open(br.compat(), bw.compat_write(), &two, None)
+        );
+        let (mine, mut theirs) = (mine.unwrap(), theirs.unwrap());
+        let (screen, mut updates) = crate::ui::channel();
+
+        said_ahead(&mine, vec!["salut".into(), "/pas une commande".into()], None, &screen).await;
+
+        for want in ["salut", "/pas une commande"] {
+            let got = theirs.inbox.recv().await.unwrap().unwrap();
+            assert_eq!(got, Message::Text(want.into()));
+            let Some(crate::ui::Update::Line(echo)) = updates.recv().await else { panic!("no echo") };
+            assert_eq!(echo.text(), format!("you> {want}"));
+        }
+    }
+
     #[tokio::test]
     async fn a_call_starts_with_the_frame_that_announced_it() {
         let dir = scratch("first-frame");
