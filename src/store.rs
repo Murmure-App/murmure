@@ -106,7 +106,30 @@ pub fn write_sealed(path: &Path, key: &[u8; 32], plaintext: &[u8]) -> Result<()>
 
     fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    sync_parent(path);
     Ok(())
+}
+
+/// Make a rename durable. On Unix the directory entry is data of its own: a
+/// crash before it reaches the disk can bring back the old file after the
+/// new one was reported written. Nothing to do on Windows, where a directory
+/// cannot be opened this way.
+///
+/// Logged rather than returned: the file is already in place, and failing the
+/// write now would say it was not.
+pub fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+            tracing::debug!("syncing {}: {e}", dir.display());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Read and open a sealed file, or [`None`] if it does not exist yet.

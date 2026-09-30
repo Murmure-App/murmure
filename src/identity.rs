@@ -21,7 +21,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use bip39::Mnemonic;
 use rand::RngCore as _;
 use tor_hscrypto::pk::{
@@ -38,7 +38,55 @@ pub const SEED_LEN: usize = 32;
 /// Marks a seed file as passphrase-encrypted rather than raw bytes. Chosen so
 /// the two formats are told apart by content, not just length — an encrypted
 /// file could coincidentally be some other length in a future format.
-const MAGIC: [u8; 6] = *b"MURM1E";
+///
+/// The second format writes its Argon2 cost after the magic, so the cost can
+/// rise later without a third. The first used Argon2's defaults and wrote
+/// nothing; it is still read, and rewritten in the second on the next load.
+const MAGIC: [u8; 6] = *b"MURM2E";
+const MAGIC_V1: [u8; 6] = *b"MURM1E";
+
+/// Argon2id cost for new files: 64 MiB, three passes, one lane. About a
+/// third of a second once per start, against Argon2's default of 19 MiB and
+/// two passes, which is sized for a server answering many logins.
+const COST: Cost = Cost { m_kib: 64 * 1024, t: 3, p: 1 };
+
+/// What the first format used, never written down.
+const COST_V1: Cost = Cost {
+    m_kib: Params::DEFAULT_M_COST,
+    t: Params::DEFAULT_T_COST,
+    p: Params::DEFAULT_P_COST,
+};
+
+/// Argon2's three knobs, as the file stores them: little-endian `u32`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cost {
+    m_kib: u32,
+    t: u32,
+    p: u32,
+}
+
+impl Cost {
+    const LEN: usize = 12;
+
+    fn to_bytes(self) -> [u8; Self::LEN] {
+        let mut out = [0; Self::LEN];
+        for (at, v) in [self.m_kib, self.t, self.p].into_iter().enumerate() {
+            out[at * 4..at * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// Read back, refusing a cost this program would never write: the file is
+    /// ours, but a tampered one must not make a start take an hour or 4 GiB.
+    fn from_bytes(bytes: &[u8; Self::LEN]) -> Result<Self> {
+        let n = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+        let cost = Cost { m_kib: n(0), t: n(4), p: n(8) };
+        if cost.m_kib > 1024 * 1024 || cost.t > 16 || cost.p > 8 {
+            bail!("the seed file asks for an Argon2 cost out of range: {cost:?}");
+        }
+        Ok(cost)
+    }
+}
 
 /// Length of the random salt stored alongside an encrypted seed.
 const SALT_LEN: usize = 16;
@@ -49,9 +97,15 @@ const SALT_LEN: usize = 16;
 /// through Argon2id rather than BLAKE3 — a KDF built to be slow against
 /// brute force, unlike `Identity::derive_key`, which derives from a seed that
 /// is already high entropy.
-fn derive_key_from_passphrase(passphrase: &str, salt: &[u8; SALT_LEN]) -> Result<Zeroizing<[u8; 32]>> {
+fn derive_key_from_passphrase(
+    passphrase: &str,
+    salt: &[u8; SALT_LEN],
+    cost: Cost,
+) -> Result<Zeroizing<[u8; 32]>> {
+    let params = Params::new(cost.m_kib, cost.t, cost.p, Some(32))
+        .map_err(|e| anyhow::anyhow!("Argon2 parameters {cost:?}: {e}"))?;
     let mut out = Zeroizing::new([0u8; 32]);
-    Argon2::default()
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
         .hash_password_into(passphrase.as_bytes(), salt, out.as_mut())
         .map_err(|e| anyhow::anyhow!("deriving a key from the passphrase: {e}"))?;
     Ok(out)
@@ -59,7 +113,12 @@ fn derive_key_from_passphrase(passphrase: &str, salt: &[u8; SALT_LEN]) -> Result
 
 /// Whether `bytes` is a passphrase-encrypted seed file rather than a raw seed.
 fn is_encrypted(bytes: &[u8]) -> bool {
-    bytes.len() > MAGIC.len() && bytes[..MAGIC.len()] == MAGIC
+    bytes.len() > MAGIC.len() && (bytes[..MAGIC.len()] == MAGIC || bytes[..MAGIC.len()] == MAGIC_V1)
+}
+
+/// Written in the first format, whose cost is too low to keep.
+fn is_v1(bytes: &[u8]) -> bool {
+    bytes.starts_with(&MAGIC_V1)
 }
 
 /// Seal `seed` under `passphrase`. Pure: no file I/O, no prompting — so tests
@@ -67,11 +126,12 @@ fn is_encrypted(bytes: &[u8]) -> bool {
 fn encrypt_seed_bytes(seed: &[u8; SEED_LEN], passphrase: &str) -> Result<Vec<u8>> {
     let mut salt = [0u8; SALT_LEN];
     rand::rngs::OsRng.fill_bytes(&mut salt);
-    let key = derive_key_from_passphrase(passphrase, &salt)?;
+    let key = derive_key_from_passphrase(passphrase, &salt, COST)?;
     let sealed = store::seal(&key, seed)?;
 
-    let mut out = Vec::with_capacity(MAGIC.len() + SALT_LEN + sealed.len());
+    let mut out = Vec::with_capacity(MAGIC.len() + Cost::LEN + SALT_LEN + sealed.len());
     out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&COST.to_bytes());
     out.extend_from_slice(&salt);
     out.extend_from_slice(&sealed);
     Ok(out)
@@ -80,13 +140,21 @@ fn encrypt_seed_bytes(seed: &[u8; SEED_LEN], passphrase: &str) -> Result<Vec<u8>
 /// Open what [`encrypt_seed_bytes`] produced.
 fn decrypt_seed_bytes(bytes: &[u8], passphrase: &str) -> Result<Zeroizing<[u8; SEED_LEN]>> {
     let rest = &bytes[MAGIC.len()..];
+    let (cost, rest) = if is_v1(bytes) {
+        (COST_V1, rest)
+    } else {
+        let (cost, rest) = rest
+            .split_first_chunk::<{ Cost::LEN }>()
+            .context("encrypted seed file is truncated")?;
+        (Cost::from_bytes(cost)?, rest)
+    };
     if rest.len() < SALT_LEN {
         bail!("encrypted seed file is truncated");
     }
     let (salt, sealed) = rest.split_at(SALT_LEN);
     let salt: [u8; SALT_LEN] = salt.try_into().expect("split_at guarantees the length");
 
-    let key = derive_key_from_passphrase(passphrase, &salt)?;
+    let key = derive_key_from_passphrase(passphrase, &salt, cost)?;
     let plaintext =
         store::open(&key, sealed).context("wrong passphrase, or the seed file was tampered with")?;
     plaintext
@@ -149,6 +217,7 @@ fn write_seed_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("flushing {}", tmp.display()))?;
     drop(file);
     fs::rename(&tmp, path).with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+    store::sync_parent(path);
     Ok(())
 }
 
@@ -192,7 +261,16 @@ impl Identity {
         );
         let seed: Zeroizing<[u8; SEED_LEN]> = if is_encrypted(&bytes) {
             let passphrase = read_passphrase("identity passphrase: ")?;
-            decrypt_seed_bytes(&bytes, &passphrase)?
+            let seed = decrypt_seed_bytes(&bytes, &passphrase)?;
+            // The passphrase is only ever in hand here, so this is where the
+            // first format moves to the second. Failing to is not failing to
+            // start: the old file still opens next time.
+            if is_v1(&bytes)
+                && let Err(e) = encrypt_seed_bytes(&seed, &passphrase).and_then(|out| write_seed_bytes(path, &out))
+            {
+                tracing::warn!("could not upgrade the seed file's passphrase hashing: {e:#}");
+            }
+            seed
         } else {
             bytes.as_slice().try_into().map(Zeroizing::new).map_err(|_| {
                 anyhow::anyhow!(
@@ -215,8 +293,10 @@ impl Identity {
     /// before touching the file, so a mistyped passphrase never destroys the
     /// original.
     pub fn encrypt_at_rest(path: &Path) -> Result<()> {
-        let bytes = fs::read(path)
-            .with_context(|| format!("reading the identity seed at {}", path.display()))?;
+        // A plaintext seed file: the buffer is the seed, so it is wiped too.
+        let bytes = Zeroizing::new(
+            fs::read(path).with_context(|| format!("reading the identity seed at {}", path.display()))?,
+        );
         if is_encrypted(&bytes) {
             bail!(
                 "{} is already passphrase-encrypted; run with MURMURE_DECRYPT_IDENTITY=1 first \
@@ -224,7 +304,7 @@ impl Identity {
                 path.display()
             );
         }
-        let seed: [u8; SEED_LEN] = bytes.as_slice().try_into().map_err(|_| {
+        let seed: Zeroizing<[u8; SEED_LEN]> = bytes.as_slice().try_into().map(Zeroizing::new).map_err(|_| {
             anyhow::anyhow!("{} is {} bytes, expected exactly {SEED_LEN}", path.display(), bytes.len())
         })?;
         let passphrase = read_new_passphrase()?;
@@ -335,6 +415,7 @@ impl Identity {
             .with_context(|| format!("writing the identity seed at {}", path.display()))?;
         file.sync_all()
             .with_context(|| format!("flushing the identity seed at {}", path.display()))?;
+        store::sync_parent(path);
 
         // Off Unix there is nothing to tighten here. std exposes only the
         // read-only flag, which is not a permission — setting it would restrict
@@ -536,6 +617,29 @@ mod test {
         assert_eq!(*decrypted, seed);
     }
 
+    /// A seed file as the first format wrote it: magic, salt, sealed seed.
+    fn first_format(seed: &[u8; SEED_LEN], passphrase: &str) -> Vec<u8> {
+        let salt = [3u8; SALT_LEN];
+        let key = derive_key_from_passphrase(passphrase, &salt, COST_V1).unwrap();
+        [&MAGIC_V1[..], &salt, &store::seal(&key, seed).unwrap()].concat()
+    }
+
+    #[test]
+    fn the_first_format_still_opens() {
+        let seed = [9u8; SEED_LEN];
+        let old = first_format(&seed, "pass");
+        assert!(is_encrypted(&old) && is_v1(&old));
+        assert_eq!(*decrypt_seed_bytes(&old, "pass").unwrap(), seed);
+        assert!(decrypt_seed_bytes(&old, "wrong").is_err());
+    }
+
+    #[test]
+    fn an_absurd_cost_is_refused_before_it_runs() {
+        let mut file = encrypt_seed_bytes(&[1u8; SEED_LEN], "p").unwrap();
+        file[MAGIC.len()..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decrypt_seed_bytes(&file, "p").is_err());
+    }
+
     #[test]
     fn a_wrong_passphrase_cannot_open_an_encrypted_seed() {
         let seed = [5u8; SEED_LEN];
@@ -576,6 +680,14 @@ mod test {
 
         let after_decrypt = Identity::load_or_create(&path).expect("load decrypted");
         assert_eq!(after_decrypt.onion_address(), address_before);
+
+        // A file in the first format opens, and is written back in the second.
+        fs::write(&path, first_format(&after_decrypt.seed, "test passphrase")).unwrap();
+        let upgraded = Identity::load_or_create(&path).expect("load the first format");
+        assert_eq!(upgraded.onion_address(), address_before);
+        let now = fs::read(&path).unwrap();
+        assert!(now.starts_with(&MAGIC) && !is_v1(&now));
+        assert_eq!(Cost::from_bytes(now[MAGIC.len()..][..Cost::LEN].try_into().unwrap()).unwrap(), COST);
 
         unsafe { std::env::remove_var("MURMURE_SEED_PASSPHRASE") };
         let _ = fs::remove_dir_all(&dir);
