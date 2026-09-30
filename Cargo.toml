@@ -6,6 +6,10 @@ name = "murmure"
 # under you". See the Status section of README.md.
 version = "0.1.0-beta.3"
 edition = "2024"
+# arti 0.46's own minimum, which is the binding one: nothing here asks for
+# more. Checked in CI by the `msrv` job, so a newer std API slipping in fails
+# there rather than on somebody's older toolchain.
+rust-version = "1.91"
 license = "GPL-3.0-or-later"
 description = "Peer-to-peer terminal messaging over Tor onion services"
 

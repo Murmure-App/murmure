@@ -151,5 +151,7 @@ Relecture de tout `src/`, faite après la v0.1.0-beta.2. Treize commits, **aucun
 
 - ✅ **Notifications** (P3-2) : bip du terminal quand un message, un appel ou une invitation de salon arrive alors que la fenêtre n'est pas au premier plan (rapports de focus de crossterm). `/notify on|off`, `MURMURE_NOTIFY=off`. Vérifié en live via tmux (drapeau de cloche levé à la sonnerie).
 
+- ✅ **MSRV et clippy multi-plateformes** (P3-5) : `rust-version = "1.91"` (le minimum d'arti 0.46), job CI `msrv` qui fait `cargo +1.91 check`, clippy sur Linux, macOS et Windows. Vérifié en local : build en 1.91, clippy en cible Windows.
+
 ### P3 — Proposé, à valider
-Messages multi-lignes, salons et réception pendant un appel, MSRV et clippy Windows/macOS en CI.
+Messages multi-lignes, salons et réception pendant un appel.
