@@ -121,3 +121,29 @@ Ce document rassemble l'ensemble des pistes d'amélioration, des axes de recherc
 - [x] **Intégration Continue (CI) Multi-Plateforme** — ✅ DÉJÀ FAIT (constaté le 2026-08-30) : `.github/workflows/ci.yml` fait tourner tests + clippy sur Linux/macOS à chaque push/PR, plus un audit hebdomadaire des dépendances (`rustsec/audit-check`). `rustfmt --check` volontairement absent — le commentaire du fichier explique pourquoi (rustfmt casserait 450 lignes de style délibéré, à activer le jour où un deuxième contributeur écrit du code ici).
 - [x] **Releases Automatisées** — ✅ DÉJÀ FAIT (constaté le 2026-08-30) : `.github/workflows/release.yml` publie sur chaque tag `v*` des binaires Linux `x86_64`/`aarch64` et macOS universel (Intel+Apple Silicon via `lipo`), avec attestation de provenance et `SHA256SUMS`. Plus complet que ce que demandait la fiche (signature de provenance en plus).
 - [ ] **Gestionnaires de paquets :** Création de formules pour **Homebrew** (macOS/Linux), paquets **AUR** (Arch Linux) et paquets Debian/Ubuntu (`.deb`). — seul point encore ouvert de la section 5.
+
+## 6. Audit du code complet (2026-09-29) — corrections P0 à P2
+
+Relecture de tout `src/`, faite après la v0.1.0-beta.2. Treize commits, **aucun bump de `VERSION`** (reste 12) : les correctifs restent compatibles avec les pairs en beta.2.
+
+### P0 — Sécurité et confidentialité
+- ✅ **Keystore arti en mémoire et vanguards** (`86a27ed`) : le keystore sur disque écrivait en clair la clé d'identité et un dossier par contact. L'ancien `state/keystore` est supprimé au démarrage.
+- ✅ **IP candidates canoniques, caractères invisibles, noms Windows** (`87c3ee9`) : `::ffff:127.0.0.1` ne passe plus le filtre loopback.
+- ✅ **Délais anti-DoS** (`64034c3`) : accept QUIC concurrent avec jeton, handshake entrant hors de la boucle, délais d'écriture et de lecture.
+
+### P1 — Bugs
+- ✅ **Transferts pendant un appel** (`451c46b`) : repli Tor après `DirectFailed`, `Post` au nom bizarre, `FileReject` ciblé, `/cancel` côté receveur, chips périmés.
+- ✅ **`main.rs`** (`a350c45`) : `/tell` découpé par mots, `/view ~`, `/tell` en attente livré après un `/call`, envoi des derniers messages avant de quitter.
+- ✅ **Fenêtre de dédup partagée `Seen`** (`21ba66d`) : lignes de salon hors ordre, `seen_above` borné à 256.
+- ✅ **Salons** (`dea7c1e`) : membre perdu par l'hôte prévenu à sa ligne suivante, invitation remplacée déclinée, expiration à 10 min, 256 fichiers au plus.
+- ✅ **Carnet** (`d1f4334`) : une adresse déjà enregistrée sous un autre nom est refusée.
+
+### P2 — Performance et confort
+- ✅ **Pool** (`b624932`) : envoi borné à 5 s, puis le lien est coupé ; un upload de salon laisse la moitié de la file libre.
+- 🟡 **Fichiers de salon** (`1ec8d34`) : hash et copies sur le pool bloquant, quota partagé entre téléchargements, un seul flux par demande, nom vérifié à l'annonce. Non fait : relancer vers un *autre* pair après un blocage ; le hash est encore attendu dans la boucle (événement de fin à faire si les fichiers de plusieurs Go comptent).
+- ✅ **Interface** (`e210e0f`) : nombre de lignes en cache, largeur d'affichage (`unicode-width`), sélection stable quand l'historique évince.
+- ✅ **Identité et stockage** (`b17bddf`) : tampon du seed en `Zeroizing`, format `MURM2E` avec le coût Argon2 dans le fichier, fsync du répertoire après rename.
+- ✅ **Répertoire de données de la plateforme** (`e822567`) : `MURMURE_DIR`, sinon `./.murmure` s'il existe, sinon `~/.local/share/murmure` et équivalents.
+
+### P3 — Proposé, à valider
+`/verify` (numéro de sécurité de 60 chiffres), notifications (`\a` hors focus), messages multi-lignes, salons et réception pendant un appel, MSRV et clippy Windows/macOS en CI.
