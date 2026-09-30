@@ -131,6 +131,14 @@ pub fn describe(path: &Path) -> Result<Offer> {
     if name.len() > crate::proto::MAX_NAME {
         bail!("{name:?} is longer than {} bytes", crate::proto::MAX_NAME);
     }
+    // Refused here rather than by the peer, whose only answer to a name it
+    // will not save is to drop the offer.
+    if safe_name(&name).is_err() {
+        bail!(
+            "{name:?} would be refused on the other side (hidden file, reserved or \
+             non-portable name, or invisible characters); rename it first"
+        );
+    }
 
     Ok(Offer {
         name,
@@ -194,8 +202,9 @@ pub fn safe_name(raw: &str) -> Result<String> {
         bail!("the peer sent a filename containing invisible or reordering characters");
     }
     // Reserved on Windows, harmless on Unix, refused everywhere so that a file
-    // received on one machine can be moved to another.
-    if last.contains(':') {
+    // received on one machine can be moved to another. Windows also drops a
+    // trailing dot, so `a.exe.` would be saved as `a.exe`.
+    if last.contains([':', '<', '>', '"', '|', '?', '*']) || last.ends_with('.') {
         bail!("the peer sent {last:?}, which is not a portable filename");
     }
     let stem = last.split('.').next().unwrap_or(&last);
@@ -222,12 +231,24 @@ pub fn safe_name(raw: &str) -> Result<String> {
 /// remaining an executable. They are listed rather than derived because std
 /// exposes no character categories, and a named list of exactly what reorders
 /// text is clearer than a dependency that would answer the same question.
+///
+/// The invisible ones go too: zero-width spaces and joiners, word joiners,
+/// the BOM, the soft hyphen, the line and paragraph separators, and the tag
+/// characters. Each lets two names that look identical differ, or hides text
+/// inside a line. A joiner-built emoji loses its joins and shows as its parts.
 fn has_display_spoofing_chars(c: char) -> bool {
     const BIDI: [char; 12] = [
         '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
         '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
     ];
-    c.is_control() || BIDI.contains(&c)
+    const INVISIBLE: [char; 13] = [
+        '\u{00ad}', '\u{180e}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{2028}', '\u{2029}',
+        '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}', '\u{feff}',
+    ];
+    c.is_control()
+        || BIDI.contains(&c)
+        || INVISIBLE.contains(&c)
+        || ('\u{e0000}'..='\u{e007f}').contains(&c)
 }
 
 /// Strip whatever would let a peer's chat text control our terminal instead of
@@ -373,6 +394,14 @@ mod tests {
         assert!(safe_name("notes\u{0000}.txt").is_err());
         // An NTFS alternate data stream, and a drive letter.
         assert!(safe_name("notes.txt:hidden").is_err());
+        // What Windows refuses to create, or silently renames.
+        for bad in ["a<b.txt", "a>b", "say \"hi\".txt", "a|b", "why?.txt", "*.txt", "a.exe."] {
+            assert!(safe_name(bad).is_err(), "{bad:?} must be refused");
+        }
+        // Looks like `report.pdf`, is not: zero-width space, BOM, word joiner.
+        for twin in ["re\u{200b}port.pdf", "\u{feff}report.pdf", "report\u{2060}.pdf"] {
+            assert!(safe_name(twin).is_err(), "{twin:?} must be refused");
+        }
     }
 
     /// A chat line has no filesystem to escape, but the same characters would
@@ -390,6 +419,11 @@ mod tests {
         assert_eq!(
             sanitize_for_display("innocent\u{202e}gnp.exe"),
             "innocentgnp.exe"
+        );
+        // Invisible characters and tag characters hide text inside a line.
+        assert_eq!(
+            sanitize_for_display("pay\u{200b}pal \u{e0041}\u{2028}ok"),
+            "paypal ok"
         );
         // Never panics or rejects — there is no sender to ask again.
         assert_eq!(sanitize_for_display(""), "");
@@ -409,6 +443,13 @@ mod tests {
         assert!(describe(&dir).is_err(), "a directory is not a file");
         fs::write(dir.join("empty"), b"").unwrap();
         assert!(describe(&dir.join("empty")).is_err(), "nothing to send");
+
+        // Legal here, refused by the receiver: caught before it is offered.
+        #[cfg(unix)]
+        for name in ["why?.txt", ".hidden"] {
+            fs::write(dir.join(name), b"x").unwrap();
+            assert!(describe(&dir.join(name)).is_err(), "{name:?} must not be offered");
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

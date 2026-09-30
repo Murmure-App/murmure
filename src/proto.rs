@@ -691,7 +691,9 @@ impl Message {
                     );
                 }
                 for addr in &d.candidates {
-                    let ip = addr.ip();
+                    // Canonical first: `::ffff:127.0.0.1` is IPv4 loopback, and
+                    // the IPv6 checks below would let it through.
+                    let ip = addr.ip().to_canonical();
                     if ip.is_unspecified() || ip.is_multicast() || ip.is_loopback() {
                         bail!("invalid candidate address {addr}: unspecified, multicast or loopback");
                     }
@@ -1538,17 +1540,23 @@ mod tests {
             assert!(wire.is_empty());
         }
 
-        // Loopback would aim us at our own machine.
-        let home = Message::FileAccept {
-            hash: [0u8; 32],
-            offset: 0,
-            direct: Some(Direct {
-                candidates: vec!["127.0.0.1:22".parse().unwrap()],
-                fingerprint: [0u8; 32],
-                token: [0u8; 32],
-            }),
-        };
-        assert!(futures::executor::block_on(write_frame(&mut Vec::new(), &home)).is_err());
+        // Loopback would aim us at our own machine, and link-local at the
+        // router's admin page — also when written as IPv4-mapped IPv6.
+        for local in ["127.0.0.1:22", "[::ffff:127.0.0.1]:22", "[::ffff:169.254.1.1]:80"] {
+            let home = Message::FileAccept {
+                hash: [0u8; 32],
+                offset: 0,
+                direct: Some(Direct {
+                    candidates: vec![local.parse().unwrap()],
+                    fingerprint: [0u8; 32],
+                    token: [0u8; 32],
+                }),
+            };
+            assert!(
+                futures::executor::block_on(write_frame(&mut Vec::new(), &home)).is_err(),
+                "{local} must be refused"
+            );
+        }
 
         // The plain Tor answer carries no addresses at all, and must stay legal.
         let mut wire = Vec::new();
