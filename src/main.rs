@@ -67,6 +67,7 @@ mod proto;
 mod ratchet;
 mod room;
 mod roomfiles;
+mod seen;
 mod store;
 mod transport;
 mod ui;

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::proto::Message;
+use crate::seen::Seen;
 use crate::store;
 
 /// Key-derivation context for the contacts file. Changing this string makes
@@ -157,17 +158,14 @@ pub struct Contact {
     pub discovery: String,
     /// Where this contact stands on seeing, and being seen by, us.
     pub presence: Presence,
-    /// The lowest contiguous [`Message::Left`] id from this contact we have received.
+    /// The [`Message::Left`] ids from this contact we have received.
     ///
     /// Their outbox keeps a message until we acknowledge it, so an
     /// acknowledgement lost to a dropped link costs a redelivery. This is what
-    /// makes that redelivery free: anything below this mark is something we
-    /// already have, acknowledged again and shown to nobody.
-    pub seen_floor: u64,
-    /// Discontiguous [`Message::Left`] ids received above [`Self::seen_floor`].
-    ///
-    /// Kept so messages delivered out of order are not silently dropped.
-    pub seen_above: std::collections::BTreeSet<u64>,
+    /// makes that redelivery free: an id already here is something we already
+    /// have, acknowledged again and shown to nobody. Out-of-order ids are kept
+    /// rather than dropped; see [`Seen`] for the bound.
+    pub seen: Seen,
     /// This contact asked not to be written down.
     ///
     /// Their side of `/history`. Honoured whatever our own setting is, so
@@ -247,8 +245,7 @@ impl Contacts {
             address: address.trim().to_owned(),
             discovery: discovery.trim().to_owned(),
             presence: Presence::Off,
-            seen_floor: 0,
-            seen_above: std::collections::BTreeSet::new(),
+            seen: Seen::default(),
             objects_to_history: false,
             we_object: false,
         };
@@ -391,12 +388,8 @@ impl Contacts {
         let Some(entry) = self.entries.get_mut(name.trim()) else {
             return Ok(false);
         };
-        if id < entry.seen_floor || entry.seen_above.contains(&id) {
+        if !entry.seen.accept(id) {
             return Ok(false);
-        }
-        entry.seen_above.insert(id);
-        while entry.seen_above.remove(&entry.seen_floor) {
-            entry.seen_floor += 1;
         }
         self.save()?;
         Ok(true)
@@ -521,8 +514,8 @@ mod tests {
         assert_eq!(book.presence_of("alice"), Presence::On, "presence survives");
         assert!(book.objects_to_history("alice"), "their objection survives");
         let (_, alice) = book.iter().next().unwrap();
-        assert_eq!(alice.seen_above.len(), 1, "the delivery mark survives");
-        assert!(alice.seen_above.contains(&41));
+        assert_eq!(alice.seen.above.len(), 1, "the delivery mark survives");
+        assert!(alice.seen.above.contains(&41));
         assert!(alice.we_object, "and ours survives");
         // Back to defaults for the rest of the test.
         book.set_presence("alice", Presence::Off).unwrap();
@@ -663,8 +656,8 @@ mod tests {
         assert!(!book.accept_left("alice", 2).unwrap());
 
         let (_, alice) = book.iter().next().unwrap();
-        assert_eq!(alice.seen_floor, 3);
-        assert!(alice.seen_above.is_empty());
+        assert_eq!(alice.seen.floor, 3);
+        assert!(alice.seen.above.is_empty());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

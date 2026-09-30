@@ -45,6 +45,7 @@ use tor_hscrypto::pk::HsId;
 use tor_llcrypto::pk::ed25519;
 
 use crate::proto::{FileRef, MAX_MEMBERS, MAX_NAME, MAX_TEXT, Message, RoomId};
+use crate::seen::Seen;
 
 /// Is this a frame for [`Rooms::receive`]?
 pub fn is_room(msg: &Message) -> bool {
@@ -185,8 +186,8 @@ pub struct Room {
     claimed: HashMap<HsId, Key>,
     /// Contacts we already told our key to.
     greeted: HashSet<HsId>,
-    /// The last line number seen from each key.
-    last: HashMap<Key, u64>,
+    /// The line numbers seen from each key, which count from 1.
+    last: HashMap<Key, Seen>,
     /// Host only: who was asked and has not answered.
     invited: HashSet<HsId>,
 }
@@ -671,7 +672,9 @@ impl Rooms {
         if !r.roster.iter().any(|(k, _)| *k == key) {
             return Outcome::default();
         }
-        if seq <= r.last.get(&key).copied().unwrap_or(0) {
+        // Checked before the signature, which costs more; recorded after it,
+        // so a forgery cannot burn a number.
+        if r.last.get(&key).is_some_and(|seen| seen.has(seq)) {
             return Outcome::default();
         }
         let Ok(sig) = <[u8; 64]>::try_from(sig.as_slice()) else {
@@ -689,7 +692,7 @@ impl Rooms {
         {
             return Outcome::default();
         }
-        r.last.insert(key, seq);
+        r.last.entry(key).or_insert_with(|| Seen::starting_at(1)).accept(seq);
         let who = r.who(&key);
         let event = match &line {
             Line::Say(body) => Event::Said {
@@ -843,6 +846,21 @@ mod tests {
         assert_eq!(said(&seen, a), ["coucou"]);
         assert_eq!(said(&seen, c), ["coucou"], "twice would mean a duplicate got through");
         assert!(seen.contains(&(c, Event::Said { who: Who::Known(b), body: "coucou".into() })));
+    }
+
+    /// Relay and direct paths race: line 2 can land before line 1. Both are
+    /// shown, and a repeat of either is not.
+    #[test]
+    fn a_line_that_arrives_late_is_still_shown_once() {
+        let ((mut nodes, contacts), [a, b, _]) = room(false);
+        let first = nodes.get_mut(&b).unwrap().say("un").unwrap().send[0].1.clone();
+        let second = nodes.get_mut(&b).unwrap().say("deux").unwrap().send[0].1.clone();
+        let host = nodes.get_mut(&a).unwrap();
+        let mut heard = |msg: &Message| host.receive(b, msg.clone(), &contacts[&a]).events.len();
+        assert_eq!(heard(&second), 1);
+        assert_eq!(heard(&first), 1, "the late one is not a repeat");
+        assert_eq!(heard(&first), 0);
+        assert_eq!(heard(&second), 0);
     }
 
     #[test]
