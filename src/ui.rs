@@ -11,7 +11,7 @@
 //! Anything written to stdout by something other than this module lands in the
 //! middle of the frame and corrupts it. `main` points `tracing` at a file for
 //! exactly that reason; `RUST_LOG=info` still works, the output just lives in
-//! `.murmure/murmure.log` instead of on screen.
+//! `murmure.log` in the run directory instead of on screen.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;

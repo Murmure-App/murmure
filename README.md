@@ -63,8 +63,9 @@ Five things differ from a plain Linux machine:
 - **Run it from your Linux home, not from `/mnt/c`.** murmure refuses to start
   if `identity.seed` is readable by anyone else, and files on the Windows drive
   cannot hold Unix permissions, so the check fails there — by design.
-- **Received files** land in `.murmure/incoming/` inside Linux. From Windows,
-  open `\\wsl$\Ubuntu\home\<you>\` in Explorer.
+- **Received files** land in `~/.local/share/murmure/incoming/` inside Linux.
+  From Windows, open `\\wsl$\Ubuntu\home\<you>\.local\share\murmure\` in
+  Explorer.
 - **Copying your address** works: Windows Terminal honours the clipboard escape
   murmure uses.
 - **`/view` does not**: Windows Terminal speaks Sixel, and `/view` only speaks
@@ -352,7 +353,8 @@ call numbers its files from 1.
 A running transfer draws a **progress bar in the title line** — name, percent
 and both sizes — for either direction and either route.
 
-An accepted file is written to `.murmure/incoming/`. It only gets its real name
+An accepted file is written to `incoming/` in the data directory (see
+[Files on disk](#files-on-disk)). It only gets its real name
 once its BLAKE3 hash matches what was offered; until then it sits under a name
 derived from that hash, with a `.part` extension.
 
@@ -438,8 +440,15 @@ message count, sizes and timing readable.
 
 ## Files on disk
 
-Everything lives in `.murmure/` next to where you ran it: the identity seed, the
-sealed contacts book, received files, Tor's state, and `murmure.log`.
+Everything lives in one directory: the identity seed, the sealed contacts book,
+received files, Tor's state, and `murmure.log`. It is the platform's data
+directory — `~/.local/share/murmure` on Linux, `~/Library/Application
+Support/murmure` on macOS, `%LOCALAPPDATA%\murmure\data` on Windows — so
+starting murmure from anywhere finds the same identity.
+
+Versions up to 0.1.0-beta.2 used `.murmure/` in the directory murmure was
+started from. That one is still used when it is there, and murmure says so at
+start; move it to the directory above to stop depending on where you start.
 
 `identity.seed` **is** your identity — 32 bytes, mode 0600, never leaves the
 machine. Lose it and you lose your address and your contacts book, which is
@@ -460,7 +469,7 @@ starts:
 
   (`read -rs` keeps the words out of your shell history.) The phrase restores
   the identity only: the contacts book and history are files, and come back
-  only if you copied `.murmure/` too. Anyone holding the words *is* you.
+  only if you copied the data directory too. Anyone holding the words *is* you.
 - **A passphrase.** `MURMURE_ENCRYPT_IDENTITY=1 ./murmure` encrypts the seed
   with a passphrase (Argon2id), asked at every start from then on;
   `MURMURE_DECRYPT_IDENTITY=1` undoes it.

@@ -251,6 +251,14 @@ async fn run(run_dir: &Path) -> Result<()> {
         book.len(),
         if book.len() == 1 { "" } else { "s" }
     ));
+    if run_dir == Path::new(LEGACY_DIR)
+        && let Some(platform) = platform_dir()
+    {
+        screen.system(format!(
+            "using ./{LEGACY_DIR} from this directory. Move it to {} to find it from anywhere.",
+            platform.display()
+        ));
+    }
     screen.system(format!("your address: {my_address}"));
     screen.system(format!("your key:     {}", identity.discovery_key()));
     screen.system("give a friend both lines, and compare the fingerprint out loud.");
@@ -1978,13 +1986,30 @@ fn identity_mismatch(
 
 /// Where this run keeps its seed, its book, its log and its Tor directories.
 ///
-/// Overridable with `MURMURE_DIR`, which is also how two instances share one
-/// machine without colliding.
+/// `MURMURE_DIR` first, which is also how two instances share one machine
+/// without colliding. Then a `.murmure` in the current directory, if there is
+/// one: where every earlier version put it, so an existing identity is not
+/// left behind. Otherwise the platform's data directory, so that starting
+/// murmure from somewhere else is not starting a different identity.
 fn run_dir() -> PathBuf {
-    match std::env::var_os("MURMURE_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(".murmure"),
+    if let Some(dir) = std::env::var_os("MURMURE_DIR") {
+        return PathBuf::from(dir);
     }
+    let here = PathBuf::from(LEGACY_DIR);
+    if here.exists() {
+        return here;
+    }
+    platform_dir().unwrap_or(here)
+}
+
+/// The run directory of versions up to 0.1.0-beta.2, relative to wherever
+/// murmure was started.
+const LEGACY_DIR: &str = ".murmure";
+
+/// `~/.local/share/murmure`, `~/Library/Application Support/murmure`,
+/// `%LOCALAPPDATA%\murmure\data`. `None` without a home directory.
+fn platform_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "murmure").map(|dirs| dirs.data_local_dir().to_path_buf())
 }
 
 /// A timestamped stage marker, so a 90-second wait never looks frozen.
