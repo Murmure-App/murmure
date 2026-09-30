@@ -198,6 +198,22 @@ impl Pool {
     /// What `/forget` and the end of a presence agreement both mean. The link
     /// is closed rather than dropped so the last frame queued on it — the
     /// `PresenceNo` that says why — still gets out.
+    /// Close every held connection, letting what is queued on each go out
+    /// first: a `RoomLeave` or `HangUp` sent on the way out is otherwise cut
+    /// off with the runtime.
+    ///
+    /// Bounded, since quitting must not wait on a peer that stopped reading.
+    /// ponytail: then a fixed pause, because a flushed frame is still in arti's
+    /// circuit reactor rather than on the wire; arti gives no "sent" signal.
+    pub async fn close_all(&mut self) {
+        if self.idle.is_empty() {
+            return;
+        }
+        let closing = self.idle.drain().map(|(_, link)| link.close(true));
+        let _ = tokio::time::timeout(Duration::from_secs(2), futures::future::join_all(closing)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     pub async fn forget(&mut self, peer: &HsId) {
         if let Some(dial) = self.dialling.remove(peer) {
             dial.abort();

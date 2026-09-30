@@ -784,6 +784,9 @@ async fn serve(
         }
     }
 
+    // What was said on the way out — leaving a room, hanging up — is still
+    // queued on the links. Let it go before the runtime is torn down.
+    pool.close_all().await;
     Ok(())
 }
 
@@ -1025,10 +1028,15 @@ async fn presence(
 /// The whole point of the pool is that hanging up is not disconnecting — so
 /// this is the one place that decides which of the two just happened, and there
 /// is exactly one answer: the peer going away.
-async fn shelve(pool: &mut Pool, link: Link, alive: bool) {
+async fn shelve(pool: &mut Pool, link: Link, alive: bool, outbox: &Outbox, screen: &Screen) {
     if alive {
         // Back where it was; nothing to announce, since nobody arrived.
+        let peer = link.peer;
         let _ = pool.keep(link).await;
+        // What waits for them goes now. A `/tell` queued before the call, or
+        // one they re-sent during it (a call ignores those, see `chat`),
+        // otherwise sat there until the next time they connected.
+        deliver(&peer, outbox, pool, screen).await;
     } else if let Err(e) = link.close(true).await {
         tracing::debug!("closing a spent connection: {e:#}");
     }
@@ -1332,7 +1340,8 @@ async fn command(
             if arg.is_empty() {
                 bail!("usage: /view <path> — the path is printed when a file arrives (\"-- received ... --\")");
             }
-            let path = std::path::Path::new(arg);
+            let arg = chat::expand_home(arg);
+            let path = std::path::Path::new(&arg);
             if !image::is_image(path) {
                 bail!("{arg} does not look like an image murmure can show (png, jpg, jpeg, gif, bmp)");
             }
@@ -1351,11 +1360,10 @@ async fn command(
                 bail!("usage: /tell <name> <message>");
             };
             // Everything after the name, spacing and all. `split_whitespace`
-            // has eaten it, so take it from the original line.
-            let body = line
-                .split_once(name)
-                .map(|(_, rest)| rest.trim())
-                .unwrap_or_default();
+            // has eaten it, so take it from the original line — by words, not
+            // by searching for the name, which a name like `el` finds inside
+            // `/tell` itself.
+            let body = after_words(line, 2);
             if body.is_empty() {
                 bail!("usage: /tell {name} <message>");
             }
@@ -1419,7 +1427,7 @@ async fn command(
                 screen,
             )
             .await;
-            shelve(pool, link, alive).await;
+            shelve(pool, link, alive, outbox, screen).await;
             if let Flow::Continue = flow {
                 screen.status("listening");
             }
@@ -1456,7 +1464,7 @@ async fn command(
                 .address_of(name)
                 .ok_or_else(|| anyhow::anyhow!("no contact called {name} — /add them first"))?
                 .to_owned();
-            return call(started, live, pool, book, history, name, &address, lines, screen).await;
+            return call(started, live, pool, book, outbox, history, name, &address, lines, screen).await;
         }
         "/copy" => {
             // Exactly what the other person has to type after `/add <name>`, in
@@ -1563,6 +1571,7 @@ async fn call(
     live: &Live<'_>,
     pool: &mut Pool,
     book: &mut Contacts,
+    outbox: &Outbox,
     history: &mut History,
     name: &str,
     address: &str,
@@ -1590,7 +1599,7 @@ async fn call(
             screen,
         )
         .await;
-        shelve(pool, link, alive).await;
+        shelve(pool, link, alive, outbox, screen).await;
         if let Flow::Continue = flow {
             screen.status("listening");
         }
@@ -1686,7 +1695,7 @@ async fn call(
         screen,
     )
     .await;
-    shelve(pool, link, alive).await;
+    shelve(pool, link, alive, outbox, screen).await;
     if let Flow::Continue = flow {
         screen.status("listening");
     }
@@ -1934,6 +1943,15 @@ async fn leave_room(rooms: &mut Rooms, pool: &mut Pool) {
     }
 }
 
+/// What follows the first `n` words of `line`, with the spacing inside it kept.
+fn after_words(line: &str, n: usize) -> &str {
+    let mut rest = line.trim_start();
+    for _ in 0..n {
+        rest = rest.trim_start_matches(|c: char| !c.is_whitespace()).trim_start();
+    }
+    rest.trim_end()
+}
+
 /// The message for the one failure that must never be papered over.
 fn identity_mismatch(
     seed_path: &Path,
@@ -1970,4 +1988,19 @@ fn run_dir() -> PathBuf {
 fn stage(screen: &Screen, started: Instant, what: &str) {
     tracing::info!("[{:.1}s] {what}", started.elapsed().as_secs_f32());
     screen.system(what);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The body of a `/tell` to someone whose name is also a piece of "/tell".
+    #[test]
+    fn a_tell_body_is_everything_after_the_name() {
+        assert_eq!(after_words("/tell el bonjour  toi ", 2), "bonjour  toi");
+        assert_eq!(after_words("/tell e le message", 2), "le message");
+        assert_eq!(after_words("  /tell   alice   salut", 2), "salut");
+        assert_eq!(after_words("/tell alice", 2), "");
+        assert_eq!(after_words("/tell", 2), "");
+    }
 }
