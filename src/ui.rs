@@ -849,6 +849,19 @@ impl App {
         }
     }
 
+    /// Who the input box is pointed at. A change means a call started or
+    /// ended, and the file numbers of the one before mean nothing any more:
+    /// each call counts from 1, so an old `[2]` clicked now would take
+    /// whatever the new call numbered 2. Its chips stop being clickable.
+    fn set_peer(&mut self, peer: Option<String>) {
+        if peer != self.peer {
+            for entry in &mut self.history {
+                entry.chips.clear();
+            }
+        }
+        self.peer = peer;
+    }
+
     fn push(&mut self, entry: Entry) {
         // Reading back through the history is not a request to be dragged
         // forward. The offset is measured from the bottom, so a line arriving
@@ -960,7 +973,7 @@ async fn event_loop(
                     Some(Update::Line(entry)) => app.push(entry),
                     Some(Update::Status(status)) => app.status = status,
                     Some(Update::Accepting(yes)) => app.accepting = yes,
-                    Some(Update::InCall(peer)) => app.peer = peer,
+                    Some(Update::InCall(peer)) => app.set_peer(peer),
                     Some(Update::Clipboard(text)) => {
                         copy_to_clipboard(&text);
                         app.flash(format!("copied {} chars", text.chars().count()));
@@ -980,7 +993,7 @@ async fn event_loop(
                         Update::Line(entry) => app.push(entry),
                         Update::Status(status) => app.status = status,
                         Update::Accepting(yes) => app.accepting = yes,
-                        Update::InCall(peer) => app.peer = peer,
+                        Update::InCall(peer) => app.set_peer(peer),
                         Update::Clipboard(text) => {
                             copy_to_clipboard(&text);
                             app.flash(format!("copied {} chars", text.chars().count()));
@@ -2260,6 +2273,14 @@ mod tests {
         let acted = mouse_up(&mut app, a as u16 + 1, 0);
         assert_eq!(acted.as_deref(), Some("/accept 1"));
         assert!(app.selection.is_none());
+
+        // Same call again: still clickable. Another call: its numbers are not
+        // these, so the old chip is dead.
+        let same = app.peer.clone();
+        app.set_peer(same);
+        assert_eq!(chip_at(&app, a as u16 + 1, 0), Some(1));
+        app.set_peer(Some("carol".into()));
+        assert_eq!(chip_at(&app, a as u16 + 1, 0), None);
     }
 
     /// Dragging across a chip is somebody selecting text, not clicking a file.

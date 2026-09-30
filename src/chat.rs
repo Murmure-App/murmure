@@ -165,6 +165,23 @@ enum DirectDone {
     Failed(String),
 }
 
+/// A transfer running outside Tor, in its own task: it owns the file and the
+/// socket, and reports back through a channel.
+struct DirectTask {
+    task: tokio::task::JoinHandle<()>,
+    /// Which file, so a `FileReject` can name it.
+    hash: [u8; 32],
+    /// Receiving side only: the offer, to take over Tor if the sender cannot
+    /// reach us.
+    incoming: Option<Offer>,
+}
+
+impl DirectTask {
+    fn running(&self) -> bool {
+        !self.task.is_finished()
+    }
+}
+
 /// A file going out, and how far it has got.
 struct Sending {
     file: std::fs::File,
@@ -184,6 +201,8 @@ struct Sending {
     path: PathBuf,
     /// Whether the offer asked for a direct link. The recipient still decides.
     route: Route,
+    /// Which file, so a `FileReject` stops this one and nothing else.
+    hash: [u8; 32],
 }
 
 /// A file a peer put in a message, waiting for our answer.
@@ -291,6 +310,11 @@ struct Receiving {
     offer: Offer,
     written: u64,
     progress: Progress,
+    /// Set by `/cancel`. What was already sent keeps arriving and is dropped,
+    /// until the sender's `FileDone` says the stream is clear.
+    cancelled: bool,
+    /// When a chunk last arrived, to give up on a drain that never ends.
+    heard: std::time::Instant,
 }
 
 /// Run a conversation over an open [`Link`].
@@ -364,7 +388,7 @@ pub async fn run(
     let mut peer_gone = false;
     // A transfer running outside Tor lives in its own task: it owns the file
     // and the socket, and reports back through the channel.
-    let mut direct_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut direct_task: Option<DirectTask> = None;
     let (direct_done_tx, mut direct_done) = mpsc::channel::<DirectDone>(1);
     // Drained before anything is waited on, so what was said before we picked
     // up keeps its place at the front and its order.
@@ -502,6 +526,33 @@ pub async fn run(
                         }
                         Err(e) => screen.error(format!("{e:#}")),
                     },
+                    // The receiving side only. What already arrived stays on
+                    // disk, so the same file offered again resumes from there.
+                    Typed::Cancel => {
+                        if let Some(r) = receiving.as_mut().filter(|r| !r.cancelled) {
+                            r.cancelled = true;
+                            if let Err(e) = std::io::Write::flush(&mut r.file) {
+                                screen.error(format!("flushing the partial file: {e}"));
+                            }
+                            screen.system(format!(
+                                "-- cancelled {:?}; what arrived is kept, and offering it again resumes --",
+                                r.offer.name
+                            ));
+                            let hash = r.offer.hash;
+                            if outbox.send(Message::FileReject { hash }).await.is_err() {
+                                break Ended::PeerHungUp;
+                            }
+                        } else if let Some(d) = direct_task.take_if(|d| d.running() && d.incoming.is_some()) {
+                            d.task.abort();
+                            let name = d.incoming.map(|o| o.name).unwrap_or_default();
+                            screen.system(format!("-- cancelled {name:?} --"));
+                            if outbox.send(Message::FileReject { hash: d.hash }).await.is_err() {
+                                break Ended::PeerHungUp;
+                            }
+                        } else {
+                            screen.error("nothing coming in to cancel — /refuse declines a file not yet taken");
+                        }
+                    }
                     Typed::Message(text) => {
                         if text.len() > MAX_TEXT {
                             screen.error(format!(
@@ -557,7 +608,7 @@ pub async fn run(
                     // They left. Same as the stream closing below: a direct
                     // transfer still running on its own socket is waited for.
                     Some(Ok(Message::HangUp)) => {
-                        if direct_task.as_ref().is_some_and(|t| !t.is_finished()) {
+                        if direct_task.as_ref().is_some_and(DirectTask::running) {
                             leaving.get_or_insert(Ended::PeerLeft);
                             continue;
                         }
@@ -615,7 +666,7 @@ pub async fn run(
                     // done, which is normal. Leaving here would drop the file on
                     // the floor with every byte already on disk.
                     None => {
-                        if direct_task.as_ref().is_some_and(|t| !t.is_finished()) {
+                        if direct_task.as_ref().is_some_and(DirectTask::running) {
                             peer_gone = true;
                             leaving.get_or_insert(Ended::PeerHungUp);
                         } else {
@@ -711,7 +762,7 @@ pub async fn run(
         let _ = outbox.send(Message::HangUp).await;
     }
 
-    if let Some(r) = receiving {
+    if let Some(r) = receiving.filter(|r| !r.cancelled) {
         screen.system(format!(
             "-- {:?} interrupted at {} of {}; offer it again to resume --",
             r.offer.name,
@@ -753,13 +804,13 @@ fn note(
 fn busy(
     sending: &Option<Sending>,
     receiving: &Option<Receiving>,
-    direct_task: &Option<tokio::task::JoinHandle<()>>,
+    direct_task: &Option<DirectTask>,
 ) -> bool {
     sending.is_some()
-        || receiving.is_some()
+        || receiving.as_ref().is_some_and(|r| !r.cancelled)
         // A direct transfer holds no `Sending`/`Receiving` — the task owns the
         // file — so without this a `/bye` mid-transfer would cut it.
-        || direct_task.as_ref().is_some_and(|t| !t.is_finished())
+        || direct_task.as_ref().is_some_and(DirectTask::running)
 }
 
 /// Act on one frame from the peer. `false` means the conversation is over.
@@ -775,7 +826,7 @@ async fn handle(
     receiving: &mut Option<Receiving>,
     sending: &mut Option<Sending>,
     offered: &mut Vec<Outgoing>,
-    direct_task: &mut Option<tokio::task::JoinHandle<()>>,
+    direct_task: &mut Option<DirectTask>,
     direct_done: &mpsc::Sender<DirectDone>,
     outbox: &mpsc::Sender<Message>,
     history: &mut Option<&mut History>,
@@ -835,10 +886,15 @@ async fn handle(
             screen.system(format!("-- {peer} offers a file --"));
             *next_batch += 1;
             *next_number += 1;
-            take_offer(
+            if let Err(e) = take_offer(
                 proto::FileRef { name, size, hash },
                 direct, *next_number, *next_batch, peer, incoming_dir, pending, screen,
-            )?;
+            ) {
+                screen.error(format!("-- that file was refused: {e:#} --"));
+                if outbox.send(Message::FileReject { hash }).await.is_err() {
+                    return Ok(false);
+                }
+            }
         }
 
         Message::Post { pieces, direct } => {
@@ -848,6 +904,7 @@ async fn handle(
             let mut shown = lead.clone();
             let mut files = Vec::new();
             let mut chips = Vec::new();
+            let mut refused = Vec::new();
             *next_batch += 1;
             for piece in pieces {
                 match piece {
@@ -857,7 +914,15 @@ async fn handle(
                         shown.push_str(&files::sanitize_for_display(&t));
                     }
                     proto::Piece::File(f) => {
-                        let name = files::safe_name(&f.name)?;
+                        // Refused on its own: the rest of the message, and the
+                        // call, are fine.
+                        let name = match files::safe_name(&f.name) {
+                            Ok(name) => name,
+                            Err(e) => {
+                                refused.push((f.hash, format!("{e:#}")));
+                                continue;
+                            }
+                        };
                         if !shown.ends_with(' ') && shown.len() > lead.len() {
                             shown.push(' ');
                         }
@@ -878,7 +943,16 @@ async fn handle(
             note(history, with, false, shown[lead.len()..].trim_end(), screen);
 
             for (number, f) in files {
-                take_offer(f, direct, number, *next_batch, peer, incoming_dir, pending, screen)?;
+                let hash = f.hash;
+                if let Err(e) = take_offer(f, direct, number, *next_batch, peer, incoming_dir, pending, screen) {
+                    refused.push((hash, format!("{e:#}")));
+                }
+            }
+            for (hash, why) in refused {
+                screen.error(format!("-- a file in that message was refused: {why} --"));
+                if outbox.send(Message::FileReject { hash }).await.is_err() {
+                    return Ok(false);
+                }
             }
             if !pending.is_empty() {
                 screen.system(format!(
@@ -915,6 +989,7 @@ async fn handle(
                 progress: Progress::new("sending", out.name.clone(), out.size),
                 path: out.path.clone(),
                 route: out.route,
+                hash,
             });
             let s = sending.as_mut().expect("just set");
             if let Some(d) = direct {
@@ -930,7 +1005,7 @@ async fn handle(
                         let s = sending.take().expect("checked just above");
                         let done = direct_done.clone();
                         let sc = screen.clone();
-                        *direct_task = Some(tokio::spawn(async move {
+                        *direct_task = Some(DirectTask { hash, incoming: None, task: tokio::spawn(async move {
                             let outcome = match push_direct(
                                 s.path, offset, d.token, stream,
                                 Progress::new("sending", s.name.clone(), s.size),
@@ -942,7 +1017,7 @@ async fn handle(
                                 Err(e) => DirectDone::Failed(format!("{e:#}")),
                             };
                             let _ = done.send(outcome).await;
-                        }));
+                        })});
                         return Ok(true);
                     }
                     Err(e) => {
@@ -976,11 +1051,22 @@ async fn handle(
                     let out = offered.remove(i);
                     screen.system(format!("-- {peer} declined {:?} --", out.name));
                 }
-                // Declining what is already going out: stop it.
-                None => match sending.take() {
-                    Some(s) => screen.system(format!("-- {peer} declined {:?} --", s.name)),
-                    None => screen.system(format!("-- {peer} declined a file --")),
-                },
+                // Cancelling what is already going out: stop that one, and
+                // only if it is the one named. Over Tor, `FileDone` then
+                // tells them the chunks still in flight were the last.
+                None if sending.as_ref().is_some_and(|s| s.hash == hash) => {
+                    let s = sending.take().expect("just checked");
+                    screen.system(format!("-- {peer} cancelled {:?} --", s.name));
+                    if s.accepted && outbox.send(Message::FileDone).await.is_err() {
+                        return Ok(false);
+                    }
+                }
+                None if direct_task.as_ref().is_some_and(|d| d.hash == hash && d.running()) => {
+                    direct_task.take().expect("just checked").task.abort();
+                    screen.system(format!("-- {peer} cancelled the direct transfer --"));
+                }
+                // Something already finished or never ours: nothing to stop.
+                None => {}
             }
         }
 
@@ -988,8 +1074,12 @@ async fn handle(
             // We are sitting on a listening socket for a connection that is not
             // coming. Stop waiting, and reopen the partial for chunks — the
             // file the task would have written is exactly the one we resume.
-            if let Some(task) = direct_task.take() {
-                task.abort();
+            if let Some(d) = direct_task.take() {
+                d.task.abort();
+                // The sender falls back to chunks from 0, straight after this.
+                if let Some(offer) = d.incoming {
+                    *receiving = Some(open_partial(incoming_dir, offer, 0)?);
+                }
             }
             screen.system(format!("-- {peer} could not reach us directly; using Tor --"));
         }
@@ -998,6 +1088,10 @@ async fn handle(
             let Some(r) = receiving.as_mut() else {
                 bail!("{peer} sent file data we did not accept");
             };
+            r.heard = std::time::Instant::now();
+            if r.cancelled {
+                return Ok(true);
+            }
             let room = r.offer.size - r.written;
             if data.len() as u64 > room {
                 bail!(
@@ -1014,6 +1108,9 @@ async fn handle(
             let Some(r) = receiving.take() else {
                 bail!("{peer} ended a transfer that was not running");
             };
+            if r.cancelled {
+                return Ok(true);
+            }
             // Flush before hashing: the bytes have to be on disk to be read back.
             std::io::Write::flush(&mut { r.file }).context("flushing the partial file")?;
             match files::finish(incoming_dir, &r.offer) {
@@ -1292,12 +1389,23 @@ async fn accept(
     pending: &mut Vec<Offered>,
     which: Which,
     receiving: &mut Option<Receiving>,
-    direct_task: &mut Option<tokio::task::JoinHandle<()>>,
+    direct_task: &mut Option<DirectTask>,
     direct_done: &mpsc::Sender<DirectDone>,
     outbox: &mpsc::Sender<Message>,
     screen: &Screen,
 ) -> Result<()> {
-    if receiving.is_some() || direct_task.as_ref().is_some_and(|t| !t.is_finished()) {
+    // A cancelled file drains until the sender's `FileDone`. A sender that
+    // never sends one (0.1.0-beta.2 does not) is taken as clear after a quiet
+    // spell. ponytail: a timer, an end marker from every peer would be exact.
+    if let Some(r) = receiving.as_ref()
+        && r.cancelled
+    {
+        if r.heard.elapsed() < DRAIN_QUIET {
+            bail!("the cancelled file is still draining — try again in a moment");
+        }
+        *receiving = None;
+    }
+    if receiving.is_some() || direct_task.as_ref().is_some_and(DirectTask::running) {
         bail!("one file at a time — this one waits until the current transfer ends");
     }
     let taken = take_pending(pending, which)?;
@@ -1351,13 +1459,17 @@ async fn accept(
                     let mine = offer.clone();
                     let sc = screen.clone();
                     let bar = Progress::new("receiving", mine.name.clone(), mine.size);
-                    *direct_task = Some(tokio::spawn(async move {
-                        let outcome = match pull_direct(listener, dir, mine.clone(), token, bar, sc).await {
-                            Ok(()) => DirectDone::Received(Box::new(mine)),
-                            Err(e) => DirectDone::Failed(format!("{e:#}")),
-                        };
-                        let _ = done.send(outcome).await;
-                    }));
+                    *direct_task = Some(DirectTask {
+                        hash: offer.hash,
+                        incoming: Some(offer.clone()),
+                        task: tokio::spawn(async move {
+                            let outcome = match pull_direct(listener, dir, mine.clone(), token, bar, sc).await {
+                                Ok(()) => DirectDone::Received(Box::new(mine)),
+                                Err(e) => DirectDone::Failed(format!("{e:#}")),
+                            };
+                            let _ = done.send(outcome).await;
+                        }),
+                    });
                     return outbox
                         .send(Message::FileAccept {
                             hash: offer.hash,
@@ -1374,28 +1486,45 @@ async fn accept(
         }
     }
 
-    let partial = files::partial_path(incoming_dir, &offer.hash);
-    // Append rather than truncate: `offset` is exactly what is already there,
-    // so the peer's first chunk continues the file.
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&partial)
-        .with_context(|| format!("opening {}", partial.display()))?;
-
     screen.system(format!("-- taking {:?} --", offer.name));
     let hash = offer.hash;
-    let bar = Progress::new("receiving", offer.name.clone(), offer.size);
-    *receiving = Some(Receiving {
-        offer,
-        file,
-        written: offset,
-        progress: bar,
-    });
+    *receiving = Some(open_partial(incoming_dir, offer, offset)?);
     outbox
         .send(Message::FileAccept { hash, offset, direct: None })
         .await
         .map_err(|_| anyhow::anyhow!("the conversation ended"))
+}
+
+/// How long a cancelled file must have been quiet before it is taken as drained.
+const DRAIN_QUIET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Open the partial for a transfer over Tor, from `offset`.
+///
+/// Appended to when resuming: `offset` is exactly what is already there, so the
+/// peer's first chunk continues the file. Truncated from 0, because a stale
+/// partial longer than the offer also reports 0 (see `files::resume_offset`)
+/// and must not end up in front of the new bytes.
+fn open_partial(incoming_dir: &Path, offer: Offer, offset: u64) -> Result<Receiving> {
+    let partial = files::partial_path(incoming_dir, &offer.hash);
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true);
+    if offset == 0 {
+        options.write(true).truncate(true);
+    } else {
+        options.append(true);
+    }
+    let file = options
+        .open(&partial)
+        .with_context(|| format!("opening {}", partial.display()))?;
+    let progress = Progress::new("receiving", offer.name.clone(), offer.size);
+    Ok(Receiving {
+        offer,
+        file,
+        written: offset,
+        progress,
+        cancelled: false,
+        heard: std::time::Instant::now(),
+    })
 }
 
 /// The next chunk to put on the wire, if a transfer is running and not finished.
@@ -1452,6 +1581,8 @@ enum Typed {
     Accept(Which),
     /// `/refuse`, likewise.
     Refuse(Which),
+    /// `/cancel`: stop the file coming in.
+    Cancel,
     /// Any other `/word`. Held back rather than sent.
     UnknownCommand(String),
     /// Something to say, with any `//` escape already unwrapped.
@@ -1489,6 +1620,7 @@ fn classify(line: &str) -> Typed {
         // See [`Which`] for what no argument means.
         "/accept" => Typed::Accept(Which::parse(rest)),
         "/refuse" => Typed::Refuse(Which::parse(rest)),
+        "/cancel" => Typed::Cancel,
         // The whole remainder, not the first word: paths have spaces in them,
         // and quoting rules would be one more thing to explain.
         // The whole remainder is the path, so `--direct` is only a flag when it
@@ -2391,5 +2523,150 @@ mod tests {
             "the two halves must join with no gap and no overlap"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Everything `handle` works on, to feed it one frame at a time.
+    struct Frames {
+        pending: Vec<Offered>,
+        next_number: usize,
+        next_batch: usize,
+        receiving: Option<Receiving>,
+        sending: Option<Sending>,
+        offered: Vec<Outgoing>,
+        direct_task: Option<DirectTask>,
+        done: mpsc::Sender<DirectDone>,
+        outbox: mpsc::Sender<Message>,
+        sent: mpsc::Receiver<Message>,
+        screen: Screen,
+        dir: PathBuf,
+        _keep: (mpsc::Receiver<DirectDone>, mpsc::UnboundedReceiver<crate::ui::Update>),
+    }
+
+    impl Frames {
+        fn new(tag: &str) -> Self {
+            let (done, done_rx) = mpsc::channel(4);
+            let (outbox, sent) = mpsc::channel(64);
+            let (screen, updates) = crate::ui::channel();
+            Frames {
+                pending: Vec::new(),
+                next_number: 0,
+                next_batch: 0,
+                receiving: None,
+                sending: None,
+                offered: Vec::new(),
+                direct_task: None,
+                done,
+                outbox,
+                sent,
+                screen,
+                dir: scratch(tag),
+                _keep: (done_rx, updates),
+            }
+        }
+
+        async fn feed(&mut self, msg: Message) -> Result<bool> {
+            let dir = self.dir.clone();
+            handle(
+                msg, "alice", "alice-address", &dir,
+                &mut self.pending, &mut self.next_number, &mut self.next_batch,
+                &mut self.receiving, &mut self.sending, &mut self.offered,
+                &mut self.direct_task, &self.done,
+                &self.outbox, &mut None, &self.screen,
+            )
+            .await
+        }
+    }
+
+    /// The sender could not reach us directly and falls back to chunks. Those
+    /// chunks have to land in a file, not end the call.
+    #[tokio::test]
+    async fn a_failed_direct_link_falls_back_to_tor() {
+        let mut f = Frames::new("direct-fallback");
+        let data = vec![5u8; 3000];
+        let offer = Offer { name: "x.bin".into(), size: 3000, hash: *blake3::hash(&data).as_bytes() };
+        f.direct_task = Some(DirectTask {
+            task: tokio::spawn(std::future::pending()),
+            hash: offer.hash,
+            incoming: Some(offer),
+        });
+
+        assert!(f.feed(Message::DirectFailed).await.unwrap());
+        assert!(f.feed(Message::FileChunk(data.clone())).await.unwrap(), "the chunk is taken");
+        assert!(f.feed(Message::FileDone).await.unwrap());
+        assert_eq!(std::fs::read(f.dir.join("x.bin")).unwrap(), data);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// After `/cancel`, what the sender had already queued keeps arriving: it
+    /// is dropped, and their `FileDone` closes the drain without a file.
+    #[tokio::test]
+    async fn a_cancelled_file_drains_until_the_sender_says_done() {
+        let mut f = Frames::new("cancel-drain");
+        let offer = Offer { name: "y.bin".into(), size: 100, hash: [3u8; 32] };
+        let mut r = open_partial(&f.dir, offer.clone(), 0).unwrap();
+        r.cancelled = true;
+        f.receiving = Some(r);
+
+        assert!(f.feed(Message::FileChunk(vec![1u8; 10])).await.unwrap());
+        let partial = files::partial_path(&f.dir, &offer.hash);
+        assert_eq!(std::fs::metadata(&partial).unwrap().len(), 0, "nothing written");
+        assert!(f.feed(Message::FileDone).await.unwrap());
+        assert!(f.receiving.is_none());
+        assert!(!f.dir.join("y.bin").exists());
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// A `FileReject` stops the file it names, and only that one. When it does
+    /// stop one, `FileDone` marks the end of what was already in flight.
+    #[tokio::test]
+    async fn a_reject_stops_only_the_file_it_names() {
+        let mut f = Frames::new("reject-hash");
+        let path = f.dir.join("out.bin");
+        std::fs::write(&path, [0u8; 10]).unwrap();
+        f.sending = Some(Sending {
+            file: std::fs::File::open(&path).unwrap(),
+            name: "out.bin".into(),
+            accepted: true,
+            sent: 0,
+            size: 10,
+            progress: Progress::new("sending", "out.bin", 10),
+            path,
+            route: Route::Tor,
+            hash: [1u8; 32],
+        });
+
+        assert!(f.feed(Message::FileReject { hash: [2u8; 32] }).await.unwrap());
+        assert!(f.sending.is_some(), "another file's reject leaves this one running");
+
+        assert!(f.feed(Message::FileReject { hash: [1u8; 32] }).await.unwrap());
+        assert!(f.sending.is_none());
+        assert!(matches!(f.sent.try_recv(), Ok(Message::FileDone)));
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// A message carrying one file we will not save still shows, keeps its
+    /// other files, and keeps the call: the bad one is refused on its own.
+    #[tokio::test]
+    async fn a_bad_filename_in_a_message_does_not_end_the_call() {
+        let mut f = Frames::new("post-badname");
+        let post = Message::Post {
+            pieces: vec![
+                proto::Piece::Text("voici".into()),
+                proto::Piece::File(proto::FileRef { name: ".bashrc".into(), size: 10, hash: [9u8; 32] }),
+                proto::Piece::File(proto::FileRef { name: "ok.txt".into(), size: 10, hash: [8u8; 32] }),
+            ],
+            direct: false,
+        };
+
+        assert!(f.feed(post).await.unwrap(), "the call goes on");
+        assert_eq!(f.pending.len(), 1);
+        assert_eq!(f.pending[0].offer.name, "ok.txt");
+        assert!(matches!(f.sent.try_recv(), Ok(Message::FileReject { hash }) if hash == [9u8; 32]));
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    #[test]
+    fn cancel_is_a_command() {
+        assert_eq!(classify("/cancel"), Typed::Cancel);
     }
 }

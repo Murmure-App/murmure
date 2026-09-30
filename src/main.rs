@@ -1735,6 +1735,7 @@ fn help(screen: &Screen) {
         "  /send --direct <path>         the same, for a file sent on its own",
         "  /accept  /refuse              answer the newest message that offered files",
         "  /accept 2   /accept all       pick one by its number, or take every one",
+        "  /cancel                       stop the file coming in; what arrived is kept",
         "  /bye                          hang up",
         "keys:",
         "  up / down                     scroll one line",

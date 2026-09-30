@@ -181,6 +181,7 @@ baked in.
 /room send ~/plan.pdf   /room get 1               put a file in the room, take one
 /send ~/rapport.pdf                               offer a file (during a call)
 /accept   /refuse                                 answer an offer of theirs
+/cancel                                           stop a file coming in
 /bye                                              hang up
 /quit                                             leave
 ```
@@ -343,7 +344,10 @@ on: the arrows step over it in one press, Backspace removes it whole, and you
 can type on either side of it.
 
 Nothing moves until the other person types `/accept` — a file lands on their disk, so they decide, not you. `/refuse`
-declines it. One file at a time, and one call at a time.
+declines it. One file at a time, and one call at a time. `/cancel` stops a
+file already coming in; what arrived is kept, so the same file offered again
+resumes from there. A chip from an earlier call is no longer clickable: each
+call numbers its files from 1.
 
 A running transfer draws a **progress bar in the title line** — name, percent
 and both sizes — for either direction and either route.
