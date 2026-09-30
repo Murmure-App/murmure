@@ -496,7 +496,7 @@ async fn serve(
                         hall.files.chunk(peer, hash, &data, screen)
                     }
                     Message::RoomDone { room, hash } if Some(room) == here => {
-                        hall.files.done(peer, hash, screen)
+                        hall.files.done(peer, hash, screen).await
                     }
                     Message::RoomNoFile { room, hash } if Some(room) == here => {
                         hall.files.refused(peer, hash, screen)
@@ -735,10 +735,10 @@ async fn serve(
                         let out = match part {
                             ui::Part::Text(text) if text.trim().is_empty() => continue,
                             ui::Part::Text(text) => hall.rooms.say(text.trim()),
-                            ui::Part::File(path) => hall
-                                .files
-                                .share(path)
-                                .and_then(|file| hall.rooms.share(file)),
+                            ui::Part::File(path) => match hall.files.share(path).await {
+                                Ok(file) => hall.rooms.share(file),
+                                Err(e) => Err(e),
+                            },
                         };
                         match out {
                             Ok(out) => apply_room(out, before, &mut hall, book, &mut pool, &live, screen).await,
@@ -1529,7 +1529,7 @@ async fn command(
                     if path.is_empty() {
                         bail!("usage: /room send <path> — or drop the file on the window");
                     }
-                    let file = hall.files.share(Path::new(&chat::expand_home(&path)))?;
+                    let file = hall.files.share(Path::new(&chat::expand_home(&path))).await?;
                     hall.rooms.share(file)?
                 }
                 Some("files") => {
@@ -1541,7 +1541,7 @@ async fn command(
                         .next()
                         .and_then(|n| n.parse().ok())
                         .ok_or_else(|| anyhow::anyhow!("usage: /room get <number> — /room files lists them"))?;
-                    let actions = hall.files.get(n, screen)?;
+                    let actions = hall.files.get(n, screen).await?;
                     run_actions(actions, hall, pool).await;
                     return Ok(Flow::Continue);
                 }
@@ -1839,8 +1839,8 @@ async fn apply_room(
                 };
                 let who = room_label(who, book);
                 let get = match hall.files.announced(file, who.clone(), source) {
-                    Some(n) => format!("/room get {n}"),
-                    None => "not kept, this room has too many files".to_owned(),
+                    Ok(n) => format!("/room get {n}"),
+                    Err(e) => format!("not kept: {e:#}"),
                 };
                 screen.say(
                     Kind::Theirs,
@@ -1899,7 +1899,7 @@ async fn run_actions(actions: Vec<Action>, hall: &mut Hall, pool: &mut Pool) {
         match action {
             Action::Send(peer, msg) => pool.send(peer, msg).await,
             Action::Upload { to, path, offset, hash } => match pool.sender(&to) {
-                Some(outbox) => hall.files.upload(outbox, path, offset, hash),
+                Some(outbox) => hall.files.upload(to, outbox, path, offset, hash),
                 // They will ask again when they are back; the partial keeps.
                 None => tracing::debug!("an upload to somebody no longer connected"),
             },

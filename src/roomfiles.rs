@@ -56,6 +56,7 @@ struct Down {
     from: HsId,
     dir: PathBuf,
     file: fs::File,
+    size: u64,
     written: u64,
     /// The operator asked for it. Otherwise we are only relaying it.
     mine: bool,
@@ -86,7 +87,9 @@ pub struct Transfers {
     room: Option<RoomId>,
     known: Vec<Known>,
     down: HashMap<[u8; 32], Down>,
-    uploads: Vec<JoinHandle<()>>,
+    /// By recipient and file: a second ask for the same file replaces the
+    /// first stream, whose chunks would otherwise interleave with it.
+    uploads: HashMap<(HsId, [u8; 32]), JoinHandle<()>>,
 }
 
 /// Something only the caller can do: it holds the connections.
@@ -109,7 +112,7 @@ impl Transfers {
             room: None,
             known: Vec::new(),
             down: HashMap::new(),
-            uploads: Vec::new(),
+            uploads: HashMap::new(),
         }
     }
 
@@ -118,7 +121,7 @@ impl Transfers {
     /// Partial downloads the operator asked for stay in `incoming/`, where a
     /// later transfer of the same file picks them up; relayed copies go.
     pub fn reset(&mut self, room: Option<RoomId>) {
-        for upload in self.uploads.drain(..) {
+        for (_, upload) in self.uploads.drain() {
             upload.abort();
         }
         self.down.clear();
@@ -142,8 +145,12 @@ impl Transfers {
     }
 
     /// Get a file of ours ready to announce.
-    pub fn share(&mut self, path: &Path) -> Result<FileRef> {
-        let offer = files::describe(path)?;
+    pub async fn share(&mut self, path: &Path) -> Result<FileRef> {
+        let offer = off_loop({
+            let path = path.to_path_buf();
+            move || files::describe(&path)
+        })
+        .await?;
         let file = FileRef {
             name: offer.name,
             size: offer.size,
@@ -164,26 +171,28 @@ impl Transfers {
         Ok(file)
     }
 
-    /// Somebody put a file in the room. Returns its number, or `None` once
-    /// the room has as many files as it keeps.
-    pub fn announced(&mut self, file: FileRef, who: String, from: HsId) -> Option<usize> {
+    /// Somebody put a file in the room. Returns its number, or why it is not
+    /// kept: the room has as many files as it keeps, or its name could never
+    /// be saved here — found now rather than after the whole download.
+    pub fn announced(&mut self, file: FileRef, who: String, from: HsId) -> Result<usize> {
         if let Some(i) = self.known.iter().position(|k| k.file.hash == file.hash) {
-            return Some(i + 1);
+            return Ok(i + 1);
         }
         if self.known.len() >= MAX_FILES {
-            return None;
+            bail!("this room already has {MAX_FILES} files");
         }
+        files::safe_name(&file.name)?;
         self.known.push(Known {
             file,
             who,
             from: Some(from),
             path: None,
         });
-        Some(self.known.len())
+        Ok(self.known.len())
     }
 
     /// The operator wants file `n`.
-    pub fn get(&mut self, n: usize, screen: &Screen) -> Result<Vec<Action>> {
+    pub async fn get(&mut self, n: usize, screen: &Screen) -> Result<Vec<Action>> {
         let known = self
             .known
             .get(n.wrapping_sub(1))
@@ -214,7 +223,8 @@ impl Transfers {
         if let Some(path) = known.path.clone() {
             // Relayed, so already here and already checked: a copy is all
             // that is left to do.
-            let saved = save_copy(&self.incoming, &path, &name)?;
+            let (incoming, keep_as) = (self.incoming.clone(), name.clone());
+            let saved = off_loop(move || save_copy(&incoming, &path, &keep_as)).await?;
             screen.system(format!("-- saved {name:?} to {} --", saved.display()));
             return Ok(Vec::new());
         }
@@ -238,8 +248,17 @@ impl Transfers {
         let offset = files::resume_offset(&dir, &hash, size);
 
         // One quota for both: the relay's copies are bytes on this disk that a
-        // peer chose, exactly like the files this machine keeps.
-        let used = files::dir_size(&self.incoming).saturating_add(files::dir_size(&self.relay));
+        // peer chose, exactly like the files this machine keeps. Downloads
+        // still running count for what they have yet to write, or two started
+        // together would each see room for itself.
+        let coming: u64 = self
+            .down
+            .values()
+            .map(|d| d.size.saturating_sub(d.written))
+            .fold(0, u64::saturating_add);
+        let used = files::dir_size(&self.incoming)
+            .saturating_add(files::dir_size(&self.relay))
+            .saturating_add(coming);
         let remaining = size.saturating_sub(offset);
         let quota = files::incoming_quota();
         if used.saturating_add(remaining) > quota {
@@ -268,6 +287,7 @@ impl Transfers {
                 from,
                 dir,
                 file,
+                size,
                 written: offset,
                 mine,
                 waiters: waiter.into_iter().collect(),
@@ -328,7 +348,7 @@ impl Transfers {
         if down.from != peer {
             return Vec::new();
         }
-        let size = self.known.iter().find(|k| k.file.hash == hash).map_or(0, |k| k.file.size);
+        let size = down.size;
         let written = down.written.saturating_add(data.len() as u64);
         let result = if written > size {
             Err(anyhow::anyhow!("more data than the file holds"))
@@ -347,7 +367,7 @@ impl Transfers {
     }
 
     /// The last of a file arrived: check it, and hand it on.
-    pub fn done(&mut self, peer: HsId, hash: [u8; 32], screen: &Screen) -> Vec<Action> {
+    pub async fn done(&mut self, peer: HsId, hash: [u8; 32], screen: &Screen) -> Vec<Action> {
         if !self.down.get(&hash).is_some_and(|d| d.from == peer) {
             return Vec::new();
         }
@@ -365,11 +385,17 @@ impl Transfers {
         let shown = files::sanitize_for_display(&file.name);
         let landed = if down.written != file.size {
             Err(anyhow::anyhow!("it ended at {} of {} bytes", down.written, file.size))
-        } else if down.dir == self.incoming {
-            // Checked, then named: a corrupted file never appears finished.
-            files::finish(&self.incoming, &offer)
         } else {
-            keep_relayed(&down.dir, &hash)
+            let (incoming, dir) = (self.incoming.clone(), down.dir.clone());
+            off_loop(move || {
+                if dir == incoming {
+                    // Checked, then named: a corrupted file never appears finished.
+                    files::finish(&incoming, &offer)
+                } else {
+                    keep_relayed(&dir, &hash)
+                }
+            })
+            .await
         };
         let path = match landed {
             Ok(path) => path,
@@ -383,7 +409,8 @@ impl Transfers {
             let saved = if down.dir == self.incoming {
                 Ok(path.clone())
             } else {
-                save_copy(&self.incoming, &path, &file.name)
+                let (incoming, path, name) = (self.incoming.clone(), path.clone(), file.name.clone());
+                off_loop(move || save_copy(&incoming, &path, &name)).await
             };
             match saved {
                 Ok(saved) => screen.system(format!("-- saved {shown:?} to {} --", saved.display())),
@@ -458,15 +485,18 @@ impl Transfers {
     ///
     /// `outbox` is the member's connection. The task holds a clone of it and
     /// nothing else, so it ends by itself when the connection does.
-    pub fn upload(&mut self, outbox: mpsc::Sender<Message>, path: PathBuf, offset: u64, hash: [u8; 32]) {
+    pub fn upload(&mut self, to: HsId, outbox: mpsc::Sender<Message>, path: PathBuf, offset: u64, hash: [u8; 32]) {
         let Some(room) = self.room else { return };
-        self.uploads.retain(|u| !u.is_finished());
-        self.uploads.push(tokio::spawn(async move {
+        self.uploads.retain(|_, u| !u.is_finished());
+        let task = tokio::spawn(async move {
             if let Err(e) = send_file(&outbox, room, &path, offset, hash).await {
                 tracing::debug!("a room upload stopped: {e:#}");
                 let _ = outbox.send(Message::RoomNoFile { room, hash }).await;
             }
-        }));
+        });
+        if let Some(earlier) = self.uploads.insert((to, hash), task) {
+            earlier.abort();
+        }
     }
 }
 
@@ -525,6 +555,14 @@ fn keep_relayed(dir: &Path, hash: &[u8; 32]) -> Result<PathBuf> {
     Ok(kept)
 }
 
+/// Run disk work that reads a whole file — a hash, a copy — on tokio's
+/// blocking pool rather than on a thread the network tasks share.
+/// ponytail: still awaited in place, so the idle loop waits for it; a
+/// completion event would free the keyboard too, if multi-GB files matter.
+async fn off_loop<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(work).await.context("the disk task failed")?
+}
+
 /// Copy a checked file into `incoming/` under its (made safe) name.
 fn save_copy(incoming: &Path, from: &Path, name: &str) -> Result<PathBuf> {
     fs::create_dir_all(incoming).with_context(|| format!("creating {}", incoming.display()))?;
@@ -556,7 +594,7 @@ mod tests {
             match msg {
                 Message::RoomChunk { hash, data, .. } => out.extend(to.chunk(from, hash, &data, screen)),
                 Message::RoomDone { hash, .. } => {
-                    out.extend(to.done(from, hash, screen));
+                    out.extend(to.done(from, hash, screen).await);
                     break;
                 }
                 Message::RoomNoFile { hash, .. } => {
@@ -576,7 +614,7 @@ mod tests {
         });
         let (to, path, offset, hash) = ups.next().expect("an upload");
         let (tx, rx) = mpsc::channel(8);
-        t.upload(tx, path, offset, hash);
+        t.upload(to, tx, path, offset, hash);
         (to, rx)
     }
 
@@ -589,10 +627,37 @@ mod tests {
             FileRef { name: format!("{n}.txt"), size: 1, hash }
         };
         for n in 0..MAX_FILES as u32 {
-            assert_eq!(files.announced(file(n), "b".into(), id(2)), Some(n as usize + 1));
+            assert_eq!(files.announced(file(n), "b".into(), id(2)).unwrap(), n as usize + 1);
         }
-        assert_eq!(files.announced(file(0), "b".into(), id(2)), Some(1), "already known");
-        assert_eq!(files.announced(file(9999), "b".into(), id(2)), None);
+        assert_eq!(files.announced(file(0), "b".into(), id(2)).unwrap(), 1, "already known");
+        assert!(files.announced(file(9999), "b".into(), id(2)).is_err());
+    }
+
+    #[test]
+    fn a_name_that_could_not_be_saved_is_refused_on_announce() {
+        let mut files = Transfers::new(PathBuf::from("in"), PathBuf::from("relay"));
+        let file = FileRef { name: "a|b".into(), size: 1, hash: [1; 32] };
+        assert!(files.announced(file, "b".into(), id(2)).is_err());
+        assert_eq!(files.list().count(), 0);
+    }
+
+    /// Nothing is on disk yet when the second starts: the first still counts.
+    #[tokio::test]
+    async fn downloads_started_together_share_the_quota() {
+        let (screen, _ui) = crate::ui::channel();
+        let (incoming, relay, _base) = dirs("quota");
+        let mut member = Transfers::new(incoming, relay);
+        member.reset(Some([9; 16]));
+        let half = files::incoming_quota() / 2 + 1;
+        for n in 1..=2u8 {
+            let file = FileRef { name: format!("{n}.bin"), size: half, hash: [n; 32] };
+            member.announced(file, "alice".into(), id(1)).unwrap();
+        }
+        member.get(1, &screen).await.unwrap();
+        let Err(second) = member.get(2, &screen).await else {
+            panic!("the second fits only if the first is not counted");
+        };
+        assert!(second.to_string().contains("quota"), "{second}");
     }
 
     /// Author `a`, relay `h`, member `c`: c asks h, h fetches from a, then
@@ -609,18 +674,18 @@ mod tests {
 
         let mut author = Transfers::new(ai, ar);
         author.reset(Some(room));
-        let file = author.share(&src).unwrap();
+        let file = author.share(&src).await.unwrap();
 
         let mut relay = Transfers::new(base.join("h-in"), base.join("h-relay"));
         relay.reset(Some(room));
-        relay.announced(file.clone(), "alice".into(), a);
+        relay.announced(file.clone(), "alice".into(), a).unwrap();
 
         let mut member = Transfers::new(base.join("c-in"), base.join("c-relay"));
         member.reset(Some(room));
-        member.announced(file.clone(), "alice".into(), h);
+        member.announced(file.clone(), "alice".into(), h).unwrap();
 
         // c asks h.
-        let ask = member.get(1, &screen).unwrap();
+        let ask = member.get(1, &screen).await.unwrap();
         let [Action::Send(to, Message::RoomFetch { hash, offset, .. })] = &ask[..] else {
             panic!("c asks for it")
         };
@@ -661,10 +726,10 @@ mod tests {
         };
         let mut member = Transfers::new(ci.clone(), cr);
         member.reset(Some(room));
-        member.announced(file.clone(), "alice".into(), a);
-        member.get(1, &screen).unwrap();
+        member.announced(file.clone(), "alice".into(), a).unwrap();
+        member.get(1, &screen).await.unwrap();
         member.chunk(a, file.hash, b"faux!", &screen);
-        member.done(a, file.hash, &screen);
+        member.done(a, file.hash, &screen).await;
         assert!(!ci.join("vrai.txt").exists());
         assert!(!files::partial_path(&ci, &file.hash).exists(), "the bad bytes are gone");
         let _ = fs::remove_dir_all(&base);
@@ -682,19 +747,19 @@ mod tests {
         };
         let mut member = Transfers::new(ci.clone(), cr);
         member.reset(Some([1; 16]));
-        member.announced(file.clone(), "alice".into(), a);
-        member.get(1, &screen).unwrap();
+        member.announced(file.clone(), "alice".into(), a).unwrap();
+        member.get(1, &screen).await.unwrap();
         member.chunk(stranger, file.hash, b"abc", &screen);
-        member.done(stranger, file.hash, &screen);
+        member.done(stranger, file.hash, &screen).await;
         assert!(!ci.join("x.txt").exists());
         member.chunk(a, file.hash, b"abc", &screen);
-        member.done(a, file.hash, &screen);
+        member.done(a, file.hash, &screen).await;
         assert_eq!(fs::read(ci.join("x.txt")).unwrap(), b"abc");
         let _ = fs::remove_dir_all(&base);
     }
 
-    #[test]
-    fn a_stalled_download_can_be_asked_for_again_and_resumes() {
+    #[tokio::test]
+    async fn a_stalled_download_can_be_asked_for_again_and_resumes() {
         let (screen, _ui) = crate::ui::channel();
         let a = id(1);
         let (ci, cr, base) = dirs("stalled");
@@ -705,31 +770,31 @@ mod tests {
         };
         let mut member = Transfers::new(ci.clone(), cr);
         member.reset(Some([1; 16]));
-        member.announced(file.clone(), "alice".into(), a);
-        member.get(1, &screen).unwrap();
+        member.announced(file.clone(), "alice".into(), a).unwrap();
+        member.get(1, &screen).await.unwrap();
         member.chunk(a, file.hash, b"abc", &screen);
         // Still moving: asking again is refused.
-        assert!(member.get(1, &screen).is_err());
+        assert!(member.get(1, &screen).await.is_err());
         // Nothing for a long while: asking again starts over from the partial.
         let d = member.down.get_mut(&file.hash).unwrap();
         d.heard = std::time::Instant::now().checked_sub(STALLED * 2).unwrap();
-        let again = member.get(1, &screen).unwrap();
+        let again = member.get(1, &screen).await.unwrap();
         assert!(matches!(&again[..], [Action::Send(to, Message::RoomFetch { offset: 3, .. })] if *to == a));
         member.chunk(a, file.hash, b"def", &screen);
-        member.done(a, file.hash, &screen);
+        member.done(a, file.hash, &screen).await;
         assert_eq!(fs::read(ci.join("long.txt")).unwrap(), b"abcdef");
         let _ = fs::remove_dir_all(&base);
     }
 
-    #[test]
-    fn nobody_outside_the_room_is_served() {
+    #[tokio::test]
+    async fn nobody_outside_the_room_is_served() {
         let (screen, _ui) = crate::ui::channel();
         let (ai, ar, base) = dirs("outsider");
         let src = base.join("secret.txt");
         fs::write(&src, b"entre nous").unwrap();
         let mut author = Transfers::new(ai, ar);
         author.reset(Some([1; 16]));
-        let file = author.share(&src).unwrap();
+        let file = author.share(&src).await.unwrap();
         assert!(author.fetch(id(9), file.hash, 0, false, &screen).is_empty());
         let _ = fs::remove_dir_all(&base);
     }
