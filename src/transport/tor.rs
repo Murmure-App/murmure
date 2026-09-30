@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow, bail};
 use arti_client::config::Reconfigure;
 use arti_client::{KeystoreSelector, TorClient};
+use tor_config::ExplicitOrAuto;
+use tor_keymgr::config::ArtiKeystoreKind;
 use futures::{Stream, StreamExt as _};
 use safelog::DisplayRedacted as _;
 use tor_cell::relaycell::msg::Connected;
@@ -35,7 +37,7 @@ pub type RendRequests = std::pin::Pin<Box<dyn Stream<Item = RendRequest> + Send>
 /// Build and bootstrap a Tor client on a dedicated pair of directories.
 ///
 /// The two clients in this milestone must never share a state or a cache
-/// directory: arti stores the keystore and the guard state under `state_dir`,
+/// directory: arti stores the guard state and the service state under `state_dir`,
 /// and two clients writing the same files corrupt each other in ways that have
 /// nothing to do with what we are testing.
 ///
@@ -52,8 +54,21 @@ pub async fn bootstrap_client(
 ) -> Result<Client> {
     create_private_dir(state_dir)?;
     create_private_dir(cache_dir)?;
+    forget_on_disk_keys(state_dir)?;
 
-    let config = arti_client::config::TorClientConfigBuilder::from_directories(state_dir, cache_dir)
+    let mut builder = arti_client::config::TorClientConfigBuilder::from_directories(state_dir, cache_dir);
+    // In memory only. arti's native keystore writes, in the clear, our identity
+    // key and one directory per contact named after their onion address: the
+    // passphrase on the seed and the sealed contacts book would protect
+    // nothing. Every key arti needs is a pure function of the seed, so the
+    // cost of an ephemeral store is re-depositing them on each start, which
+    // `serve` already does.
+    builder
+        .storage()
+        .keystore()
+        .primary()
+        .kind(ExplicitOrAuto::Explicit(ArtiKeystoreKind::Ephemeral));
+    let config = builder
         .build()
         .with_context(|| {
             format!(
@@ -95,6 +110,25 @@ pub async fn bootstrap_client(
     Ok(client)
 }
 
+/// Delete what a native keystore left on disk (beta.2 and earlier), plus the
+/// onion service's own state.
+///
+/// The service state goes too because it records introduction points whose
+/// keys lived in that keystore: arti would find the records without the keys
+/// on every start, log a "bug", and regenerate them anyway. With the keystore
+/// in memory, the service starts fresh each run and nothing about it persists.
+fn forget_on_disk_keys(state_dir: &Path) -> Result<()> {
+    for dir in ["keystore", "hss"] {
+        let path = state_dir.join(dir);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => tracing::info!("removed {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+    Ok(())
+}
+
 /// Create a directory `fs-mistrust` will accept: owner-only, 0700.
 fn create_private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
@@ -107,71 +141,25 @@ fn create_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The outcome of handing our identity key to arti.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyHandover {
-    /// The keystore was empty for this nickname; arti accepted our keypair.
-    Inserted,
-    /// The keystore already held an identity for this nickname, so arti refused
-    /// to overwrite it and we launched against whatever was already there.
-    ///
-    /// This is *not* a success on its own — the caller must still prove the
-    /// published address is the one derived from our seed.
-    Reused,
-}
-
 /// Launch the onion service under **our** identity key.
 ///
-/// # Route A / route B swap point
-///
-/// This is the single function that decides how murmure's key reaches arti's
-/// keystore. Nothing else in the codebase touches `tor-keymgr`, so swapping the
-/// route is a local edit here.
-///
-/// **Route A (in use).** `TorClient::launch_onion_service_with_hsid`
-/// (`arti-client-0.44.0/src/client.rs:1998`, gated `onion-service-service` +
-/// `experimental-api`). It calls
-/// `KeyMgr::insert::<HsIdKeypair>(kp, &HsIdKeypairSpecifier::new(nickname),
-/// KeystoreSelector::Primary, /* overwrite = */ false)` and then delegates to
-/// the ordinary `launch_onion_service`.
-///
-/// **Route B (fallback, no experimental feature).** Build an
-/// `ArtiNativeKeystore::from_path_and_mistrust(state_dir.join("keystore"),
-/// permissions)` plus a `KeyMgrBuilder`, insert under `HsIdKeypairSpecifier`,
-/// then call the non-experimental `launch_onion_service`. arti-client builds
-/// its own keystore at exactly `<state_dir>/keystore`
-/// (`arti-client-0.44.0/src/client.rs:320-350`), so the two agree on disk.
-/// Replacing the body of this function is the whole migration.
-///
-/// # Why a second run is not an error
-///
-/// `KeyMgr::insert` with `overwrite = false` returns `KeyAlreadyExists` whenever
-/// the keystore already holds an `HsIdKeypair` for the nickname — including when
-/// it holds *our own* key from a previous run. Refusing to overwrite is exactly
-/// the behaviour murmure wants, so the failure is caught here and we launch
-/// against the stored key instead. Which key that actually is gets settled by
-/// the caller's byte comparison against the locally derived address, never by
-/// trusting this call.
+/// `TorClient::launch_onion_service_with_hsid` (gated on the features
+/// `onion-service-service` and `experimental-api`) inserts the keypair into
+/// the primary keystore without overwriting, then launches. The keystore is in memory and starts empty, so
+/// "already exists" cannot happen here and is an error like any other. The
+/// caller still compares the published address with the one our seed
+/// derives, rather than trusting this call.
 pub fn launch_with_identity(
     client: &Client,
     nickname: &HsNickname,
     keypair: HsIdKeypair,
     authorized: &[(HsClientNickname, HsClientDescEncKey)],
-) -> Result<(KeyHandover, Arc<RunningOnionService>, RendRequests)> {
+) -> Result<(Arc<RunningOnionService>, RendRequests)> {
     let config = service_config(nickname, authorized)?;
 
-    match client.launch_onion_service_with_hsid(config.clone(), keypair) {
-        // The two arms return two distinct opaque `impl Stream` types, so they
-        // are boxed into one nameable type.
-        Ok(Some((svc, requests))) => Ok((KeyHandover::Inserted, svc, Box::pin(requests))),
+    match client.launch_onion_service_with_hsid(config, keypair) {
+        Ok(Some((svc, requests))) => Ok((svc, Box::pin(requests))),
         Ok(None) => bail!("the onion service is disabled in its own configuration"),
-        Err(e) if is_key_already_exists(&e) => {
-            let (svc, requests) = client
-                .launch_onion_service(config)
-                .map_err(|e| describe(e, "launching the onion service"))?
-                .ok_or_else(|| anyhow!("the onion service is disabled in its own configuration"))?;
-            Ok((KeyHandover::Reused, svc, Box::pin(requests)))
-        }
         Err(e) => Err(describe(e, "handing our identity key to arti")),
     }
 }
@@ -243,8 +231,9 @@ pub fn authorize(
 pub fn present_to(client: &Client, peer: HsId, secret: HsClientDescEncSecretKey) -> Result<()> {
     match client.insert_service_discovery_key(KeystoreSelector::Primary, peer, secret) {
         Ok(_) => Ok(()),
-        // Already deposited on an earlier run. Since the secret is a pure
-        // function of our seed, what is stored is what we would have written.
+        // Already deposited by an earlier resync of this run. Since the secret
+        // is a pure function of our seed, what is stored is what we would have
+        // written.
         Err(e) if is_key_already_exists(&e) => Ok(()),
         Err(e) => Err(describe(e, "storing our discovery key for a contact")),
     }

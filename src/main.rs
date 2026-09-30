@@ -99,11 +99,10 @@ struct Hall {
     rooms: Rooms,
     files: Transfers,
 }
-use crate::transport::tor::{self, KeyHandover};
+use crate::transport::tor;
 use crate::ui::{Kind, Screen};
 
-/// Nickname arti files this service's keys and state under. Fixed: changing it
-/// would look like a brand new service to the keystore.
+/// Nickname arti files this service's keys and state under.
 const NICKNAME: &str = "murmure";
 
 /// How long to wait for the service to *confirm* it is reachable before saying
@@ -343,11 +342,8 @@ async fn serve(
 
     screen.status("publishing");
     let clients = authorized(book)?;
-    let (handover, service, requests) =
+    let (service, requests) =
         tor::launch_with_identity(&client, &nickname, identity.hs_id_keypair(), &clients)?;
-    if handover == KeyHandover::Reused {
-        tracing::debug!("the keystore already held this identity; arti did not overwrite it");
-    }
     let live = Live {
         client: &client,
         service: &service,
@@ -381,7 +377,7 @@ async fn serve(
         .onion_address()
         .context("arti published the service but reported no onion address")?;
     if published != expected {
-        bail!(identity_mismatch(run_dir, seed_path, &published, &expected));
+        bail!(identity_mismatch(seed_path, &published, &expected));
     }
     // Not on screen: the operator cannot act on it, and it only ever says the
     // same thing — the alternative is a hard failure a few lines above.
@@ -1917,20 +1913,17 @@ async fn leave_room(rooms: &mut Rooms, pool: &mut Pool) {
 
 /// The message for the one failure that must never be papered over.
 fn identity_mismatch(
-    run_dir: &Path,
     seed_path: &Path,
     published: &tor_hscrypto::pk::HsId,
     expected: &tor_hscrypto::pk::HsId,
 ) -> String {
     format!(
-        "IDENTITY MISMATCH — arti published {} but our seed derives {}. \
-         The keystore at {}/service/state/keystore holds a different key than the seed at {}. \
-         Nothing was overwritten: delete that keystore directory to republish under our seed, \
-         or delete the seed to adopt the stored identity.",
+        "IDENTITY MISMATCH — arti published {} but the seed at {} derives {}. \
+         arti's keystore lives in memory and starts empty, so this is a bug. \
+         murmure stops here; please report it.",
         published.display_unredacted(),
-        expected.display_unredacted(),
-        run_dir.display(),
         seed_path.display(),
+        expected.display_unredacted(),
     )
 }
 

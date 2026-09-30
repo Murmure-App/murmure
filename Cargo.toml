@@ -55,6 +55,11 @@ arti-client = { version = "=0.46.0", default-features = false, features = [
     "onion-service-service",
     "restricted-discovery",
     "static-sqlite",
+    # Guard-discovery protection for the onion service, which is online for as
+    # long as murmure runs. Mode "lite", the one C-tor uses for services.
+    "vanguards",
+    # Keys live in memory only, see `transport::tor::bootstrap_client`.
+    "ephemeral-keystore",
 ] }
 
 # Named directly so murmure can build the onion-service config, the nickname,
@@ -63,6 +68,8 @@ tor-hsservice = "=0.46.0"
 tor-hscrypto = "=0.46.0"
 tor-llcrypto = "=0.46.0"
 tor-keymgr = "=0.46.0"
+# `ExplicitOrAuto`, to pick the keystore kind. arti-client does not re-export it.
+tor-config = "=0.46.0"
 # CONNECTED / END relay messages, needed to answer a StreamRequest.
 tor-cell = "=0.46.0"
 # PreferredRuntime, to name the concrete TorClient type. arti-client does not

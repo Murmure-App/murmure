@@ -2495,6 +2495,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tor-cell",
+ "tor-config",
  "tor-hscrypto",
  "tor-hsservice",
  "tor-keymgr",

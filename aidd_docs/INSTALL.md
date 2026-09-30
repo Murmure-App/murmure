@@ -47,7 +47,7 @@ ten users, zero cost, permanently.
 | Transport — control plane | **arti** — Tor v3 onion service (`arti-client`, `onion-service-service` feature) | The only one of the three candidates that does not betray the metadata goal. It also removes the NAT problem entirely, including on 4G/CGNAT. Carries discovery, authentication, presence and **all text**. ✅ Verified on 2026-08-01 between macOS and Linux, on the same network **and** over a 5G tether — so two NATs and two different ISPs. |
 | Transport — data plane | **`quinn`** (raw QUIC), on demand, **v2** | For files and images only. Candidates are exchanged over the already-authenticated Tor channel, then a direct connection at full speed. Failure ⇒ fall back to Tor, slow but working. |
 | Identifier → address directory | **Tor's distributed directory (HSDir)** | Settles the last technical unknown from the brainstorm without hosting anything. v3 descriptors are blind-encrypted: a directory cannot enumerate the services it relays. |
-| Identity | **ed25519 key = v3 `.onion` address**, a 32-byte seed owned by murmure, deposited in the arti keystore (`ArtiNativeKeystore`) | The "identifier derived from the key, unforgeable" requirement is not something to implement: it is the definition of a v3 onion address. ✅ Settled 2026-07-31: murmure **supplies** its key to arti through `launch_onion_service_with_hsid`, it does not read it. See "Ownership of the identity key — settled". |
+| Identity | **ed25519 key = v3 `.onion` address**, a 32-byte seed owned by murmure, deposited in the arti keystore (in memory, `ArtiEphemeralKeystore`) | The "identifier derived from the key, unforgeable" requirement is not something to implement: it is the definition of a v3 onion address. ✅ Settled 2026-07-31: murmure **supplies** its key to arti through `launch_onion_service_with_hsid`, it does not read it. See "Ownership of the identity key — settled". |
 | Peer authentication | **Restricted discovery** (Arti ≥ 1.7.0), **x25519** client keys | An onion service authenticates the server but not the client. Restricted discovery limits even *descriptor retrieval* to authorized contacts: "friends only" becomes a property of the transport. |
 | Transfer integrity | ~~`bao-tree`~~ → **BLAKE3 of the whole file** | ❌ **Reversed on 2026-08-01, while writing `files.rs`.** Verified streaming defends against a source you did not choose; here the stream is an onion circuit that is already encrypted and authenticated, and the peer is authenticated by the `.onion` address compared out loud. A sender who wanted to send bad bytes would simply offer a different file. What was actually needed is integrity against corruption plus a **transfer identity** to resume at the right place: a hash of the whole file gives both, with no extra dependency. The partial file is named after that hash, which makes splicing two different files together structurally impossible. Full reasoning at the top of `src/files.rs`. |
 | Channel encryption | **No added layer** — Tor's own (ntor v3) | A deliberate decision. Stacking Noise on top of an onion circuit adds a surface for mistakes with nothing gained: home-made crypto is excluded, and a home-made composition of audited primitives is a form of it. |
@@ -212,10 +212,17 @@ the two agree on disk. The whole rework fits in the body of a single function,
 
 **A trap found at runtime.** `KeyMgr::insert` with `overwrite = false` returns
 `KeyAlreadyExists` as soon as the keystore already holds a key for that nickname
-— **including our own**, on the second launch. This is not an error:
-`launch_with_identity` catches it and publishes on the stored key. It is the
-byte comparison, and only it, that distinguishes "this is indeed our key" from
-"somebody else occupies that nickname".
+— **including our own**, on the second launch. Up to beta.2 this was caught
+and the service published on the stored key.
+
+**Keystore in memory since 2026-09-30.** arti's native keystore wrote, in the
+clear, the expanded identity key (`hss/murmure/ks_hs_id…`) and one directory
+per contact named after their onion address (`client/<address>/…`): the seed
+passphrase and the sealed contacts book protected nothing. murmure now enables
+`ephemeral-keystore` and sets `storage.keystore.primary.kind = ephemeral`;
+every key arti needs is re-deposited from the seed on each start. At startup
+`<state_dir>/keystore` and `<state_dir>/hss` (introduction-point records whose
+keys lived in that keystore) are deleted. The byte comparison stays.
 
 ---
 
@@ -503,11 +510,8 @@ remains:
   contacts comparing notes see the same public key and deduce they are talking
   to the same person — they both already hold the same `.onion` address, which
   says so more directly. Full reasoning on `Identity::discovery_secret`.
-- **Vanguards are not enabled.** `arti-client`'s `vanguards` feature is absent
-  from `Cargo.toml`. Without it, the onion service's paths are more exposed to
-  introduction point enumeration than a production deployment would ask for.
-  Out of scope for the keystore milestone; to be settled before the second one
-  (two machines, two cities).
+- ~~**Vanguards are not enabled.**~~ ✅ 2026-09-30: `vanguards` feature on,
+  mode `lite` (arti's default, the one C-tor uses for onion services).
 - **The migration cost of `experimental-api`.** See the note in the Stack
   summary section.
 
