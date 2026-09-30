@@ -60,9 +60,50 @@ pub fn fingerprint(address: &str) -> String {
     format!("{head} … {tail}")
 }
 
+/// Key-derivation context for the safety number. Frozen: changing it changes
+/// every number two people have already compared.
+const SAFETY_CONTEXT: &str = "murmure 2026 safety number";
+
+/// Sixty digits two people compute alike from their two addresses, to read
+/// out to each other.
+///
+/// Where [`fingerprint`] is 40 bits of one address, this covers every bit of
+/// both, so no address ground to look alike gets past it. The pair is sorted
+/// first: each side reads out the same number. Twelve groups of five digits,
+/// each from five bytes of BLAKE3 output, as Signal does it.
+pub fn safety_number(a: &str, b: &str) -> String {
+    let (first, second) = if a <= b { (a, b) } else { (b, a) };
+    let mut hasher = blake3::Hasher::new_derive_key(SAFETY_CONTEXT);
+    hasher.update(first.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(second.as_bytes());
+    let mut bytes = [0u8; 60];
+    hasher.finalize_xof().fill(&mut bytes);
+    bytes
+        .chunks(5)
+        .map(|five| {
+            let n = five.iter().fold(0u64, |n, b| n << 8 | u64::from(*b));
+            format!("{:05}", n % 100_000)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_safety_number_is_the_same_from_both_sides_and_differs_per_pair() {
+        const OTHER: &str = "rg4vaxch2neyqkejzdcvfjdkqdmuyj3fjktyjopjvc3xfvypvt55t3qd.onion";
+        const THIRD: &str = "trsgbyk6vbbyvnyz5wmpw4n3d6m6ivzqgqm4qzhnfqxqeufqbnmwx5yd.onion";
+        let number = safety_number(GOOD, OTHER);
+        assert_eq!(number, safety_number(OTHER, GOOD));
+        assert_ne!(number, safety_number(GOOD, THIRD));
+        let groups: Vec<&str> = number.split(' ').collect();
+        assert_eq!(groups.len(), 12);
+        assert!(groups.iter().all(|g| g.len() == 5 && g.bytes().all(|b| b.is_ascii_digit())));
+    }
 
     const GOOD: &str = "haticvmas7sfodcos2yhp7sf43cxifwl5aafgeathnyad4culhdj7ryd.onion";
     const GOOD_KEY: &str = "descriptor:x25519:ZPRRMIV6DV6SJFL7SFBSVLJ5VUNPGCDFEVZ7M23LTLVTCCXJQBKA";

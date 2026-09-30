@@ -409,7 +409,7 @@ impl Typed {
 /// the same way an out-of-date `/help` line would be — by reading it.
 const COMMANDS: &[&str] = &[
     "/add", "/tell", "/call", "/cancel", "/answer", "/decline", "/presence", "/contacts",
-    "/forget", "/copy", "/history", "/search", "/view", "/help", "/quit", "/send", "/direct",
+    "/forget", "/verify", "/copy", "/history", "/search", "/view", "/help", "/quit", "/send", "/direct",
     "/accept", "/refuse", "/bye", "/room",
 ];
 

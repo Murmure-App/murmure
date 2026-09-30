@@ -174,6 +174,7 @@ baked in.
 ```text
 /add alice xxxx….onion descriptor:x25519:XXXX…    file them under a name
 /call alice                                       dial (7–50 s, /cancel to stop)
+/verify alice                                     a safety number to read out together
 /answer   /decline                                take, or turn down, a call
 /tell alice on rentre à 19h                       leave a message for later
 /history                                          what is kept (nothing, by default)
@@ -191,9 +192,21 @@ Then **compare the fingerprint out loud** — the short `hati … 7ryd` form sho
 next to the name. It is the address itself, so if it matches you are talking to
 the key you meant to. Nothing else authenticates the other side.
 
+The fingerprint is 8 characters, 40 bits: enough against a typo or a quick
+swap, not against somebody who spent weeks grinding an address that looks the
+same at both ends. `/verify alice` shows a **safety number**: 60 digits
+computed from both your whole addresses, the same on both sides. Read it out to
+each other once, on a call or face to face; if every digit matches, nobody
+stands between the two addresses you filed.
+
 The 7–50 seconds is the price of the *first* call. The connection outlives the
 call held over it, so calling the same person again costs nothing until one of
 you leaves.
+
+Anything you type while the call is still connecting is held and goes out as
+soon as it connects; it is also what rings at the other end. Commands are not
+held: they are commands, and only `/cancel` and `/quit` mean something before
+there is a call.
 
 **A call still has to be answered.** The connection being open is not consent to
 talk over it, so a call coming in shows `-- alice is calling --` and waits for

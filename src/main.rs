@@ -13,6 +13,7 @@
 //! /room new <name>              open a room; /room invite, join, send, get
 //! /contacts                     list the book
 //! /forget <name>                drop a contact
+//! /verify <name>                a 60-digit number to compare with them
 //! /quit                         leave
 //! ```
 //!
@@ -1475,6 +1476,25 @@ async fn command(
                 .to_owned();
             return call(started, live, pool, book, outbox, history, name, &address, lines, screen).await;
         }
+        "/verify" => {
+            let Some(name) = parts.next() else {
+                bail!("usage: /verify <name>");
+            };
+            let Some(theirs) = book.address_of(name) else {
+                bail!("no contact called {name} — /contacts lists them");
+            };
+            let mine = live.identity.onion_address().display_unredacted().to_string();
+            let number = onion::safety_number(&mine, theirs);
+            let groups: Vec<&str> = number.split(' ').collect();
+            screen.system(format!("safety number with {name} — the same on both sides:"));
+            for row in groups.chunks(4) {
+                screen.system(format!("    {}", row.join(" ")));
+            }
+            screen.system(format!(
+                "read it out loud with {name}, on a call or face to face. \
+                 one digit different: one of you has the wrong address."
+            ));
+        }
         "/copy" => {
             // Exactly what the other person has to type after `/add <name>`, in
             // that order, so they paste once and are done.
@@ -1770,6 +1790,8 @@ fn help(screen: &Screen) {
         "                                and either of you can stop it with /presence <name> off",
         "  /contacts                     list the book, and who is online",
         "  /forget <name>                drop a contact",
+        "  /verify <name>                a 60-digit safety number: read it out loud together.",
+        "                                it covers both whole addresses, the fingerprint 40 bits",
         "  /copy                         your address and key, to the clipboard",
         "  /history                      the last lines kept, if any",
         "  /history on   /history off    start or stop keeping a record. off by default;",
