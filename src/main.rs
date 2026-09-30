@@ -1838,13 +1838,13 @@ async fn apply_room(
                     _ => from,
                 };
                 let who = room_label(who, book);
-                let n = hall.files.announced(file, who.clone(), source);
+                let get = match hall.files.announced(file, who.clone(), source) {
+                    Some(n) => format!("/room get {n}"),
+                    None => "not kept, this room has too many files".to_owned(),
+                };
                 screen.say(
                     Kind::Theirs,
-                    format!(
-                        "#{room} {who} shared {name:?} ({}) — /room get {n}",
-                        files::human(size)
-                    ),
+                    format!("#{room} {who} shared {name:?} ({}) — {get}", files::human(size)),
                 );
             }
             Event::Said { who, body } => {
@@ -1874,6 +1874,13 @@ async fn apply_room(
                 name = name_for(book, &peer)
             )),
             Event::Ended => screen.system(format!("-- #{room} is over: the host left --")),
+            Event::Removed => screen.system(format!(
+                "-- you are no longer in #{room}: the host lost your connection --"
+            )),
+            Event::Superseded { from, name } => screen.system(format!(
+                "-- the earlier invitation from {} to #{name} is declined: one at a time --",
+                name_for(book, &from)
+            )),
         }
     }
     for (peer, msg) in out.send {

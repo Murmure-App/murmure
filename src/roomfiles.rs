@@ -74,6 +74,10 @@ struct Down {
 /// this the file would be "on its way" for ever.
 const STALLED: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How many files a room keeps track of. Numbers are positions in the list,
+/// so past this, new announcements are dropped rather than old ones.
+const MAX_FILES: usize = 256;
+
 /// Every file in the room we are in, and every transfer running for it.
 pub struct Transfers {
     incoming: PathBuf,
@@ -148,6 +152,9 @@ impl Transfers {
         if self.known.iter().any(|k| k.file.hash == file.hash) {
             bail!("that file is already in the room");
         }
+        if self.known.len() >= MAX_FILES {
+            bail!("this room already has {MAX_FILES} files");
+        }
         self.known.push(Known {
             file: file.clone(),
             who: "you".to_owned(),
@@ -157,10 +164,14 @@ impl Transfers {
         Ok(file)
     }
 
-    /// Somebody put a file in the room. Returns its number.
-    pub fn announced(&mut self, file: FileRef, who: String, from: HsId) -> usize {
+    /// Somebody put a file in the room. Returns its number, or `None` once
+    /// the room has as many files as it keeps.
+    pub fn announced(&mut self, file: FileRef, who: String, from: HsId) -> Option<usize> {
         if let Some(i) = self.known.iter().position(|k| k.file.hash == file.hash) {
-            return i + 1;
+            return Some(i + 1);
+        }
+        if self.known.len() >= MAX_FILES {
+            return None;
         }
         self.known.push(Known {
             file,
@@ -168,7 +179,7 @@ impl Transfers {
             from: Some(from),
             path: None,
         });
-        self.known.len()
+        Some(self.known.len())
     }
 
     /// The operator wants file `n`.
@@ -557,6 +568,21 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         t.upload(tx, path, offset, hash);
         (to, rx)
+    }
+
+    #[test]
+    fn a_room_keeps_a_bounded_list_of_files() {
+        let mut files = Transfers::new(PathBuf::from("in"), PathBuf::from("relay"));
+        let file = |n: u32| {
+            let mut hash = [0; 32];
+            hash[..4].copy_from_slice(&n.to_le_bytes());
+            FileRef { name: format!("{n}.txt"), size: 1, hash }
+        };
+        for n in 0..MAX_FILES as u32 {
+            assert_eq!(files.announced(file(n), "b".into(), id(2)), Some(n as usize + 1));
+        }
+        assert_eq!(files.announced(file(0), "b".into(), id(2)), Some(1), "already known");
+        assert_eq!(files.announced(file(9999), "b".into(), id(2)), None);
     }
 
     /// Author `a`, relay `h`, member `c`: c asks h, h fetches from a, then

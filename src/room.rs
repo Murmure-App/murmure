@@ -38,6 +38,7 @@
 //! host vouches for who they are, and nothing here pretends otherwise.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use rand::RngCore as _;
 use safelog::DisplayRedacted as _;
@@ -139,6 +140,10 @@ pub enum Event {
     Mismatch(HsId),
     /// The room is over: the host left, or we lost them.
     Ended,
+    /// The host no longer counts us in the room: they lost our connection.
+    Removed,
+    /// A second invitation replaced this one, which was turned down.
+    Superseded { from: HsId, name: String },
 }
 
 /// What handling a frame or a command came to.
@@ -160,11 +165,15 @@ impl Outcome {
     }
 }
 
+/// How long an invitation stands, on either side.
+const INVITE_TTL: Duration = Duration::from_secs(10 * 60);
+
 /// An invitation not yet answered.
 struct Invite {
     from: HsId,
     room: RoomId,
     name: String,
+    at: Instant,
 }
 
 /// The room we are in.
@@ -188,8 +197,11 @@ pub struct Room {
     greeted: HashSet<HsId>,
     /// The line numbers seen from each key, which count from 1.
     last: HashMap<Key, Seen>,
-    /// Host only: who was asked and has not answered.
-    invited: HashSet<HsId>,
+    /// Host only: who was asked and has not answered, and when.
+    invited: HashMap<HsId, Instant>,
+    /// Host only: members dropped when their link was lost. They cannot be
+    /// told at that moment, so they are told the next time they speak.
+    dropped: HashSet<HsId>,
 }
 
 impl Room {
@@ -207,7 +219,8 @@ impl Room {
             claimed: HashMap::new(),
             greeted: HashSet::new(),
             last: HashMap::new(),
-            invited: HashSet::new(),
+            invited: HashMap::new(),
+            dropped: HashSet::new(),
         }
     }
 
@@ -329,13 +342,14 @@ impl Rooms {
         if !room.hosting() {
             anyhow::bail!("only the host of #{} can invite", room.name);
         }
+        room.invited.retain(|_, at| at.elapsed() < INVITE_TTL);
         if room.roster.len() + room.invited.len() >= MAX_MEMBERS {
             anyhow::bail!("a room holds at most {MAX_MEMBERS} people");
         }
         if room.bound.values().any(|p| *p == peer) {
             anyhow::bail!("they are already in #{}", room.name);
         }
-        room.invited.insert(peer);
+        room.invited.insert(peer, Instant::now());
         Ok(Message::RoomInvite {
             room: room.id,
             name: room.name.clone(),
@@ -355,6 +369,9 @@ impl Rooms {
         let Some(invite) = self.invite.take() else {
             anyhow::bail!("nobody has invited you to a room");
         };
+        if invite.at.elapsed() >= INVITE_TTL {
+            anyhow::bail!("the invitation to #{} has expired — ask for a new one", invite.name);
+        }
         let room = Room::new(invite.room, invite.name, Some(invite.from));
         let join = Message::RoomJoin {
             room: room.id,
@@ -473,6 +490,7 @@ impl Rooms {
             // only way anybody else could still reach them.
             room.bound.remove(&key);
             room.roster.retain(|(k, _)| *k != key);
+            room.dropped.insert(*peer);
             out.events.push(Event::Left(Who::Known(*peer)));
         }
         if !out.events.is_empty() {
@@ -494,8 +512,8 @@ impl Rooms {
             Message::RoomJoin { room, key } => self.joined(from, room, key),
             Message::RoomDecline { room } => match self.room.as_mut() {
                 Some(r) if r.id == room && r.hosting() => match r.invited.remove(&from) {
-                    true => Outcome::event(Event::Declined(from)),
-                    false => Outcome::default(),
+                    Some(_) => Outcome::event(Event::Declined(from)),
+                    None => Outcome::default(),
                 },
                 _ => Outcome::default(),
             },
@@ -541,21 +559,41 @@ impl Rooms {
                 reach: Vec::new(),
             };
         }
+        let mut out = Outcome::event(Event::Invited {
+            from,
+            name: name.clone(),
+        });
+        // One invitation waits at a time. The one it replaces is turned down
+        // rather than dropped, so its host is not left holding a place.
+        if let Some(old) = self.invite.take()
+            && old.room != room
+        {
+            out.events.push(Event::Superseded { from: old.from, name: old.name });
+            out.send.push((old.from, Message::RoomDecline { room: old.room }));
+        }
         self.invite = Some(Invite {
             from,
             room,
-            name: name.clone(),
+            name,
+            at: Instant::now(),
         });
-        Outcome::event(Event::Invited { from, name })
+        out
     }
 
     fn joined(&mut self, from: HsId, room: RoomId, key: Key) -> Outcome {
         let Some(r) = self.room.as_mut() else {
             return Outcome::default();
         };
-        // Only somebody asked in, and only once per asking.
-        if r.id != room || !r.hosting() || !r.invited.remove(&from) {
+        if r.id != room || !r.hosting() || r.bound.values().any(|p| *p == from) {
             return Outcome::default();
+        }
+        // Only somebody asked in, once per asking, and not too long ago.
+        // Anybody else is told, or they would sit in a room of one.
+        if !r.invited.remove(&from).is_some_and(|at| at.elapsed() < INVITE_TTL) {
+            return Outcome {
+                send: vec![(from, Message::RoomLeave { room })],
+                ..Outcome::default()
+            };
         }
         // A key already in the roster would make two members one author.
         if r.roster.iter().any(|(k, _)| *k == key) || r.roster.len() >= MAX_MEMBERS {
@@ -609,6 +647,13 @@ impl Rooms {
         let before: Vec<Key> = r.roster.iter().map(|(k, _)| *k).collect();
         r.roster = members;
         let now: Vec<Key> = r.roster.iter().map(|(k, _)| *k).collect();
+
+        // Listed before, not now: the host let us go.
+        let mine = r.key();
+        if before.contains(&mine) && !now.contains(&mine) {
+            self.room = None;
+            return Outcome::event(Event::Removed);
+        }
 
         // A key no longer listed names nobody in the room any more.
         let gone: Vec<Key> = before.iter().filter(|k| !now.contains(k)).copied().collect();
@@ -666,7 +711,18 @@ impl Rooms {
         let Some(r) = self.room.as_mut() else {
             return Outcome::default();
         };
-        if r.id != room || key == r.key() || !r.targets().contains(&from) {
+        if r.id != room || key == r.key() {
+            return Outcome::default();
+        }
+        if !r.targets().contains(&from) {
+            // Somebody we dropped, still talking: the roster without them is
+            // what tells them. Once, and only to them.
+            if r.hosting() && r.dropped.remove(&from) {
+                return Outcome {
+                    send: vec![(from, Message::RoomRoster { room, members: r.roster.clone() })],
+                    ..Outcome::default()
+                };
+            }
             return Outcome::default();
         }
         if !r.roster.iter().any(|(k, _)| *k == key) {
@@ -981,6 +1037,90 @@ mod tests {
             .get_mut(&a)
             .unwrap()
             .receive(stranger, Message::RoomJoin { room: room_id, key: [5; 32] }, &[]);
-        assert!(out.events.is_empty() && out.send.is_empty());
+        assert!(out.events.is_empty());
+        // Told no, rather than left believing they are in.
+        assert!(matches!(out.send[..], [(to, Message::RoomLeave { room })] if to == stranger && room == room_id));
+        assert!(!nodes[&a].room.as_ref().unwrap().roster.iter().any(|(k, _)| *k == [5; 32]));
+    }
+
+    fn long_ago() -> Instant {
+        Instant::now().checked_sub(INVITE_TTL + Duration::from_secs(1)).unwrap()
+    }
+
+    #[test]
+    fn a_member_the_host_lost_is_told_when_they_speak() {
+        let ((mut nodes, contacts), [a, b, c]) = room(false);
+        let out = nodes.get_mut(&a).unwrap().lost(&b);
+        run(&mut nodes, &contacts, a, out);
+        assert!(nodes[&b].room.is_some(), "b could not be told: the link was gone");
+
+        let out = nodes.get_mut(&b).unwrap().say("encore là ?").unwrap();
+        let seen = run(&mut nodes, &contacts, b, out);
+        assert!(seen.contains(&(b, Event::Removed)));
+        assert!(nodes[&b].room.is_none());
+        assert!(said(&seen, c).is_empty(), "the line of somebody dropped is not relayed");
+    }
+
+    #[test]
+    fn a_second_invitation_declines_the_first() {
+        let (a, b, d) = (id(1), id(2), id(4));
+        let contacts = HashMap::from([(a, vec![b]), (b, vec![a, d]), (d, vec![b])]);
+        let mut nodes = HashMap::from([(a, Rooms::new(a)), (b, Rooms::new(b)), (d, Rooms::new(d))]);
+        for (host, name) in [(a, "table"), (d, "autre")] {
+            nodes.get_mut(&host).unwrap().create(name).unwrap();
+            let invite = nodes.get_mut(&host).unwrap().invite(b).unwrap();
+            let out = Outcome { send: vec![(b, invite)], ..Outcome::default() };
+            let seen = run(&mut nodes, &contacts, host, out);
+            if host == d {
+                assert!(seen.contains(&(b, Event::Superseded { from: a, name: "table".into() })));
+                assert!(seen.contains(&(a, Event::Declined(b))), "the first host is told");
+            }
+        }
+        assert!(nodes[&a].room.as_ref().unwrap().invited.is_empty());
+        let out = nodes.get_mut(&b).unwrap().join().unwrap();
+        run(&mut nodes, &contacts, b, out);
+        assert_eq!(nodes[&b].room.as_ref().unwrap().name, "autre");
+    }
+
+    #[test]
+    fn an_old_invitation_cannot_be_joined() {
+        let (a, b) = (id(1), id(2));
+        let contacts = HashMap::from([(a, vec![b]), (b, vec![a])]);
+        let mut nodes = HashMap::from([(a, Rooms::new(a)), (b, Rooms::new(b))]);
+        nodes.get_mut(&a).unwrap().create("table").unwrap();
+        let invite = nodes.get_mut(&a).unwrap().invite(b).unwrap();
+        run(&mut nodes, &contacts, a, Outcome { send: vec![(b, invite)], ..Outcome::default() });
+
+        nodes.get_mut(&b).unwrap().invite.as_mut().unwrap().at = long_ago();
+        assert!(nodes.get_mut(&b).unwrap().join().is_err());
+    }
+
+    #[test]
+    fn a_host_turns_away_a_join_that_comes_too_late() {
+        let (a, b) = (id(1), id(2));
+        let contacts = HashMap::from([(a, vec![b]), (b, vec![a])]);
+        let mut nodes = HashMap::from([(a, Rooms::new(a)), (b, Rooms::new(b))]);
+        nodes.get_mut(&a).unwrap().create("table").unwrap();
+        let invite = nodes.get_mut(&a).unwrap().invite(b).unwrap();
+        run(&mut nodes, &contacts, a, Outcome { send: vec![(b, invite)], ..Outcome::default() });
+
+        *nodes.get_mut(&a).unwrap().room.as_mut().unwrap().invited.get_mut(&b).unwrap() = long_ago();
+        let out = nodes.get_mut(&b).unwrap().join().unwrap();
+        let seen = run(&mut nodes, &contacts, b, out);
+        assert!(seen.contains(&(b, Event::Ended)));
+        assert!(nodes[&b].room.is_none());
+        assert_eq!(nodes[&a].room.as_ref().unwrap().roster.len(), 1, "only the host");
+    }
+
+    #[test]
+    fn an_expired_invitation_frees_its_place() {
+        let mut host = Rooms::new(id(1));
+        host.create("table").unwrap();
+        for n in 2..(1 + MAX_MEMBERS as u8) {
+            host.invite(id(n)).unwrap();
+        }
+        assert!(host.invite(id(99)).is_err(), "full");
+        *host.room.as_mut().unwrap().invited.get_mut(&id(2)).unwrap() = long_ago();
+        host.invite(id(99)).unwrap();
     }
 }
