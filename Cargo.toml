@@ -4,7 +4,7 @@ name = "murmure"
 # author has read the security-relevant code. `0.1.0` would say "small but
 # settled"; `-beta` says "the interfaces and the wire format can still move
 # under you". See the Status section of README.md.
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 edition = "2024"
 # arti 0.47's own minimum, which is the binding one: nothing here asks for
 # more. Checked in CI by the `msrv` job, so a newer std API slipping in fails
