@@ -1,6 +1,6 @@
 // Modified for murmure (2026-09-29): find_limit stops on a step that leaves
 // the value unchanged, so it terminates with Windows' 100 ns SystemTime.
-// See arti#2678 and arti#2726. Original: saturating-time 0.4.0, Clara Engler,
+// See arti#2678 and arti#2726. Original: saturating-time 0.5.0, Clara Engler,
 // MIT OR Apache-2.0.
 
 //! Internal parts used for sealing.
@@ -78,7 +78,8 @@ impl SaturatingTime for SystemTime {
 
 impl SaturatingTime for Instant {
     fn anchor() -> Self {
-        Self::now()
+        use web_time_compat::InstantExt;
+        Self::get()
     }
 
     fn max_value() -> Self {
@@ -156,7 +157,7 @@ where
             Some(st) if st != res => {
                 // (2.1) If Some and different, set res to the returned value
                 // and continue.
-                res = st
+                res = st;
             }
             _ => {
                 if step == ONE_NS {
@@ -173,6 +174,21 @@ where
 
 #[cfg(test)]
 mod tests {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_time_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+
     use std::{
         fmt::Debug,
         ops::{Add, Sub},

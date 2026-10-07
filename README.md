@@ -100,7 +100,7 @@ xattr -d com.apple.quarantine murmure
 ## Build
 
 Building it yourself is the recommended path, and the only one that asks you to
-trust nobody. Needs Rust ≥ 1.91.
+trust nobody. Needs Rust ≥ 1.92.
 
 ```sh
 rustup toolchain install stable && rustup default stable

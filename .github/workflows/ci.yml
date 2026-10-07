@@ -71,7 +71,7 @@ jobs:
         run: cargo test --locked
 
   # The oldest compiler `rust-version` promises. `check` rather than `test`:
-  # what can break is an API newer than 1.91, and that fails to compile.
+  # what can break is an API newer than 1.92, and that fails to compile.
   msrv:
     runs-on: ubuntu-latest
     steps:

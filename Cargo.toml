@@ -6,10 +6,10 @@ name = "murmure"
 # under you". See the Status section of README.md.
 version = "0.1.0-beta.5"
 edition = "2024"
-# arti 0.46's own minimum, which is the binding one: nothing here asks for
+# arti 0.47's own minimum, which is the binding one: nothing here asks for
 # more. Checked in CI by the `msrv` job, so a newer std API slipping in fails
 # there rather than on somebody's older toolchain.
-rust-version = "1.91"
+rust-version = "1.92"
 license = "GPL-3.0-or-later"
 description = "Peer-to-peer terminal messaging over Tor onion services"
 
@@ -50,7 +50,7 @@ description = "Peer-to-peer terminal messaging over Tor onion services"
 #  2. It is also the leading suspect for a Windows bootstrap that stalls with
 #     the channel handshake complete and the circuit's CREATE2 never answered.
 #     Unconfirmed — see the field notes in aidd_docs/INSTALL.md.
-arti-client = { version = "=0.46.0", default-features = false, features = [
+arti-client = { version = "=0.47.0", default-features = false, features = [
     "tokio",
     "compression",
     "rustls",
@@ -68,17 +68,17 @@ arti-client = { version = "=0.46.0", default-features = false, features = [
 
 # Named directly so murmure can build the onion-service config, the nickname,
 # and its own HsIdKeypair instead of letting arti generate one.
-tor-hsservice = "=0.46.0"
-tor-hscrypto = "=0.46.0"
-tor-llcrypto = "=0.46.0"
-tor-keymgr = "=0.46.0"
+tor-hsservice = "=0.47.0"
+tor-hscrypto = "=0.47.0"
+tor-llcrypto = "=0.47.0"
+tor-keymgr = "=0.47.0"
 # `ExplicitOrAuto`, to pick the keystore kind. arti-client does not re-export it.
-tor-config = "=0.46.0"
+tor-config = "=0.47.0"
 # CONNECTED / END relay messages, needed to answer a StreamRequest.
-tor-cell = "=0.46.0"
+tor-cell = "=0.47.0"
 # PreferredRuntime, to name the concrete TorClient type. arti-client does not
 # re-export it.
-tor-rtcompat = { version = "=0.46.0", features = ["tokio", "rustls"] }
+tor-rtcompat = { version = "=0.47.0", features = ["tokio", "rustls"] }
 # Not used in murmure's own code: named only to pick rustls' crypto provider.
 # arti pulls rustls in with default features off and selects neither backend, so
 # `CryptoProvider::install_default` would otherwise have to be called by hand —
@@ -91,7 +91,7 @@ tor-rtcompat = { version = "=0.46.0", features = ["tokio", "rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # HsId is inherently sensitive: printing it unredacted goes through
 # safelog::DisplayRedacted.
-safelog = "0.9"
+safelog = "0.10"
 
 # Base64 for the OSC 52 clipboard escape. Named rather than hand-rolled, and it
 # costs nothing: arti already compiles it, so this adds no build time and no new
@@ -179,7 +179,7 @@ tokio-util = { version = "0.7.19", features = ["compat"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [patch.crates-io]
-# saturating-time 0.4.0 (pulled in by tor-cert and tor-netdoc) never returns
+# saturating-time 0.5.0 (pulled in by tor-netdoc) never returns
 # on Windows: it finds SystemTime's minimum by halving a step down to 1ns,
 # but Windows counts 100ns intervals, so any step under 100ns subtracts
 # nothing, returns Some, and the step never shrinks again. That loop is

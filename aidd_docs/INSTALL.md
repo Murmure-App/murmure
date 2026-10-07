@@ -42,7 +42,7 @@ ten users, zero cost, permanently.
 | --- | --- | --- |
 | Architecture | Monolith, **a single binary crate**, with a `Transport` trait and two implementations | One solo developer, fewer than ten users. The only abstraction laid down is the transport one, because there really will be two implementations — not a speculative interface. |
 | **Control / data separation** | **Tor carries control, a direct channel carries data** | Tor's throughput (0.1-0.25 MB/s) is inconsequential for text and disqualifying for files. Decoupling the two means paying the price of anonymity where it buys something, and not elsewhere. Restores the three-path ladder from the brainstorm. |
-| Language | **Rust** (MSRV 1.91) | The only language known here that gives all of a native Tor ecosystem, a single cross-OS binary, and no runtime for the other person to install. |
+| Language | **Rust** (MSRV 1.92) | The only language known here that gives all of a native Tor ecosystem, a single cross-OS binary, and no runtime for the other person to install. |
 | Interface | **ratatui + crossterm**, TUI | The "rich text mode, no graphical window" requirement. crossterm covers Windows, which answers the reservation raised about that OS. ⚠️ **Contradicted on 2026-08-01, but not by crossterm**: the TUI renders correctly under Windows Terminal; it is arti that hangs before that. |
 | Transport — control plane | **arti** — Tor v3 onion service (`arti-client`, `onion-service-service` feature) | The only one of the three candidates that does not betray the metadata goal. It also removes the NAT problem entirely, including on 4G/CGNAT. Carries discovery, authentication, presence and **all text**. ✅ Verified on 2026-08-01 between macOS and Linux, on the same network **and** over a 5G tether — so two NATs and two different ISPs. |
 | Transport — data plane | **`quinn`** (raw QUIC), on demand, **v2** | For files and images only. Candidates are exchanged over the already-authenticated Tor channel, then a direct connection at full speed. Failure ⇒ fall back to Tor, slow but working. |
@@ -64,8 +64,8 @@ the comment saying why it is there — this table is only an index to them.
 
 | Layer | Crate / tech | Real version |
 | --- | --- | --- |
-| Control transport & directory | `arti-client` (features `onion-service-service`, `onion-service-client`, `experimental-api`, `restricted-discovery`, `static-sqlite`, `rustls`) | **=0.46.0**, pinned |
-| arti crates named directly | `tor-hsservice`, `tor-hscrypto`, `tor-llcrypto`, `tor-keymgr`, `tor-cell`, `tor-rtcompat` | **=0.46.0**, pinned |
+| Control transport & directory | `arti-client` (features `onion-service-service`, `onion-service-client`, `experimental-api`, `restricted-discovery`, `static-sqlite`, `rustls`) | **=0.47.0**, pinned |
+| arti crates named directly | `tor-hsservice`, `tor-hscrypto`, `tor-llcrypto`, `tor-keymgr`, `tor-cell`, `tor-rtcompat` | **=0.47.0**, pinned |
 | Async runtime | `tokio` | 1.x, `full` feature |
 | Terminal interface | `ratatui` + `crossterm` | ratatui **0.30.2** / crossterm **0.29** (`event-stream`) |
 | Identity | ~~`ed25519-dalek`~~ → `tor-llcrypto` | Never added: arti already re-exports ed25519 and curve25519, and a second copy of dalek in the tree would mean two incompatible types for the same key. |
@@ -76,7 +76,7 @@ the comment saying why it is there — this table is only an index to them.
 | Protocol serialization | `serde` + `postcard` | 1.x / 1.x |
 | Logging | `tracing` + `tracing-subscriber`, `safelog` | to a file, never stdout — the TUI owns the screen |
 | Data transport (v2) | `quinn` + `rcgen` | **0.11 / 0.14**, `ring` feature on both. Shipped 2026-08-02: `/send --direct`, explicit. |
-| Compiler | Rust stable | **≥ 1.91** (MSRV imposed by arti 0.46) |
+| Compiler | Rust stable | **≥ 1.92** (MSRV imposed by arti 0.47) |
 
 > **`static-sqlite` was not planned and is not optional.** `tor-dirmgr` caches
 > the consensus in SQLite; without this feature, linking fails on Windows
@@ -96,7 +96,7 @@ no third-party account, no server to operate.
 
 > ⚠️ **Pin the arti versions strictly.** The arti crates are `0.x` with a
 > **monthly** release cadence and API breaks at every bump. Write
-> `arti-client = "=0.46.0"`, not `"0.46"`. Budget half an evening of migration
+> `arti-client = "=0.47.0"`, not `"0.47"`. Budget half an evening of migration
 > for every deliberate bump.
 
 > ⚠️ **Known migration cost: `experimental-api`.** The keystore milestone forced
@@ -320,8 +320,8 @@ provides — so having it, they are no longer needed.
 
 Manual installation — this document generates no files.
 
-1. **Install Rust ≥ 1.91**: `rustup toolchain install stable && rustup default stable`,
-   then check with `rustc --version` (arti 0.44 imposes 1.91 as its MSRV).
+1. **Install Rust ≥ 1.92**: `rustup toolchain install stable && rustup default stable`,
+   then check with `rustc --version` (arti 0.47 imposes 1.92 as its MSRV).
 2. **Initialize the crate**: `cargo init murmure --bin` at the root of the
    existing repository.
 3. ~~**Add the dependencies**~~ — the real list diverged from this one; see
